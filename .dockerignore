@@ -1,0 +1,22 @@
+# 大目录与本地状态不进构建上下文（data/ 含全部数据集与工作区）。
+.git
+.venv
+data
+evals
+docs
+tests
+app/frontend
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+.env
+.env.*
+!.env.example
+*.md
+Dockerfile
+docker-compose.yml
+Makefile
+.pre-commit-config.yaml

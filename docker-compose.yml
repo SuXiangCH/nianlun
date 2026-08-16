@@ -1,0 +1,131 @@
+# Nianlun 一键部署：前端 + API Server + Milvus standalone（etcd/minio）+ Attu GUI。
+# 自包含，不依赖宿主机上的任何服务。
+#
+# 准备：cp .env.example .env（可选；Web 端的模型在界面「模型管理」中配置，
+#        .env 主要影响 Milvus collection 等默认值）
+# 启动：docker compose up -d --build
+# 访问：前端 http://localhost:3000
+#        API 文档 http://localhost:8000/docs
+#        Milvus GUI（Attu）http://localhost:8080
+
+services:
+  api:
+    build: .
+    image: nianlun-api
+    restart: unless-stopped
+    environment:
+      MILVUS_URI: http://milvus:19530
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      # SQLite、工作区 JSON、上传与解析产物全部落在这里
+      - ./data:/app/data
+    ports:
+      - "8000:8000" # 直接访问 API/OpenAPI 文档用；只走前端可删
+    depends_on:
+      milvus:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          ".venv/bin/python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthz', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./app/frontend
+      args:
+        VITE_API_BASE: "/"
+    image: nianlun-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    # 国内镜像：quay.nju.edu.cn/coreos/etcd:v3.5.25
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command:
+      etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls=http://0.0.0.0:2379
+      --data-dir=/etcd
+    volumes:
+      - etcd:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+  minio:
+    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    # 国内镜像：docker.xuanyuan.run/minio/minio:RELEASE.2024-12-18T13-15-44Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - minio:/minio_data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 10s
+
+  milvus:
+    image: milvusdb/milvus:v2.6.20
+    # 国内镜像：docker.xuanyuan.run/milvusdb/milvus:v2.6.20
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MQ_TYPE: woodpecker
+    volumes:
+      - milvus:/var/lib/milvus
+    ports:
+      - "19530:19530" # 供宿主机 CLI / 离线索引直连；不需要可删
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 90s
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  attu:
+    image: zilliz/attu:v2.6.5
+    # 国内镜像：docker.xuanyuan.run/zilliz/attu:v2.6.5
+    environment:
+      MILVUS_URL: milvus:19530
+    ports:
+      - "8080:3000"
+    depends_on:
+      milvus:
+        condition: service_healthy
+
+volumes:
+  etcd:
+  minio:
+  milvus:

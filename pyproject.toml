@@ -1,0 +1,113 @@
+[project]
+name = "nianlun"
+version = "0.1.0"
+description = "Document indexing, retrieval, and agent runtime platform"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.116.1,<1.0.0",
+    "httpx>=0.27.0,<1.0.0",
+    "json-repair>=0.52.0,<1.0.0",
+    "langchain>=1.0.0,<2.0.0",
+    "langchain-openai>=1.0.0,<2.0.0",
+    "langgraph>=1.0.0,<2.0.0",
+    "markdown-it-py>=4.0.0",
+    "pymilvus>=2.6.0,<4.0.0",
+    "python-dotenv==1.0.1",
+    "python-multipart>=0.0.20,<1.0.0",
+    "sqlalchemy>=2.0,<3.0",
+    "tiktoken>=0.9.0",
+    "uvicorn[standard]>=0.35.0,<1.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nianlun", "app"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "nianlun",
+    "app",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "pyproject.toml",
+]
+
+[dependency-groups]
+dev = [
+    "coverage>=7.9.1",
+    "pre-commit>=4.2.0",
+    "pytest>=8.4.1",
+]
+lint = [
+    "pyright>=1.1.402",
+    "ruff>=0.12.1",
+]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.format]
+line-ending = "lf"
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnnecessaryIsInstance = false
+reportUnnecessaryTypeIgnoreComment = true
+reportMissingModuleSource = false
+reportUnknownArgumentType = false
+reportUnknownLambdaType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportMissingParameterType = false
+reportMissingTypeArgument = false
+reportAssignmentType = false
+reportConstantRedefinition = false
+reportInvalidTypeForm = false
+reportOptionalCall = false
+reportOptionalMemberAccess = false
+reportOptionalSubscript = false
+reportUnnecessaryComparison = false
+include = ["nianlun", "app"]
+exclude = ["nianlun/**/tests", "app/**/tests", "app/frontend/node_modules"]
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+include = ["nianlun/**/*.py", "tests/**/*.py"]
+branch = true
+
+[tool.coverage.report]
+skip_covered = true
+show_missing = true
+ignore_errors = true
+precision = 2
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if typing.TYPE_CHECKING:",
+    "@overload",
+    "@abstractmethod",
+    "if __name__ == .__main__.:",
+    "except ImportError as _import_error:",
+    "^\\s*pass$",
+    "assert False",
+]
+
+[tool.uv]
+index-url = "https://mirrors.aliyun.com/pypi/simple/"

@@ -1,0 +1,54 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+
+# Test and coverage reports
+.coverage
+.coverage.*
+.pytest_cache/
+.ruff_cache/
+.pyright/
+htmlcov/
+coverage.xml
+
+# Local configuration, data, and evaluation output
+.env
+.env.*
+!.env.example
+data/
+evals/
+*.sqlite
+*.sqlite3
+*.db
+
+# Logs and local tooling state
+*.log
+.cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Frontend build and tool caches
+app/frontend/dist/
+app/frontend/.vite/
+app/frontend/coverage/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# Frontend dependencies
+node_modules/
+app/frontend/node_modules/
+docs/
