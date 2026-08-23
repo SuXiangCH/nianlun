@@ -80,7 +80,8 @@ CONTEXT_SUMMARY_PROMPT = """你是文档研究会话的上下文摘要器。
 摘要必须包含以下部分：
 
 ## SESSION_INTENT
-用户当前的目标、问题范围和重要约束。
+用户当前的目标、问题范围和重要约束。首先完整保留最近一条尚未完成的用户请求，
+不得省略其中的主体、条件、范围或输出要求，也不得只概括成宽泛主题。
 
 ## CONFIRMED_FACTS
 已经从正文中确认的事实。每条事实都必须保留对应的文档名、doc_id、node_id、
@@ -121,11 +122,11 @@ def _is_tool_message(message: Any) -> bool:
     return False
 
 
-def _tool_message_content_text(tool_message: Any) -> str:
-    if isinstance(tool_message, Mapping):
-        content = tool_message.get("content")
+def _message_content_text(message: Any) -> str:
+    if isinstance(message, Mapping):
+        content = message.get("content")
     else:
-        content = getattr(tool_message, "content", None)
+        content = getattr(message, "content", None)
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -142,6 +143,21 @@ def _tool_message_content_text(tool_message: Any) -> str:
             if isinstance(text, str):
                 parts.append(text)
     return "".join(parts)
+
+
+def _tool_message_content_text(tool_message: Any) -> str:
+    return _message_content_text(tool_message)
+
+
+def _latest_user_message(messages: Iterable[AnyMessage]) -> HumanMessage | None:
+    latest: HumanMessage | None = None
+    for message in messages:
+        if (
+            isinstance(message, HumanMessage)
+            and getattr(message, "name", None) != "context_summary"
+        ):
+            latest = message
+    return latest
 
 
 def _parse_structured_tool_result(tool_message: Any) -> dict[str, Any] | None:
@@ -483,7 +499,7 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
                     messages_to_summarize
                 )
             update = self._build_summarized_message_state_update(
-                summary, preserved_messages
+                summary, messages_to_summarize, preserved_messages
             )
         except Exception as exc:
             _emit_context_status(
@@ -556,7 +572,7 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
                     messages_to_summarize
                 )
             update = self._build_summarized_message_state_update(
-                summary, preserved_messages
+                summary, messages_to_summarize, preserved_messages
             )
         except Exception as exc:
             _emit_context_status(
@@ -577,10 +593,19 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
         return update
 
     def _build_summarized_message_state_update(
-        self, summary: str, preserved_messages: list[AnyMessage]
+        self,
+        summary: str,
+        summarized_messages: list[AnyMessage],
+        preserved_messages: list[AnyMessage],
     ) -> dict[str, Any]:
+        active_user_request = self._active_user_request_for_summary(
+            summarized_messages, preserved_messages
+        )
         new_messages = self._fit_messages_to_hard_limit(
-            [self._build_context_summary_message(summary), *preserved_messages]
+            [
+                self._build_context_summary_message(summary, active_user_request),
+                *preserved_messages,
+            ]
         )
         return {
             "messages": [
@@ -658,7 +683,7 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
                 high = middle
             else:
                 low = middle + 1
-        candidate = list(messages[low:])
+        candidate: list[AnyMessage] = list(messages[low:])
         if candidate and isinstance(candidate[0], ToolMessage):
             safe_low = self._find_safe_cutoff_point(messages, low)
             paired_candidate = list(messages[safe_low:])
@@ -719,6 +744,53 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
         if token_limit is None or self.token_counter(messages) <= token_limit:
             return messages
 
+        latest_user = _latest_user_message(messages)
+        if latest_user is not None:
+            latest_user_index = next(
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if messages[index] is latest_user
+            )
+            user_tokens = self.token_counter([latest_user])
+            if user_tokens > token_limit:
+                return [self._truncate_message_to_token_limit(latest_user, token_limit)]
+            if user_tokens == token_limit:
+                return [latest_user]
+
+            recent_messages = self._fit_suffix_messages(
+                messages[latest_user_index + 1 :], token_limit - user_tokens
+            )
+            protected_messages: list[AnyMessage] = [latest_user, *recent_messages]
+            protected_tokens = self.token_counter(protected_messages)
+            if protected_tokens > token_limit:
+                protected_messages = [latest_user]
+                protected_tokens = user_tokens
+
+            remaining_tokens = token_limit - protected_tokens
+            if (
+                remaining_tokens > 0
+                and latest_user_index > 0
+                and isinstance(messages[0], HumanMessage)
+                and messages[0].name == "context_summary"
+            ):
+                compact_summary = self._truncate_message_to_token_limit(
+                    messages[0], remaining_tokens
+                )
+                candidate = [compact_summary, *protected_messages]
+                if (
+                    _message_content_text(compact_summary).strip()
+                    and self.token_counter(candidate) <= token_limit
+                ):
+                    return candidate
+            elif remaining_tokens > 0 and latest_user_index > 0:
+                older_messages = self._fit_suffix_messages(
+                    messages[:latest_user_index], remaining_tokens
+                )
+                candidate = [*older_messages, *protected_messages]
+                if self.token_counter(candidate) <= token_limit:
+                    return candidate
+            return protected_messages
+
         if (
             messages
             and isinstance(messages[0], HumanMessage)
@@ -740,9 +812,35 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
         return self._fit_suffix_messages(messages, token_limit)
 
     @staticmethod
-    def _build_context_summary_message(summary: str) -> HumanMessage:
+    def _active_user_request_for_summary(
+        summarized_messages: list[AnyMessage],
+        preserved_messages: list[AnyMessage],
+    ) -> str | None:
+        latest_user = _latest_user_message([*summarized_messages, *preserved_messages])
+        if latest_user is None or any(
+            message is latest_user for message in preserved_messages
+        ):
+            return None
+        text = _message_content_text(latest_user)
+        return text if text.strip() else None
+
+    @staticmethod
+    def _build_context_summary_message(
+        summary: str, active_user_request: str | None = None
+    ) -> HumanMessage:
+        active_request_block = ""
+        if active_user_request is not None:
+            active_request_block = (
+                "ACTIVE_USER_REQUEST (preserved verbatim; continue this task):\n"
+                f"{active_user_request}\n"
+                "END_ACTIVE_USER_REQUEST\n\n"
+            )
         return HumanMessage(
-            content=f"Here is a summary of the document research conversation to date:\n\n{summary}",
+            content=(
+                f"{active_request_block}"
+                "Here is a summary of the document research conversation to date:\n\n"
+                f"{summary}"
+            ),
             name="context_summary",
             additional_kwargs={"lc_source": "context_summarization"},
         )

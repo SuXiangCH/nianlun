@@ -455,3 +455,19 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+def test_ensure_llm_disables_thinking_for_reproducible_indexing(monkeypatch):
+    """索引默认构建的 LLM 必须显式关闭思考（回归：provider 默认思考会吃空 content）。"""
+    from nianlun.indexing.tree import pipeline
+
+    captured = {}
+
+    def fake_build_chat_model(model=None, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(pipeline, "build_chat_model", fake_build_chat_model)
+    pipeline._ensure_llm(None, "some-model")
+
+    assert captured.get("enable_thinking") is False

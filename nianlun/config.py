@@ -18,7 +18,7 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_DIR = PROJECT_ROOT / "evals" / "results"
 
-DEFAULT_MODEL = "deepseek-v4-flash-0731"
+DEFAULT_MODEL = "deepseek-v4-flash"
 
 
 def get_openai_api_key() -> str | None:
@@ -34,14 +34,15 @@ def get_openai_model() -> str:
     return os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
 
 
-def get_enable_thinking() -> bool:
-    """读取 OpenAI-compatible 后端的思考模式开关。"""
-    return os.environ.get("OPENAI_ENABLE_THINKING", "true").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
+def get_enable_thinking() -> bool | None:
+    """读取思考模式关闭覆盖；仅显式 false 时覆盖供应商默认行为。"""
+    raw = os.environ.get("OPENAI_ENABLE_THINKING")
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return None
 
 
 def get_openai_temperature() -> float:

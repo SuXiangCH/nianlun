@@ -17,8 +17,9 @@ Nianlun，取意“年轮”。我们相信，智能系统的进化不是一场�
 | Agent | 生长者 | Agent 如树木在森林中自主生长，向光而行、向深处扎根；它在复杂问题中持续探索，规划检索路径并调用工具完成任务。 |
 | RAG | 根系汲取 | RAG 如根系穿透土壤，从多文档知识库中精准汲取养分；树索引、全文检索与向量检索共同为回答提供可追溯的证据。 |
 | 数据治理 | 木质结构 | 数据治理如年轮的木质纹理，层层分明、疏密有序；文档解析、工作区、元数据和分层索引让每条数据在正确的圈层中归位。 |
+| 评估 | 数年轮 | 评估如林业专家数年轮，不止粗略一瞥，而是逐项度量回答质量、检索效果与系统稳定性，让成长有据可查。 |
 
-Agent 是生长的意志，自主地向未知延伸；RAG 是深扎的根系，从知识的土壤中提取养分；数据治理是木质的分层，让混乱归于秩序。
+Agent 是生长的意志，自主地向未知延伸；RAG 是深扎的根系，从知识的土壤中提取养分；数据治理是木质的分层，让混乱归于秩序；评估是数年轮的刻度，让每一次成长都有据可量。
 
 在 Nianlun，我们不追求一蹴而就的参天，只在乎每一圈都扎实、每一层都可追溯。
 
@@ -96,6 +97,31 @@ uv run python -m nianlun.agent.cli --no-stream   # 交互模式，整轮完成�
 ```
 
 各命令的完整选项可用 `--help` 查看。
+
+### 通用 RAG 评估
+
+评估模块使用统一的四字段 JSONL 协议，不依赖 Nianlun 的 Agent 运行时。每一行包含
+`question`、`reference_answer`、`actual_answer` 与 `retrieval_contexts`；检索上下文是带
+`text` 和可选来源字段的数组。空回答会被确定性标记为 `generation_empty`，无需模型调用。
+
+```bash
+uv run python -m nianlun.evaluation.cli \
+  --input evals/results/normalized_requests.jsonl \
+  --output evals/results/evaluation_results.jsonl \
+  --judge-model judge-model \
+  --workers 4
+```
+
+Judge 复用 CLI 模型配置：API key 从 `OPENAI_API_KEY` 读取，兼容服务地址从
+`OPENAI_BASE_URL`（或 `OPENAI_API_BASE`）读取，不通过命令行参数传递密钥。为历史
+Nianlun 批处理结果指定 `--adapter nianlun`，将其显式转换为相同协议。
+
+Python 调用方可使用 `summarize_results(results)` 汇总同一 evaluator fingerprint 下的
+答案结论、检索证据、错误归因、Critic 路由、token 和重试统计。该汇总只报告内部可观测
+指标，不把没有人工标签的 Critic 推翻率解释为真实净纠错收益。评估架构、指标边界与稳定
+契约见 [`docs/architecture/evaluation.md`](docs/architecture/evaluation.md)；模型配置、
+输入样例、Excel 导出与断点续跑见
+[`nianlun/evaluation/README.md`](nianlun/evaluation/README.md)。
 
 ## 目录
 

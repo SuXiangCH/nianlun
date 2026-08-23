@@ -26,7 +26,7 @@ def test_prompt_uses_progressive_retrieval_for_composite_questions():
     assert "不要因为某文档出现在候选结果中就读取其全部目录或正文" in prompt
     assert "只有当用户要求全局总结、跨章节分析" in prompt
     assert "一次 get_line_content 只代表一个证据片段" in prompt
-    assert "达到上述停止条件后仍缺失的信息" in prompt
+    assert "若存在可通过一次定向检索补足的关键缺口，继续检索" in prompt
 
 
 def test_prompt_hides_internal_locations_and_separates_progress_from_final_answer():
@@ -36,8 +36,20 @@ def test_prompt_hides_internal_locations_and_separates_progress_from_final_answe
     assert "citation_id 是唯一允许展示的定位字段" in prompt
     assert "每个新的工具执行阶段开始前，应输出一句简短、自然的进度说明" in prompt
     assert "不展示内部推理、判断链条" in prompt
-    assert "最终答案不包含“现在我已经查看”" in prompt
-    assert "不要罗列未命中项、排除过程或其他取值" in prompt
+    assert "不要在最终答案中展示用户未要求的检索、分析或推导过程" in prompt
+    assert "不要展示内部定位字段、重复来源清单或内部检查过程" in prompt
+
+
+def test_prompt_requires_direct_answers_without_unsolicited_additions():
+    prompt = build_system_prompt(_NoCatalogKnowledgeBase())
+
+    assert "对简单、明确的问题，直接给出结论或结果" in prompt
+    assert "除非用户明确要求，否则不要添加解释、分析、比较、推导" in prompt
+    assert "不说明未命中项、排除过程或结果可能存在的理论遗漏" in prompt
+    assert "不要补充用户未询问的信息" in prompt
+    assert "限制说明、免责声明" in prompt
+    assert "不要让结论的适用范围超过证据覆盖范围" in prompt
+    assert "立即结束输出" in prompt
 
 
 def test_prompt_uses_tool_assigned_citation_ids():
@@ -73,5 +85,5 @@ def test_prompt_describes_deduplicated_retrieval_results():
     assert "不要因此重复相同检索" in prompt
 
 
-def test_prompt_revision_is_v1():
-    assert PROMPT_VERSION == 1
+def test_prompt_revision_is_v4():
+    assert PROMPT_VERSION == 4

@@ -9,7 +9,7 @@
 - :mod:`nianlun.indexing.fts`  节点级全文索引构建
 - :mod:`nianlun.knowledgebase` 在线知识库访问与检索
 - :mod:`nianlun.agent`        交互/批量入口；主 Agent 位于 ``nianlun.agent.lead_agent``
-- :mod:`nianlun.models.llm`       共享 LLM 工厂 ``build_chat_model`` 与 content 归一化 ``content_to_text``
+- :mod:`nianlun.models.llm`       统一 LLM 客户端、结构化输出与 content 归一化
 - :mod:`nianlun.models.embedding` 共享 Embedding 工厂 ``build_embeddings_model``
 
 典型用法（按需从子模块导入，不再经顶层 re-export）::

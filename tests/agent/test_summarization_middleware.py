@@ -181,6 +181,35 @@ def test_context_summarization_preserves_evidence_and_tool_pair():
     assert "long evidence body" in prompt
 
 
+def test_context_summarization_embeds_active_request_when_keep_window_drops_it():
+    model = _make_summary_model("summary without the active request")
+    middleware = ContextSummarizationMiddleware(
+        model,
+        trigger=("messages", 4),
+        keep=("messages", 1),
+        hard_limit=None,
+        conversation_turn_limit=None,
+        token_counter=len,
+    )
+    messages = [
+        HumanMessage(content="需要保留的当前问题"),
+        AIMessage(content="research step 1"),
+        AIMessage(content="research step 2"),
+        AIMessage(content="research step 3"),
+    ]
+
+    result = middleware.before_model({"messages": messages}, SimpleNamespace())
+
+    assert result is not None
+    summary = result["messages"][1]
+    assert summary.name == "context_summary"
+    assert "ACTIVE_USER_REQUEST" in summary.content
+    assert "需要保留的当前问题" in summary.content
+    assert result["messages"][2] is messages[-1]
+    summary_prompt = model.invoke.call_args.args[0]
+    assert "首先完整保留最近一条尚未完成的用户请求" in summary_prompt
+
+
 def test_context_summarization_does_not_trigger_below_threshold():
     model = _make_summary_model()
     middleware = ContextSummarizationMiddleware(
@@ -337,6 +366,33 @@ def test_context_summarization_uses_deterministic_fallback_on_failure():
     assert "1395" in summary
 
 
+def test_deterministic_fallback_embeds_active_request_from_summarized_messages():
+    model = _make_summary_model()
+    model.invoke.side_effect = RuntimeError("summary backend unavailable")
+    middleware = ContextSummarizationMiddleware(
+        model,
+        trigger=("messages", 4),
+        keep=("messages", 1),
+        hard_limit=None,
+        conversation_turn_limit=None,
+        token_counter=len,
+    )
+    messages = [
+        HumanMessage(content="不能丢失的当前问题"),
+        AIMessage(content="research step 1"),
+        AIMessage(content="research step 2"),
+        AIMessage(content="research step 3"),
+    ]
+
+    result = middleware.before_model({"messages": messages}, SimpleNamespace())
+
+    assert result is not None
+    summary = result["messages"][1].content
+    assert "ACTIVE_USER_REQUEST" in summary
+    assert "不能丢失的当前问题" in summary
+    assert "Summary model unavailable" in summary
+
+
 def test_context_summarization_uses_deterministic_fallback_at_hard_limit():
     model = _make_summary_model()
     middleware = ContextSummarizationMiddleware(
@@ -408,6 +464,32 @@ def test_context_summarization_enforces_hard_limit_when_keep_window_is_too_large
     assert len(result["messages"]) == 3
 
 
+def test_hard_limit_prioritizes_latest_user_request_over_summary():
+    model = _make_summary_model()
+
+    def token_counter(items):
+        return sum(len(str(getattr(item, "content", ""))) for item in items)
+
+    middleware = ContextSummarizationMiddleware(
+        model,
+        trigger=("tokens", 1),
+        hard_limit=60,
+        conversation_turn_limit=None,
+        token_counter=token_counter,
+    )
+    current_question = HumanMessage(content="critical current question")
+    messages = [
+        HumanMessage(content="s" * 120, name="context_summary"),
+        current_question,
+        AIMessage(content="r" * 120),
+    ]
+
+    fitted = middleware._fit_messages_to_hard_limit(messages)
+
+    assert current_question in fitted
+    assert token_counter(fitted) <= 60
+
+
 def test_hard_limit_suffix_never_starts_with_orphan_tool_message():
     model = _make_summary_model()
 
@@ -460,8 +542,10 @@ def test_context_summarization_supports_async_summary_generation():
     model = _make_summary_model("async compressed context")
     middleware = ContextSummarizationMiddleware(
         model,
-        trigger=("messages", 3),
+        trigger=("messages", 4),
         keep=("messages", 1),
+        hard_limit=None,
+        conversation_turn_limit=None,
         token_counter=len,
     )
 
@@ -469,9 +553,10 @@ def test_context_summarization_supports_async_summary_generation():
         return await middleware.abefore_model(
             {
                 "messages": [
-                    HumanMessage(content="old-1"),
-                    HumanMessage(content="old-2"),
-                    HumanMessage(content="current"),
+                    HumanMessage(content="async current question"),
+                    AIMessage(content="research step 1"),
+                    AIMessage(content="research step 2"),
+                    AIMessage(content="research step 3"),
                 ]
             },
             SimpleNamespace(),
@@ -481,3 +566,4 @@ def test_context_summarization_supports_async_summary_generation():
 
     assert result is not None
     assert "async compressed context" in result["messages"][1].content
+    assert "async current question" in result["messages"][1].content
