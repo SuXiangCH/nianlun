@@ -1,5 +1,4 @@
-"""Embedding 工厂与响应归一化的统一入口，检索侧与索引侧共用。
-"""
+"""Embedding 工厂与响应归一化的统一入口，检索侧与索引侧共用。"""
 
 from __future__ import annotations
 
@@ -65,8 +64,10 @@ def _vector_list(value: object) -> list[float] | None:
         if _is_number(parsed):
             return None
         return _base64_vector(text)
-    if not isinstance(value, list) or not value or not all(
-        _is_number(item) for item in value
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(_is_number(item) for item in value)
     ):
         return None
     return [float(item) for item in value]
@@ -135,9 +136,7 @@ def _standard_embedding_response(
                 for index, vector in enumerate(vectors)
             ],
             "model": str(response.get("model") or model),
-            "usage": response.get(
-                "usage", {"prompt_tokens": 0, "total_tokens": 0}
-            ),
+            "usage": response.get("usage", {"prompt_tokens": 0, "total_tokens": 0}),
         }
     )
     return response
@@ -169,9 +168,7 @@ def embedding_response_hook(model: str) -> Callable[[httpx.Response], None]:
         except (json.JSONDecodeError, TypeError):
             payload = text
         original = payload if isinstance(payload, dict) else None
-        normalized = _standard_embedding_response(
-            payload, model, original=original
-        )
+        normalized = _standard_embedding_response(payload, model, original=original)
         if normalized is None:
             return
         setattr(response, "_content", json.dumps(normalized).encode("utf-8"))

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from app.api_server.apis.v1.schemas import KnowledgeBaseCreateRequest
-from app.api_server.config import get_settings
+from app.api_server.config import ApiServerSettings, get_settings
 from app.api_server.services.container import build_services
 
 FTS_WAIT_TIMEOUT_SECONDS = 600
@@ -70,7 +70,8 @@ def _wait_for_fts(services: Any, knowledge_base_id: str) -> str:
 
 
 def main(
-    argv: list[str] | None = None, settings: Any | None = None
+    argv: list[str] | None = None,
+    settings: ApiServerSettings | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(
         description="把 datasets/ 的 Markdown 正文与预建树导入 API Server 知识库"

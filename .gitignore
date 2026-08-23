@@ -51,4 +51,8 @@ Thumbs.db
 # Frontend dependencies
 node_modules/
 app/frontend/node_modules/
-docs/
+docs/*
+!docs/usage.md
+!docs/architecture/
+docs/architecture/*
+!docs/architecture/evaluation.md

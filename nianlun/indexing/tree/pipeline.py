@@ -356,7 +356,8 @@ def _ensure_llm(llm, model: str | None):
     """llm 缺省时按 model 构建；仅摘要/描述需要时才调用（无摘要路径零 LLM）。"""
     if llm is not None:
         return llm
-    return build_chat_model(model=model)
+    # 索引摘要要求可复现：显式关闭思考，避免推理通道吃空 content。
+    return build_chat_model(model=model, enable_thinking=False)
 
 
 def _has_oversized_section(
