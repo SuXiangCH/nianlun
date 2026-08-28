@@ -16,6 +16,7 @@ from nianlun.agent.tools import (
     build_tools,
     find_semantic_documents_tool,
     get_line_content_tool,
+    get_structure_outline_tool,
     search_document_nodes_tool,
 )
 
@@ -134,6 +135,26 @@ def test_get_line_content_tool_applies_default_and_maximum_limits():
 
     get_line_content_tool.func(runtime, "doc-1", "1", char_limit=20_000)
     assert calls[-1]["char_limit"] == 8000
+
+
+def test_get_line_content_allows_direct_read_and_outline_remains_optional():
+    content_calls = []
+
+    class FakeKnowledgeBase:
+        def get_structure_outline(self, doc_id):
+            return f"[0001] 第 1 行: {doc_id} 目录"
+
+        def get_line_content(self, **kwargs):
+            content_calls.append(kwargs)
+            return "{}"
+
+    runtime = _runtime_context(FakeKnowledgeBase())
+
+    assert json.loads(get_line_content_tool.func(runtime, "doc-1", "1")) == {}
+    assert len(content_calls) == 1
+    assert "doc-1 目录" in get_structure_outline_tool.func(runtime, "doc-1")
+    assert json.loads(get_line_content_tool.func(runtime, "doc-1", "1")) == {}
+    assert len(content_calls) == 2
 
 
 def test_tool_exceptions_are_left_for_error_middleware():
@@ -319,6 +340,10 @@ def test_agent_runtime_exposes_application_context():
     second_collector, second_context = runtime.new_request_context()
     assert second_collector is not collector
     assert second_context["retrieval_collector"] is second_collector
+    assert (
+        second_context["retrieval_deduplication_state"]
+        is not context["retrieval_deduplication_state"]
+    )
 
 
 def test_agent_runtime_does_not_retain_factory_secrets_or_worker_builder():

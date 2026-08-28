@@ -12,7 +12,11 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from nianlun.knowledgebase.config import NODE_MATCH_LIMIT, WORKSPACE_DIR
+from nianlun.knowledgebase.config import (
+    NODE_HINT_SUMMARY_LIMIT,
+    NODE_MATCH_LIMIT,
+    WORKSPACE_DIR,
+)
 
 if TYPE_CHECKING:
     from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
@@ -261,16 +265,23 @@ class KnowledgeBase:
                 "node_hints": [],
             }
 
-        for hit in selected_nodes:
+        for hit_index, hit in enumerate(selected_nodes):
             doc_id = hit["doc_id"]
             document = documents_by_id[doc_id]
-            document["node_hints"].append(
-                {
-                    "node_id": hit.get("node_id"),
-                    "title": sanitize_text(str(hit.get("title", ""))),
-                    "line_num": hit.get("line_num"),
-                }
-            )
+            node_id = hit.get("node_id")
+            hint = {
+                "node_id": node_id,
+                "title": sanitize_text(str(hit.get("title", ""))),
+                "line_num": hit.get("line_num"),
+            }
+            if hit_index < NODE_HINT_SUMMARY_LIMIT:
+                summary = hit.get("node_summary")
+                if isinstance(summary, str) and summary:
+                    hint["summary"] = sanitize_text(summary)
+                    hint["summary_truncated"] = (
+                        hit.get("node_summary_truncated") is True
+                    )
+            document["node_hints"].append(hint)
         return json.dumps(
             {
                 "query": query,

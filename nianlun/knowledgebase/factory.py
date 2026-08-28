@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from nianlun.indexing.fts.config import FTS_SCHEMA_CHECK_TIMEOUT_SECONDS
+from nianlun.indexing.fts.store import CollectionSchemaStatus
 from nianlun.indexing.vector.config import get_embedding_dim
-from nianlun.models.embedding import build_embedding_client
 from nianlun.indexing.vector.store import DocVectorStore
+from nianlun.models.embedding import build_embedding_client
 from nianlun.knowledgebase.config import KnowledgeBaseConfig
 from nianlun.knowledgebase.core import KnowledgeBase
 from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
@@ -38,11 +40,16 @@ class KnowledgeBaseFactory:
             collection_name=self.config.fts_collection,
             knowledge_base_id=self.config.knowledge_base_id,
         )
-        if not full_text_retriever.store.client.has_collection(
-            full_text_retriever.store.collection
-        ):
+        schema_status = full_text_retriever.store.schema_status(
+            timeout=FTS_SCHEMA_CHECK_TIMEOUT_SECONDS
+        )
+        if schema_status is CollectionSchemaStatus.MISSING:
             raise RuntimeError(
                 f"Milvus collection 不存在: {full_text_retriever.store.collection}"
+            )
+        if schema_status is CollectionSchemaStatus.OUTDATED:
+            raise RuntimeError(
+                "Milvus FTS collection schema 已过期；请等待或触发 FTS 索引重建"
             )
 
         return KnowledgeBase(

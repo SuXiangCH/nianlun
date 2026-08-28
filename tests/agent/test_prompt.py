@@ -23,8 +23,17 @@ def test_prompt_uses_progressive_retrieval_for_composite_questions():
     prompt = build_system_prompt(_NoCatalogKnowledgeBase())
 
     assert "综合问题" in prompt
-    assert "不要因为某文档出现在候选结果中就读取其全部目录或正文" in prompt
-    assert "只有当用户要求全局总结、跨章节分析" in prompt
+    assert "不要因为文档出现在结果中就读取全部候选文档" in prompt
+    assert "高排名 node_hints 可能带有受限 summary" in prompt
+    assert "只用于判断候选节点与目标概念的对应关系" in prompt
+    assert "优先直接读取 summary 最匹配节点的正文" in prompt
+    assert "正文能够精确、完整支撑答案时，不必读取目录" in prompt
+    assert "仅在以下情况调用 get_structure_outline" in prompt
+    assert "最近的同父前置兄弟节点" in prompt
+    assert "line_spec 必须使用目录返回的真实节点起始行" in prompt
+    assert "不得通过行号减法" in prompt
+    assert "只对证据不足、概念冲突或需要完整性判断的文档补读目录" in prompt
+    assert "不要固定读取每篇候选文档的完整目录" in prompt
     assert "一次 get_line_content 只代表一个证据片段" in prompt
     assert "若存在可通过一次定向检索补足的关键缺口，继续检索" in prompt
 
@@ -85,5 +94,23 @@ def test_prompt_describes_deduplicated_retrieval_results():
     assert "不要因此重复相同检索" in prompt
 
 
-def test_prompt_revision_is_v4():
-    assert PROMPT_VERSION == 4
+def test_prompt_requires_answer_coverage_check_before_stopping():
+    prompt = build_system_prompt(_NoCatalogKnowledgeBase())
+
+    assert "<回答前覆盖检查>" in prompt
+    assert "当前证据是否直接、完整地覆盖用户问题" in prompt
+    assert "不能把相近概念、相邻字段或同类指标当成目标字段" in prompt
+    assert "仅部分词语重合但语义不同的字段" in prompt
+    assert "概念性问题必须匹配到与用户目标概念直接对应的正文" in prompt
+    assert "先扩大相邻章节的读取范围" in prompt
+    assert "仍不足时再使用保持原意的 query 扩大搜索范围" in prompt
+    assert "污染等级" not in prompt
+    assert "污染液体" not in prompt
+    assert "继续定向读取相关节点" in prompt
+    assert "query 扩大搜索范围" in prompt
+    assert "仍不确定时，明确说明无法确认" in prompt
+    assert prompt.rfind("<回答前覆盖检查>") > prompt.rfind("<停止条件>")
+
+
+def test_prompt_revision_is_v9():
+    assert PROMPT_VERSION == 9

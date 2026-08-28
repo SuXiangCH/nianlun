@@ -14,7 +14,10 @@ from __future__ import annotations
 from collections.abc import Iterator
 from typing import Any
 
-from nianlun.indexing.fts.config import TEXT_TRUNCATE_BYTES
+from nianlun.indexing.fts.config import (
+    NODE_SUMMARY_PREVIEW_CHAR_LIMIT,
+    TEXT_TRUNCATE_BYTES,
+)
 
 # 三源标识
 SOURCE_DOC_DESC = "doc_desc"
@@ -55,6 +58,15 @@ def summary_field(node: dict) -> str:
     return node.get("summary") or ""
 
 
+def node_summary_preview(summary: str) -> tuple[str | None, bool | None]:
+    """Return compact node navigation metadata and its truncation flag."""
+    compact = " ".join(summary.split())
+    if not compact:
+        return None, None
+    truncated = len(compact) > NODE_SUMMARY_PREVIEW_CHAR_LIMIT
+    return compact[:NODE_SUMMARY_PREVIEW_CHAR_LIMIT], truncated
+
+
 def _normalize_ws(s: str) -> str:
     """归一化空白用于重复判定：合并连续空白、去首尾（不影响存入 Milvus 的原文 ``text``）。"""
     return " ".join(s.split())
@@ -89,7 +101,7 @@ def build_records(
         knowledge_base_id: 多知识库共用 collection 时写入的隔离字段。
 
     Returns:
-        每条记录 ``{doc_id, doc_name, source_type, node_id, title, line_num, text}``；
+        节点记录同时携带受限 ``node_summary`` 导航元数据；
         ``doc_desc`` 记录的 ``node_id``/``title``/``line_num`` 为 ``None``。
         ``emb_pk``（auto_id）与 ``sparse``（BM25 function 输出）由 Milvus 生成，不含于此。
     """
@@ -109,6 +121,8 @@ def build_records(
                 "title": None,
                 "line_num": None,
                 "text": truncate_bytes(doc_description),
+                "node_summary": None,
+                "node_summary_truncated": None,
             }
         )
 
@@ -119,6 +133,7 @@ def build_records(
         line_num = node.get("line_num")
         text = node.get("text", "") or ""
         summary = summary_field(node)
+        summary_preview, summary_truncated = node_summary_preview(summary)
 
         if text.strip():
             records.append(
@@ -130,6 +145,8 @@ def build_records(
                     "title": title,
                     "line_num": line_num,
                     "text": truncate_bytes(text),
+                    "node_summary": summary_preview,
+                    "node_summary_truncated": summary_truncated,
                 }
             )
         if summary.strip() and not is_dup_summary(summary, text):
@@ -142,6 +159,8 @@ def build_records(
                     "title": title,
                     "line_num": line_num,
                     "text": truncate_bytes(summary),
+                    "node_summary": summary_preview,
+                    "node_summary_truncated": summary_truncated,
                 }
             )
 

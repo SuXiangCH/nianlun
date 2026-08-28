@@ -11,9 +11,11 @@ schema 为多记录单字段：``text``（BM25 输入，混合语言 analyzer）
 from __future__ import annotations
 
 import logging
-from typing import Any
+from enum import StrEnum
+from typing import Any, cast
 
 from nianlun.indexing.fts.config import (
+    NODE_SUMMARY_PREVIEW_MAX_BYTES,
     TEXT_MAX_BYTES,
     get_fts_analyzer_params,
     get_milvus_token,
@@ -36,6 +38,14 @@ else:
 logger = logging.getLogger(__name__)
 
 
+class CollectionSchemaStatus(StrEnum):
+    """Compatibility state of an FTS collection."""
+
+    MISSING = "missing"
+    OUTDATED = "outdated"
+    CURRENT = "current"
+
+
 def ensure_pymilvus() -> None:
     """检查 pymilvus 依赖；缺失时记录安装提示并抛原异常。"""
     if _PYMILVUS_IMPORT_ERROR is None:
@@ -45,8 +55,17 @@ def ensure_pymilvus() -> None:
 
 
 def _output_fields() -> list[str]:
-    """search 返回字段（不含 ``text``：不泄正文，保"定位后现取"）。"""
-    return ["doc_id", "doc_name", "source_type", "node_id", "title", "line_num"]
+    """Search fields excluding body ``text`` but including navigation metadata."""
+    return [
+        "doc_id",
+        "doc_name",
+        "source_type",
+        "node_id",
+        "title",
+        "line_num",
+        "node_summary",
+        "node_summary_truncated",
+    ]
 
 
 def query_variants(query: str) -> list[str]:
@@ -110,6 +129,13 @@ class NodeFtsStore:
         schema.add_field("title", DataType.VARCHAR, max_length=512, nullable=True)
         schema.add_field("line_num", DataType.INT64, nullable=True)
         schema.add_field(
+            "node_summary",
+            DataType.VARCHAR,
+            max_length=NODE_SUMMARY_PREVIEW_MAX_BYTES,
+            nullable=True,
+        )
+        schema.add_field("node_summary_truncated", DataType.BOOL, nullable=True)
+        schema.add_field(
             "text",
             DataType.VARCHAR,
             max_length=TEXT_MAX_BYTES,
@@ -143,6 +169,40 @@ class NodeFtsStore:
             index_params=index_params,
         )
         self._loaded = False  # drop+recreate 后 collection 已变，旧 load 状态失效
+
+    def schema_status(self, *, timeout: float | None = None) -> CollectionSchemaStatus:
+        """Inspect collection existence and schema compatibility in one probe."""
+        call_options = {} if timeout is None else {"timeout": timeout}
+        if not self.client.has_collection(self.collection, **call_options):
+            return CollectionSchemaStatus.MISSING
+        description = cast(
+            dict[str, Any],
+            self.client.describe_collection(self.collection, **call_options),
+        )
+        fields = {
+            str(field.get("name"))
+            for field in description.get("fields", [])
+            if isinstance(field, dict)
+        }
+        is_current = {
+            "doc_id",
+            "doc_name",
+            "source_type",
+            "node_id",
+            "title",
+            "line_num",
+            "text",
+            "sparse",
+            "node_summary",
+            "node_summary_truncated",
+        }.issubset(fields)
+        if is_current:
+            return CollectionSchemaStatus.CURRENT
+        return CollectionSchemaStatus.OUTDATED
+
+    def has_current_schema(self, *, timeout: float | None = None) -> bool:
+        """Whether the collection exposes the metadata required by node search."""
+        return self.schema_status(timeout=timeout) is CollectionSchemaStatus.CURRENT
 
     def ensure_collection(self) -> bool:
         """确保 collection 存在：缺失则建表，已存在则不动。
@@ -214,7 +274,8 @@ class NodeFtsStore:
         也能获得大小写不敏感的检索效果。
 
         Returns:
-            ``[{doc_id, doc_name, source_type, node_id, title, line_num, score}]``，
+            ``[{doc_id, doc_name, source_type, node_id, title, line_num,
+            node_summary, node_summary_truncated, score}]``，
             按 BM25 分数降序。``node_id`` 为 ``None`` 的命中来自 ``doc_desc`` 记录（文档级）。
         """
         if not self._loaded:  # 仅首次 load，后续 search 不重发（幂等但省往返）
@@ -256,11 +317,15 @@ class NodeFtsStore:
                         "node_id": entity.get("node_id"),
                         "title": entity.get("title"),
                         "line_num": entity.get("line_num"),
+                        "node_summary": entity.get("node_summary"),
+                        "node_summary_truncated": entity.get("node_summary_truncated"),
                         "score": hit.get("distance"),
                     }
                     key = tuple(item[field] for field in _output_fields())
                     current = merged.get(key)
-                    if current is None or (item["score"] or 0) > (current["score"] or 0):
+                    if current is None or (item["score"] or 0) > (
+                        current["score"] or 0
+                    ):
                         merged[key] = item
 
         return sorted(
@@ -285,7 +350,11 @@ def _smoke_search() -> None:
     """
     import sys
 
-    from nianlun.indexing.fts.config import DOC_DERIVE_LIMIT, NODE_MATCH_LIMIT, NODE_PER_DOC
+    from nianlun.indexing.fts.config import (
+        DOC_DERIVE_LIMIT,
+        NODE_MATCH_LIMIT,
+        NODE_PER_DOC,
+    )
     from nianlun.indexing.fts.postprocess import postprocess_node_hits
 
     s = NodeFtsStore()
@@ -298,10 +367,7 @@ def _smoke_search() -> None:
         sys.exit(1)
 
     print(f"collection: {s.collection}（cap_per_doc={NODE_PER_DOC}）")
-    queries = (
-        "test",
-        "测试"
-    )
+    queries = ("test", "测试")
     for q in queries:
         hits = s.search(q, limit=DOC_DERIVE_LIMIT)
         node_hits = [h for h in hits if h.get("node_id")]

@@ -4,7 +4,7 @@ import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
-import { normalizeHtmlTables } from "../chat/markdown";
+import { normalizeHtmlTablesWithSourceLines } from "../chat/markdown";
 import type { DocumentIndexNode, DocumentIndexTree } from "../../types";
 
 interface Props {
@@ -28,10 +28,9 @@ interface HastNode {
   position?: { start?: { line?: number } };
 }
 
-// Stamp each rendered heading with its source line so tree clicks can anchor
-// into the rendered document; positions are exact unless table normalization
-// rewrote lines above the heading, in which case jumps land on a nearby one.
-const rehypeHeadingLines = () => (tree: HastNode) => {
+// Stamp each rendered heading with its original Markdown source line so tree
+// clicks remain exact even when HTML table normalization changes rendered lines.
+const rehypeHeadingLines = (sourceLineByRenderedLine: number[]) => () => (tree: HastNode) => {
   const walk = (node: HastNode) => {
     if (
       node.type === "element" &&
@@ -39,7 +38,11 @@ const rehypeHeadingLines = () => (tree: HastNode) => {
       /^h[1-6]$/.test(node.tagName) &&
       typeof node.position?.start?.line === "number"
     ) {
-      node.properties = { ...(node.properties || {}), dataLine: node.position.start.line };
+      const renderedLine = node.position.start.line;
+      node.properties = {
+        ...(node.properties || {}),
+        dataLine: sourceLineByRenderedLine[renderedLine - 1] ?? renderedLine,
+      };
     }
     (node.children || []).forEach(walk);
   };
@@ -56,6 +59,13 @@ const collectDefaultCollapsed = (nodes: DocumentIndexNode[], depth: number, coll
 const countNodes = (nodes: DocumentIndexNode[]): number =>
   nodes.reduce((total, node) => total + 1 + countNodes(node.nodes || []), 0);
 
+const collectBranchNodeIds = (nodes: DocumentIndexNode[], nodeIds: Set<string>) => {
+  for (const node of nodes) {
+    if (node.nodes?.length) nodeIds.add(node.node_id);
+    collectBranchNodeIds(node.nodes || [], nodeIds);
+  }
+};
+
 interface TreeNodeProps {
   node: DocumentIndexNode;
   depth: number;
@@ -70,8 +80,8 @@ const TreeNode = ({ node, depth, collapsed, activeNodeId, onToggle, onJump }: Tr
   const expanded = hasChildren && !collapsed.has(node.node_id);
   const summary = node.summary || node.prefix_summary;
   return (
-    <li className="reader-tree-item">
-      <div className={`reader-tree-row ${activeNodeId === node.node_id ? "is-active" : ""}`} style={{ paddingLeft: depth * 12 }}>
+    <li className="reader-tree-item" data-depth={depth}>
+      <div className={`reader-tree-row reader-tree-depth-${Math.min(depth, 4)} ${activeNodeId === node.node_id ? "is-active" : ""}`}>
         {hasChildren ? (
           <button className="reader-tree-toggle" type="button" aria-label={expanded ? `收起 ${node.title}` : `展开 ${node.title}`} aria-expanded={expanded} onClick={() => onToggle(node.node_id)}>{expanded ? "▾" : "▸"}</button>
         ) : (
@@ -160,7 +170,18 @@ export function DocumentReader({
   };
 
   const sourceLines = useMemo(() => (content === null ? [] : content.split("\n")), [content]);
+  const normalizedContent = useMemo(
+    () => (content === null ? null : normalizeHtmlTablesWithSourceLines(content)),
+    [content],
+  );
   const nodeCount = tree ? countNodes(tree.structure) : 0;
+
+  const expandAll = () => setCollapsed(new Set());
+  const collapseAll = () => {
+    const next = new Set<string>();
+    collectBranchNodeIds(tree?.structure || [], next);
+    setCollapsed(next);
+  };
 
   return (
     <div className="document-content-panel document-reader" ref={rootRef}>
@@ -180,8 +201,16 @@ export function DocumentReader({
       <div className="reader-body">
         <aside className="reader-tree" aria-label="文档索引树">
           <div className="reader-tree-heading">
-            <span>索引树</span>
-            {tree && <span className="reader-tree-count">{nodeCount} 个节点</span>}
+            <div className="reader-tree-heading-title">
+              <span>索引树</span>
+              {tree && <span className="reader-tree-count">{nodeCount} 个节点</span>}
+            </div>
+            {tree && tree.structure.length > 0 && (
+              <div className="reader-tree-actions" role="group" aria-label="索引树展开状态">
+                <button type="button" onClick={expandAll}>展开</button>
+                <button type="button" onClick={collapseAll}>收起</button>
+              </div>
+            )}
           </div>
           {treeLoading && <div className="reader-tree-state">正在加载索引树...</div>}
           {treeError && <div className="reader-tree-state is-error" role="alert">{treeError}</div>}
@@ -198,7 +227,7 @@ export function DocumentReader({
           {contentError && <div className="reader-content-state is-error" role="alert">{contentError}</div>}
           {content !== null && (mode === "rendered" ? (
             <div className="message-markdown reader-markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex, rehypeHeadingLines]}>{normalizeHtmlTables(content)}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex, rehypeHeadingLines(normalizedContent?.sourceLineByRenderedLine || [])]}>{normalizedContent?.content || ""}</ReactMarkdown>
             </div>
           ) : (
             <pre className="reader-source">{sourceLines.map((line, index) => (

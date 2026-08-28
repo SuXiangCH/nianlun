@@ -33,6 +33,8 @@ def build_workspace_doc(
     no_summary: bool = False,
     atx_only: bool = True,
     llm: Any = None,
+    thin: bool = False,
+    min_node_token: int | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build one Markdown index and normalize it to the workspace contract."""
     result = build_md_index_sync(
@@ -44,6 +46,8 @@ def build_workspace_doc(
         add_node_text=True,
         add_node_id=True,
         atx_only=atx_only,
+        thin=thin,
+        min_node_token=min_node_token,
     )
     doc_id = str(uuid.uuid4())
     doc = {
@@ -75,7 +79,9 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def write_workspace_doc(workspace: Path | str, doc_id: str, doc: dict[str, Any]) -> None:
+def write_workspace_doc(
+    workspace: Path | str, doc_id: str, doc: dict[str, Any]
+) -> None:
     """Write one document and merge its metadata into ``_meta.json``."""
     workspace_path = Path(workspace)
     workspace_path.mkdir(parents=True, exist_ok=True)

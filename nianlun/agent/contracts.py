@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, NotRequired, Protocol, TypedDict
 
-AGENT_TOOL_SCHEMA_VERSION = 2
+AGENT_TOOL_SCHEMA_VERSION = 4
 
 
 class KnowledgeBasePort(Protocol):

@@ -9,6 +9,7 @@ import shutil
 import threading
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator
 
@@ -20,6 +21,32 @@ except ImportError:  # pragma: no cover - the supported deployment is POSIX
 
 _thread_locks: dict[Path, threading.RLock] = {}
 _thread_locks_guard = threading.Lock()
+TREE_BUILD_OPTIONS_FILENAME = ".tree-build-options.json"
+
+
+@dataclass(frozen=True, slots=True)
+class TreeBuildOptions:
+    """Persisted tree-build behavior for one API-owned knowledge-base workspace."""
+
+    subtree_folding_enabled: bool = False
+    min_subtree_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.subtree_folding_enabled:
+            return
+        if (
+            isinstance(self.min_subtree_tokens, bool)
+            or not isinstance(self.min_subtree_tokens, int)
+            or self.min_subtree_tokens <= 0
+        ):
+            raise ValueError("启用子树折叠时 min_subtree_tokens 必须为正整数")
+
+
+LEGACY_TREE_BUILD_OPTIONS = TreeBuildOptions()
+NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS = TreeBuildOptions(
+    subtree_folding_enabled=True,
+    min_subtree_tokens=1200,
+)
 
 
 def _lock_for(path: Path) -> threading.RLock:
@@ -63,6 +90,43 @@ class WorkspaceArtifactStore:
                 os.close(directory_fd)
         finally:
             temporary.unlink(missing_ok=True)
+
+    @classmethod
+    def write_tree_build_options(
+        cls, workspace: Path, options: TreeBuildOptions
+    ) -> None:
+        payload = {
+            "version": 1,
+            "subtree_folding_enabled": options.subtree_folding_enabled,
+            "min_subtree_tokens": options.min_subtree_tokens,
+        }
+        cls.atomic_write(
+            workspace / TREE_BUILD_OPTIONS_FILENAME,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8"),
+        )
+
+    @staticmethod
+    def read_tree_build_options(workspace: Path) -> TreeBuildOptions:
+        path = workspace / TREE_BUILD_OPTIONS_FILENAME
+        if not path.exists():
+            # Workspaces created before this option existed retain their tree.
+            return LEGACY_TREE_BUILD_OPTIONS
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"知识库树构建配置不可读: {path}") from exc
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError(f"知识库树构建配置格式无效: {path}")
+        enabled = payload.get("subtree_folding_enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError(f"知识库树构建配置格式无效: {path}")
+        try:
+            return TreeBuildOptions(
+                subtree_folding_enabled=enabled,
+                min_subtree_tokens=payload.get("min_subtree_tokens"),
+            )
+        except ValueError as exc:
+            raise ValueError(f"知识库树构建配置格式无效: {path}") from exc
 
     @staticmethod
     def _read_manifest(workspace: Path) -> dict[str, dict[str, Any]]:
@@ -233,4 +297,11 @@ class WorkspaceArtifactStore:
         return len(metadata)
 
 
-__all__ = ["WorkspaceArtifactStore", "workspace_lock"]
+__all__ = [
+    "LEGACY_TREE_BUILD_OPTIONS",
+    "NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS",
+    "TREE_BUILD_OPTIONS_FILENAME",
+    "TreeBuildOptions",
+    "WorkspaceArtifactStore",
+    "workspace_lock",
+]
