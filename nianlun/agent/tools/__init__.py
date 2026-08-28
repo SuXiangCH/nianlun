@@ -101,6 +101,7 @@ def search_document_nodes_tool(
     """全文检索文档节点，并返回可用于 get_line_content 的节点提示。
 
     ``doc_ids`` 可选，用于在语义文档路由返回的候选文档范围内继续检索。
+    高排名节点可能带有受限 summary，仅用于选择待读节点，不能作为答案证据。
     """
     start = time.monotonic()
     try:
@@ -180,7 +181,10 @@ def get_document_tool(runtime: Runtime, doc_id: str) -> str:
 
 @tool("get_structure_outline")
 def get_structure_outline_tool(runtime: Runtime, doc_id: str) -> str:
-    """返回文档目录结构（节点 ID、标题、行号），不含正文。命中正文不足、需查找相关章节或核对结构时调用。"""
+    """返回纯目录结构（节点 ID、标题、层级、行号），不含 summary 或正文。
+
+    在正文证据不足、需要理解章节关系或判断覆盖范围时按需调用。
+    """
     start = time.monotonic()
     try:
         return _run_tool(

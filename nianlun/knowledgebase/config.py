@@ -16,6 +16,7 @@ WORKSPACE_DIR = Path(
 ).expanduser()
 META_PATH = WORKSPACE_DIR / "_meta.json"
 NODE_MATCH_LIMIT = 60
+NODE_HINT_SUMMARY_LIMIT = 20
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ class KnowledgeBaseConfig:
 __all__ = [
     "KnowledgeBaseConfig",
     "META_PATH",
+    "NODE_HINT_SUMMARY_LIMIT",
     "NODE_MATCH_LIMIT",
     "WORKSPACE_DIR",
 ]

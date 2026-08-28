@@ -12,6 +12,7 @@ from nianlun.indexing.fts.build_records import (
     SOURCE_NODE_TEXT,
     build_records,
     is_dup_summary,
+    node_summary_preview,
     summary_field,
     truncate_bytes,
     walk_nodes,
@@ -113,6 +114,16 @@ def test_summary_field_missing():
     assert summary_field({"nodes": []}) == ""
 
 
+def test_node_summary_preview_normalizes_and_bounds_navigation_metadata():
+    preview, truncated = node_summary_preview("  第一行\n\n第二行  ")
+    assert preview == "第一行 第二行"
+    assert truncated is False
+
+    preview, truncated = node_summary_preview("x" * 301)
+    assert preview == "x" * 300
+    assert truncated is True
+
+
 # ============ build_records：三源记录 ============
 
 
@@ -158,6 +169,9 @@ def test_build_records_node_text_carries_node_fields():
     assert nt["title"] == "营业收入明细"
     assert nt["line_num"] == 8
     assert "营业收入 100 亿" in nt["text"]
+    # 摘要记录因与正文重复而不入 BM25，但其导航摘要仍随正文记录持久化。
+    assert nt["node_summary"] == "营业收入 100 亿。"
+    assert nt["node_summary_truncated"] is False
 
 
 def test_build_records_node_summary_carries_node_fields():
@@ -170,6 +184,7 @@ def test_build_records_node_summary_carries_node_fields():
     # 0001 非叶 -> prefix_summary
     assert ns["text"] == "本节讨论营业收入。"
     assert ns["node_id"] == "0001"
+    assert ns["node_summary"] == "本节讨论营业收入。"
 
 
 def test_build_records_missing_summary_skipped():

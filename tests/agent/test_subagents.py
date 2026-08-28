@@ -7,6 +7,7 @@ from langchain_core.messages import AIMessage
 
 from nianlun.agent.subagents.config import DeepSearchConfig
 from nianlun.agent.subagents.executor import DeepSearchRunner
+from nianlun.agent.subagents.prompt import build_deep_search_system_prompt
 from nianlun.agent.subagents.result import (
     DeepSearchResult,
     Evidence,
@@ -103,6 +104,15 @@ def test_runner_context_factory_supplies_isolated_runtime_dependencies():
     assert contexts[0]["knowledge_base"] == "kb"
     assert contexts[0]["request_value"] == "one"
     assert contexts[0]["subagent_run_id"]
+
+
+def test_deep_search_prompt_uses_outline_only_for_evidence_gaps():
+    prompt = build_deep_search_system_prompt()
+
+    assert "直接读取最相关节点的正文" in prompt
+    assert "正文证据不足" in prompt
+    assert "再使用 get_structure_outline" in prompt
+    assert "只对存在证据缺口的文档读取目录" in prompt
 
 
 def test_context_factory_failure_releases_the_concurrency_slot():

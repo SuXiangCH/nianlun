@@ -38,6 +38,15 @@ DOC_TOP_N = 20
 TEXT_MAX_BYTES = 65535
 TEXT_TRUNCATE_BYTES = 60000
 
+# Node summaries are navigation metadata returned with the highest-ranked node
+# hints. Complete summaries remain in ``text`` for BM25 indexing.
+NODE_SUMMARY_PREVIEW_CHAR_LIMIT = 300
+NODE_SUMMARY_PREVIEW_MAX_BYTES = NODE_SUMMARY_PREVIEW_CHAR_LIMIT * 4
+
+# Bound request-time and startup schema probes so an unavailable Milvus backend
+# cannot indefinitely block Agent runtime creation or recovery work.
+FTS_SCHEMA_CHECK_TIMEOUT_SECONDS = 5.0
+
 # 当前已迁移的默认知识库 collection。API Server 会按知识库生成独立的
 # collection；这个值只作为离线 CLI 和 smoke search 的默认目标。
 DEFAULT_NODE_FTS_COLLECTION = "pageindex_node_fts_18b7abeab1127eeb"

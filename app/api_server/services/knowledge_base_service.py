@@ -24,6 +24,7 @@ from app.api_server.apis.v1.schemas import (
 from app.api_server.services.model_config_service import ModelConfigService
 from nianlun.indexing.tree.workspace import build_workspace_doc
 from app.api_server.services.workspace_store import (
+    NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS,
     WorkspaceArtifactStore,
     workspace_lock,
 )
@@ -118,6 +119,10 @@ class KnowledgeBaseService:
         workspace_dir.mkdir(parents=True, exist_ok=False)
         try:
             WorkspaceArtifactStore.atomic_write(workspace_dir / "_meta.json", b"{}")
+            WorkspaceArtifactStore.write_tree_build_options(
+                workspace_dir,
+                NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS,
+            )
             timestamp = _now()
             item = {
                 "id": knowledge_base_id,
@@ -268,17 +273,24 @@ class KnowledgeBaseService:
             staging_path = workspace_dir / f".upload-{document_id}.md.tmp"
             try:
                 staging_path.write_bytes(content)
+                tree_options = self.artifacts.read_tree_build_options(workspace_dir)
                 if prebuilt_document is not None:
                     # 离线导入：直接采用调用方提供的已建树（含 LLM 摘要），
                     # 跳过现场重建，不产生任何模型调用。
                     document = json.loads(json.dumps(prebuilt_document))
                 elif item["summary_enabled"]:
                     _, document = build_workspace_doc(
-                        str(staging_path), llm=self.models.build_llm()
+                        str(staging_path),
+                        llm=self.models.build_llm(),
+                        thin=tree_options.subtree_folding_enabled,
+                        min_node_token=tree_options.min_subtree_tokens,
                     )
                 else:
                     _, document = build_workspace_doc(
-                        str(staging_path), no_summary=True
+                        str(staging_path),
+                        no_summary=True,
+                        thin=tree_options.subtree_folding_enabled,
+                        min_node_token=tree_options.min_subtree_tokens,
                     )
                 document["doc_name"] = source_name
                 document_count, artifact_sha256 = self.artifacts.write_document(

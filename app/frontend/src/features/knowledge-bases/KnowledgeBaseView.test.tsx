@@ -293,6 +293,123 @@ describe("KnowledgeBaseView", () => {
     expect(sourceLines.map((line) => line.dataset.line)).toEqual(["1", "2", "3", "4", "5", "6", "7"]);
   });
 
+  it("uses original Markdown lines when a rendered HTML table changes line count", async () => {
+    const onReadContent = vi.fn().mockResolvedValue("# 概述\n\n<table>\n<tr><th>参数</th></tr>\n<tr><td>数值</td></tr>\n</table>\n\n## 方案\n\n正文。\n");
+    const onReadTree = vi.fn().mockResolvedValue({
+      doc_name: "report.md",
+      doc_description: null,
+      line_count: 10,
+      structure: [{
+        title: "概述",
+        node_id: "0001",
+        line_num: 1,
+        nodes: [{ title: "方案", node_id: "0002", line_num: 8 }],
+      }],
+    });
+    const scrolled: Element[] = [];
+    Element.prototype.scrollIntoView = function (this: Element) { scrolled.push(this); };
+    renderView({
+      selectedId: "kb-1",
+      documents: [{
+        id: "doc-1",
+        knowledge_base_id: "kb-1",
+        original_filename: "report.md",
+        file_extension: ".md",
+        mime_type: "text/markdown",
+        size_bytes: 64,
+        parser: "native_markdown",
+        status: "ready",
+        parsed_content_version: 1,
+        error_code: null,
+        error_message: null,
+        latest_task: null,
+        artifacts: [],
+        created_at: "2026-08-15T00:00:00Z",
+        updated_at: "2026-08-15T00:00:00Z",
+        completed_at: "2026-08-15T00:00:00Z",
+      }],
+      onReadContent,
+      onReadTree,
+    });
+
+    await act(async () => {
+      (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "查看解析内容") as HTMLButtonElement).click();
+    });
+    const headings = Array.from(container.querySelectorAll<HTMLElement>(".reader-markdown [data-line]"));
+    expect(headings.map((heading) => heading.dataset.line)).toEqual(["1", "8"]);
+
+    await act(async () => {
+      (Array.from(container.querySelector(".reader-tree")!.querySelectorAll("button")).find((button) => button.textContent === "方案") as HTMLButtonElement).click();
+    });
+    expect(scrolled.filter((element) => element.hasAttribute("data-line"))).toEqual([headings[1]]);
+  });
+
+  it("expands and collapses the complete document index tree", async () => {
+    Element.prototype.scrollIntoView = () => {};
+    const onReadContent = vi.fn().mockResolvedValue("# 概述\n\n## 方案\n\n### 细节\n\n#### 子细节\n");
+    const onReadTree = vi.fn().mockResolvedValue({
+      doc_name: "report.md",
+      doc_description: null,
+      line_count: 7,
+      structure: [{
+        title: "概述",
+        node_id: "0001",
+        line_num: 1,
+        nodes: [{
+          title: "方案",
+          node_id: "0002",
+          line_num: 3,
+          nodes: [{
+            title: "细节",
+            node_id: "0003",
+            line_num: 5,
+            nodes: [{ title: "子细节", node_id: "0004", line_num: 7 }],
+          }],
+        }],
+      }],
+    });
+    renderView({
+      selectedId: "kb-1",
+      documents: [{
+        id: "doc-1",
+        knowledge_base_id: "kb-1",
+        original_filename: "report.md",
+        file_extension: ".md",
+        mime_type: "text/markdown",
+        size_bytes: 64,
+        parser: "native_markdown",
+        status: "ready",
+        parsed_content_version: 1,
+        error_code: null,
+        error_message: null,
+        latest_task: null,
+        artifacts: [],
+        created_at: "2026-08-15T00:00:00Z",
+        updated_at: "2026-08-15T00:00:00Z",
+        completed_at: "2026-08-15T00:00:00Z",
+      }],
+      onReadContent,
+      onReadTree,
+    });
+
+    await act(async () => {
+      (Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "查看解析内容") as HTMLButtonElement).click();
+    });
+    const tree = container.querySelector(".reader-tree")!;
+    expect(tree.textContent).toContain("方案");
+    expect(tree.textContent).not.toContain("子细节");
+
+    await act(async () => {
+      (Array.from(tree.querySelectorAll("button")).find((button) => button.textContent === "展开") as HTMLButtonElement).click();
+    });
+    expect(tree.textContent).toContain("子细节");
+
+    await act(async () => {
+      (Array.from(tree.querySelectorAll("button")).find((button) => button.textContent === "收起") as HTMLButtonElement).click();
+    });
+    expect(tree.textContent).not.toContain("方案");
+  });
+
   it("keeps showing content when the tree request fails", async () => {
     Element.prototype.scrollIntoView = () => {};
     const onReadContent = vi.fn().mockResolvedValue("# 只有正文\n");

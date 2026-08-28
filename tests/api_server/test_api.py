@@ -12,6 +12,7 @@ from app.api_server.apis.v1.schemas import ChatResponse
 from app.api_server.config import ApiServerSettings
 from app.api_server.main import create_app
 from app.api_server.services.container import build_services
+from app.api_server.services.workspace_store import TREE_BUILD_OPTIONS_FILENAME
 
 
 class FakeSummaryLLM:
@@ -158,6 +159,56 @@ def test_knowledge_base_summary_switch_defaults_on_and_can_be_disabled(
     fetched = client.get(f"/api/v1/knowledge-bases/{knowledge_base_id}")
     assert fetched.status_code == 200
     assert fetched.json()["data"]["summary_enabled"] is False
+
+
+def test_new_knowledge_base_enables_subtree_folding_without_api_setting(
+    tmp_path: Path,
+) -> None:
+    client = TestClient(create_app(_settings(tmp_path)))
+    new_knowledge_base = client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "新知识库", "summary_enabled": False},
+    ).json()["data"]
+    new_workspace = Path(new_knowledge_base["workspace_dir"])
+    options = json.loads(
+        (new_workspace / TREE_BUILD_OPTIONS_FILENAME).read_text(encoding="utf-8")
+    )
+    assert options == {
+        "min_subtree_tokens": 1200,
+        "subtree_folding_enabled": True,
+        "version": 1,
+    }
+
+    response = client.post(
+        f"/api/v1/knowledge-bases/{new_knowledge_base['id']}/documents",
+        files={"file": ("new.md", b"# Parent\n\nintro\n\n## Child\n\ndetail")},
+    )
+    assert response.status_code == 200
+    new_document_id = response.json()["data"]["document_id"]
+    new_artifact = json.loads(
+        (new_workspace / f"{new_document_id}.json").read_text(encoding="utf-8")
+    )
+    assert len(new_artifact["structure"]) == 1
+    assert not new_artifact["structure"][0].get("nodes")
+    assert "## Child" in new_artifact["structure"][0]["text"]
+
+    legacy_knowledge_base = client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "旧知识库", "summary_enabled": False},
+    ).json()["data"]
+    legacy_workspace = Path(legacy_knowledge_base["workspace_dir"])
+    # Existing workspaces created before this release have no private config file.
+    (legacy_workspace / TREE_BUILD_OPTIONS_FILENAME).unlink()
+    response = client.post(
+        f"/api/v1/knowledge-bases/{legacy_knowledge_base['id']}/documents",
+        files={"file": ("legacy.md", b"# Parent\n\nintro\n\n## Child\n\ndetail")},
+    )
+    assert response.status_code == 200
+    legacy_document_id = response.json()["data"]["document_id"]
+    legacy_artifact = json.loads(
+        (legacy_workspace / f"{legacy_document_id}.json").read_text(encoding="utf-8")
+    )
+    assert legacy_artifact["structure"][0]["nodes"][0]["title"] == "Child"
 
 
 def test_knowledge_base_name_can_be_updated(
@@ -1055,11 +1106,7 @@ def test_document_tree_outline_serves_without_node_text(
     assert alpha["title"] == "Alpha"
     assert alpha["line_num"] == 1
     assert "text" not in alpha
-    beta = alpha["nodes"][0]
-    assert beta["title"] == "Beta"
-    assert beta["line_num"] == 5
-    assert "text" not in beta
-    assert "nodes" not in beta
+    assert "nodes" not in alpha
 
     missing = client.get(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/documents/no-such-doc/tree"

@@ -748,10 +748,23 @@ class DocumentIngestionService:
         knowledge_base = self.knowledge_bases.require_record(
             str(document["knowledge_base_id"])
         )
+        tree_options = self.artifacts.read_tree_build_options(
+            Path(str(knowledge_base["workspace_dir"]))
+        )
         if knowledge_base["summary_enabled"]:
-            _, parsed = build_workspace_doc(str(path), llm=self.models.build_llm())
+            _, parsed = build_workspace_doc(
+                str(path),
+                llm=self.models.build_llm(),
+                thin=tree_options.subtree_folding_enabled,
+                min_node_token=tree_options.min_subtree_tokens,
+            )
         else:
-            _, parsed = build_workspace_doc(str(path), no_summary=True)
+            _, parsed = build_workspace_doc(
+                str(path),
+                no_summary=True,
+                thin=tree_options.subtree_folding_enabled,
+                min_node_token=tree_options.min_subtree_tokens,
+            )
         parsed["doc_name"] = document["original_filename"]
         return parsed
 
