@@ -91,7 +91,10 @@ def main(
 
     datasets_dir = Path(args.datasets_dir).resolve()
     if not (datasets_dir / "workspace" / "_meta.json").is_file():
-        print(f"数据集清单不存在: {datasets_dir / 'workspace' / '_meta.json'}", file=sys.stderr)
+        print(
+            f"数据集清单不存在: {datasets_dir / 'workspace' / '_meta.json'}",
+            file=sys.stderr,
+        )
         return 1
 
     settings = settings or get_settings()
@@ -135,9 +138,13 @@ def main(
         else:
             imported += 1
         if total % 20 == 0:
-            print(f"  进度: {total} 篇（新导入 {imported}，跳过 {replayed}，失败 {failed}）")
+            print(
+                f"  进度: {total} 篇（新导入 {imported}，跳过 {replayed}，失败 {failed}）"
+            )
 
-    print(f"导入完成: 共 {total} 篇 = 新导入 {imported} + 幂等跳过 {replayed} + 失败 {failed}")
+    print(
+        f"导入完成: 共 {total} 篇 = 新导入 {imported} + 幂等跳过 {replayed} + 失败 {failed}"
+    )
 
     fts_failed = False
     if settings.fts_enabled:

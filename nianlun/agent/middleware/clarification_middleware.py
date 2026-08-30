@@ -264,7 +264,11 @@ def _status_sink(runtime: Any) -> Any:
 
 def _clarification_enabled(runtime: Any) -> bool:
     context = getattr(runtime, "context", None) or {}
-    return bool(context.get("clarification_enabled", False)) if isinstance(context, Mapping) else False
+    return (
+        bool(context.get("clarification_enabled", False))
+        if isinstance(context, Mapping)
+        else False
+    )
 
 
 def _emit_status(

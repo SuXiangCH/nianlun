@@ -49,9 +49,13 @@ def summarize_results(results: Iterable[EvaluationOutcome]) -> EvaluationSummary
         for item in completed
         if item.reference_quality is not None
     )
-    evidence_results = [item.evidence for item in completed if item.evidence is not None]
+    evidence_results = [
+        item.evidence for item in completed if item.evidence is not None
+    ]
     critics = [
-        item.run_logs.critic_run for item in completed if item.run_logs.critic_run is not None
+        item.run_logs.critic_run
+        for item in completed
+        if item.run_logs.critic_run is not None
     ]
     attributions = [
         item.attribution for item in completed if item.attribution is not None
@@ -85,24 +89,21 @@ def summarize_results(results: Iterable[EvaluationOutcome]) -> EvaluationSummary
         for item in completed
         if item.run_logs.correctness_result is not None
         and item.run_logs.critic_run is not None
-        and item.run_logs.correctness_result.correctness.value
-        != AnswerVerdict.CORRECT
+        and item.run_logs.correctness_result.correctness.value != AnswerVerdict.CORRECT
     ]
     preliminary_correct = [
         item
         for item in completed
         if item.run_logs.correctness_result is not None
         and item.run_logs.critic_run is not None
-        and item.run_logs.correctness_result.correctness.value
-        == AnswerVerdict.CORRECT
+        and item.run_logs.correctness_result.correctness.value == AnswerVerdict.CORRECT
     ]
     recovered_false_negatives = sum(
         item.correctness is not None and item.correctness.value == AnswerVerdict.CORRECT
         for item in preliminary_noncorrect
     )
     corrected_false_positives = sum(
-        item.correctness is not None
-        and item.correctness.value != AnswerVerdict.CORRECT
+        item.correctness is not None and item.correctness.value != AnswerVerdict.CORRECT
         for item in preliminary_correct
     )
     usage = _sum_usage(items)

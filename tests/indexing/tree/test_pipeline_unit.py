@@ -107,7 +107,9 @@ class _StubPlannerLLM:
                     "right_planning_chunk_id": right,
                     "boundary": False,
                     "title": "合并主题",
-                    "title_basis_block_ids": re.findall(r'"block_id":"(b\d+)"', prompt)[:1],
+                    "title_basis_block_ids": re.findall(r'"block_id":"(b\d+)"', prompt)[
+                        :1
+                    ],
                     "confidence": 0.9,
                 }
             return {

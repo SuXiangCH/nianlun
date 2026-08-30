@@ -104,9 +104,14 @@ class MineruClient:
             "model_version": model_version,
         }
         if options:
-            body.update({key: value for key, value in options.items() if value is not None})
+            body.update(
+                {key: value for key, value in options.items() if value is not None}
+            )
         payload = self._json_request(
-            "POST", f"{self.api_root}/file-urls/batch", headers=self._headers(), json=body
+            "POST",
+            f"{self.api_root}/file-urls/batch",
+            headers=self._headers(),
+            json=body,
         )
         data = payload.get("data")
         if not isinstance(data, dict):
@@ -115,7 +120,11 @@ class MineruClient:
         file_urls = data.get("file_urls")
         if not isinstance(batch_id, str) or not batch_id:
             raise MineruError("MinerU 上传接口缺少 batch_id")
-        if not isinstance(file_urls, list) or not file_urls or not isinstance(file_urls[0], str):
+        if (
+            not isinstance(file_urls, list)
+            or not file_urls
+            or not isinstance(file_urls[0], str)
+        ):
             raise MineruError("MinerU 上传接口缺少签名地址")
         return MineruUploadTicket(batch_id=batch_id, upload_url=file_urls[0])
 
@@ -145,11 +154,11 @@ class MineruClient:
         state = str(result.get("state") or "pending")
         return MineruBatchResult(
             state=state,
-            data_id=str(result["data_id"]) if result.get("data_id") is not None else None,
+            data_id=str(result["data_id"])
+            if result.get("data_id") is not None
+            else None,
             full_zip_url=(
-                str(result["full_zip_url"])
-                if result.get("full_zip_url")
-                else None
+                str(result["full_zip_url"]) if result.get("full_zip_url") else None
             ),
             extracted_pages=_int_or_none(result.get("extracted_pages")),
             total_pages=_int_or_none(result.get("total_pages")),
@@ -241,7 +250,9 @@ class SelfHostedMineruClient:
 
     def get_task_result(self, task_id: str) -> MineruBatchResult:
         try:
-            response = self._client.get(f"{self.base_url}/tasks/{task_id}", headers=self._headers())
+            response = self._client.get(
+                f"{self.base_url}/tasks/{task_id}", headers=self._headers()
+            )
         except httpx.HTTPError as exc:
             raise MineruError("MinerU API 连接失败，请检查 URL 和网络") from exc
         payload = _response_json(response)
@@ -249,7 +260,9 @@ class SelfHostedMineruClient:
             raise MineruClient.response_error(response, payload)
         if not isinstance(payload, dict):
             raise MineruError("私有 MinerU 任务接口返回无效 JSON")
-        raw_state = str(payload.get("status") or payload.get("state") or "pending").lower()
+        raw_state = str(
+            payload.get("status") or payload.get("state") or "pending"
+        ).lower()
         state = _self_hosted_state(raw_state)
         error = payload.get("error") or payload.get("message")
         return MineruBatchResult(

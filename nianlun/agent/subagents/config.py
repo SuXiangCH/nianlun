@@ -42,7 +42,10 @@ class DeepSearchConfig:
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
 
-        if not isinstance(self.timeout_seconds, (int, float)) or self.timeout_seconds <= 0:
+        if (
+            not isinstance(self.timeout_seconds, (int, float))
+            or self.timeout_seconds <= 0
+        ):
             raise ValueError("timeout_seconds must be positive")
         if self.max_answer_chars > self.max_result_chars:
             raise ValueError("max_answer_chars cannot exceed max_result_chars")

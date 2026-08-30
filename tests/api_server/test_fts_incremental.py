@@ -19,7 +19,9 @@ def _repository(tmp_path: Path) -> SQLiteMetadataRepository:
     return SQLiteMetadataRepository(factory)
 
 
-def _seed_kb(repository: SQLiteMetadataRepository, kb_id: str, *, fts_revision: int | None = 5) -> None:
+def _seed_kb(
+    repository: SQLiteMetadataRepository, kb_id: str, *, fts_revision: int | None = 5
+) -> None:
     repository.put(
         "knowledge_bases",
         kb_id,
@@ -132,6 +134,7 @@ def test_mark_documents_fts_indexed_empty_is_noop(tmp_path: Path) -> None:
     repository.mark_documents_fts_indexed("kb-1", [], 6, NOW)
 
     assert repository.list_fts_dirty_documents("kb-1") == ["doc-1"]
+
 
 def test_mark_all_fts_dirty_clears_clean_documents(tmp_path: Path) -> None:
     repository = _repository(tmp_path)

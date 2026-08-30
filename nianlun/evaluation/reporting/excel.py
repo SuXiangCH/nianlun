@@ -75,7 +75,9 @@ def export_excel(
     input line already owns the outcome.
     """
     if output_path.resolve() in {input_path.resolve(), results_path.resolve()}:
-        raise ValueError("Excel output path must differ from input and JSONL result paths")
+        raise ValueError(
+            "Excel output path must differ from input and JSONL result paths"
+        )
     input_cases = _read_input_cases(input_path, adapter)
     rows = _read_latest_rows(results_path, input_cases)
 
@@ -122,7 +124,9 @@ def _read_latest_rows(
                 if not isinstance(payload, Mapping):
                     continue
                 input_line = _input_line(payload)
-                row = _row_from_payload(payload, input_line, input_cases.get(input_line))
+                row = _row_from_payload(
+                    payload, input_line, input_cases.get(input_line)
+                )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 continue
             if row is not None:
@@ -132,7 +136,11 @@ def _read_latest_rows(
 
 def _input_line(payload: Mapping[str, Any]) -> int:
     input_line = payload["input_line"]
-    if isinstance(input_line, bool) or not isinstance(input_line, int) or input_line < 1:
+    if (
+        isinstance(input_line, bool)
+        or not isinstance(input_line, int)
+        or input_line < 1
+    ):
         raise ValueError("input_line must be a positive integer")
     return input_line
 

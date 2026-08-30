@@ -136,7 +136,9 @@ class ApplicationService:
         selected_llm_model_id: str | None = None
         if self.model_config_service is not None:
             selected_llm_model_id = str(
-                self.model_config_service.require_llm_profile(request.llm_model_id)["id"]
+                self.model_config_service.require_llm_profile(request.llm_model_id)[
+                    "id"
+                ]
             )
         elif request.llm_model_id is not None:
             raise ApiError(

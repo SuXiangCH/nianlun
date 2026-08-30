@@ -155,9 +155,7 @@ class ApiServerSettings:
                     "NIANLUN_API_FTS_BUILD_WORKERS", str(cls.fts_build_workers)
                 )
             ),
-            vector_enabled=parse_bool(
-                "NIANLUN_API_VECTOR_ENABLED", cls.vector_enabled
-            ),
+            vector_enabled=parse_bool("NIANLUN_API_VECTOR_ENABLED", cls.vector_enabled),
             vector_collection=os.environ.get("NIANLUN_API_VECTOR_COLLECTION"),
             vector_build_workers=int(
                 os.environ.get(

@@ -19,8 +19,10 @@ class Correctness:
             CorrectnessResult,
         )
 
+
 if __name__ == "__main__":
     import json
+
     json_schema = json.dumps(
         CorrectnessResult.model_json_schema(), ensure_ascii=False, indent=2, default=str
     )

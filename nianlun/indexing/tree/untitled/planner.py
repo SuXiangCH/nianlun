@@ -151,9 +151,7 @@ async def classify(
                 chunk.planning_chunk_id,
             )
         confidence = data.get("confidence")
-        if (
-            not valid_confidence(confidence, config.min_confidence)
-        ):
+        if not valid_confidence(confidence, config.min_confidence):
             raise UntitledStructureError(
                 "UNTITLED_LLM_PLAN_INVALID",
                 "classification 置信度不足",
@@ -393,9 +391,7 @@ async def plan_untitled(
             )
 
     # 阶段 1：各 chunk 的 classify/boundary 互相独立，并发规划。
-    results = await asyncio.gather(
-        *(plan_chunk(chunk) for chunk in planning_chunks)
-    )
+    results = await asyncio.gather(*(plan_chunk(chunk) for chunk in planning_chunks))
 
     # 阶段 2：bridge 依赖相邻 chunk 的规划结果，串行衔接。任一侧已规则兜底时
     # 直接保留边界：弱证据不值得再花调用做合并判定。
@@ -460,7 +456,9 @@ async def plan_untitled(
 
     if len(sections) >= 2 and config.max_depth > 1:
         try:
-            grouped = await groups(llm, sections, 2, config, source, call_counter, blocks)
+            grouped = await groups(
+                llm, sections, 2, config, source, call_counter, blocks
+            )
             if grouped:
                 sections = apply_groups(
                     sections,

@@ -242,7 +242,9 @@ def test_retrieval_deduplication_keeps_only_new_nodes_from_later_searches():
 
 def test_retrieval_deduplication_removes_repeated_document_only_results():
     state = {"documents": set(), "nodes": set()}
-    result = _retrieval_result({"doc_id": "doc-1", "doc_name": "报告", "node_hints": []})
+    result = _retrieval_result(
+        {"doc_id": "doc-1", "doc_name": "报告", "node_hints": []}
+    )
 
     assert json.loads(deduplicate_retrieval_result(result, state))["documents"]
     deduplicated = json.loads(deduplicate_retrieval_result(result, state))

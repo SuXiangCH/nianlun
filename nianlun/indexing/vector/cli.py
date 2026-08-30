@@ -9,9 +9,7 @@ from nianlun.indexing.vector.build import build_doc_vectors
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="python -m nianlun.indexing.vector.cli"
-    )
+    parser = argparse.ArgumentParser(prog="python -m nianlun.indexing.vector.cli")
     parser.add_argument(
         "--workspace", required=True, help="包含 _meta.json 和文档 JSON 的 workspace"
     )

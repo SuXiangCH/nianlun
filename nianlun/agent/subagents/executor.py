@@ -39,7 +39,9 @@ class DeepSearchExecution:
     result: DeepSearchResult
     parent_request_id: str | None = None
     status_events: tuple[dict[str, Any], ...] = ()
-    config: DeepSearchConfig = field(default_factory=DeepSearchConfig, repr=False, compare=False)
+    config: DeepSearchConfig = field(
+        default_factory=DeepSearchConfig, repr=False, compare=False
+    )
 
     def to_dict(self, config: DeepSearchConfig | None = None) -> dict[str, Any]:
         return self.result.to_dict(config or self.config)
@@ -102,14 +104,18 @@ class DeepSearchRunner:
         if not isinstance(task, str) or not task.strip():
             return self._execution(
                 run_id,
-                failed_result("invalid_task", "Deep-search task must be a non-empty string."),
+                failed_result(
+                    "invalid_task", "Deep-search task must be a non-empty string."
+                ),
                 events,
                 parent_request_id=parent_id,
             )
         if external_cancel.is_set():
             return self._execution(
                 run_id,
-                failed_result("cancelled", "Deep-search task was cancelled before it started."),
+                failed_result(
+                    "cancelled", "Deep-search task was cancelled before it started."
+                ),
                 events,
                 parent_request_id=parent_id,
             )
@@ -123,6 +129,7 @@ class DeepSearchRunner:
 
         started = time.monotonic()
         deadline = started + self.config.timeout_seconds
+
         def emit(event: str, **details: Any) -> None:
             events.append(
                 self._event(event, run_id, parent_request_id=parent_id, **details)
@@ -163,15 +170,21 @@ class DeepSearchRunner:
             submitted = True
             while True:
                 if external_cancel.is_set():
-                    result = failed_result("cancelled", "Deep-search task was cancelled.")
+                    result = failed_result(
+                        "cancelled", "Deep-search task was cancelled."
+                    )
                     emit("deep_search_failed", code="cancelled")
-                    return self._execution(run_id, result, events, parent_request_id=parent_id)
+                    return self._execution(
+                        run_id, result, events, parent_request_id=parent_id
+                    )
                 remaining = self.config.timeout_seconds - (time.monotonic() - started)
                 if remaining <= 0:
                     external_cancel.set()
                     result = failed_result("timeout", "Deep-search task timed out.")
                     emit("deep_search_failed", code="timeout")
-                    return self._execution(run_id, result, events, parent_request_id=parent_id)
+                    return self._execution(
+                        run_id, result, events, parent_request_id=parent_id
+                    )
                 try:
                     raw_output = future.result(timeout=min(remaining, 0.1))
                     break
@@ -181,9 +194,13 @@ class DeepSearchRunner:
             if external_cancel.is_set():
                 result = failed_result("cancelled", "Deep-search task was cancelled.")
                 emit("deep_search_failed", code="cancelled")
-                return self._execution(run_id, result, events, parent_request_id=parent_id)
+                return self._execution(
+                    run_id, result, events, parent_request_id=parent_id
+                )
 
-            result = bound_result(result_from_agent_output(raw_output, self.config), self.config)
+            result = bound_result(
+                result_from_agent_output(raw_output, self.config), self.config
+            )
             if result.status == "completed":
                 emit(
                     "deep_search_completed",

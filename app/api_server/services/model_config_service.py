@@ -232,12 +232,18 @@ class ModelConfigService:
         current = self.repository.get_model_profile(profile_id)
         if current is None:
             raise ApiError("模型不存在", status.HTTP_404_NOT_FOUND)
-        if current["kind"] == "embedding" and self.repository.count_knowledge_bases_for_vector_model(profile_id):
+        if current[
+            "kind"
+        ] == "embedding" and self.repository.count_knowledge_bases_for_vector_model(
+            profile_id
+        ):
             raise ApiError(
                 "该 Embedding 模型已被知识库使用，请先为这些知识库选择其他模型",
                 status.HTTP_409_CONFLICT,
             )
-        if current["kind"] == "llm" and self.repository.count_applications_for_llm_model(profile_id):
+        if current[
+            "kind"
+        ] == "llm" and self.repository.count_applications_for_llm_model(profile_id):
             raise ApiError(
                 "该 LLM 模型已被 Agent 使用，请先删除使用该模型的 Agent",
                 status.HTTP_409_CONFLICT,

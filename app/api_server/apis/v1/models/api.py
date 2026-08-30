@@ -31,9 +31,7 @@ def create_model(body: ModelProfileRequest, request: Request) -> dict[str, Any]:
 
 
 @router.post("/test")
-def test_model_draft(
-    body: ModelConfigTestRequest, request: Request
-) -> dict[str, Any]:
+def test_model_draft(body: ModelConfigTestRequest, request: Request) -> dict[str, Any]:
     """Test a model draft without persisting it."""
     item = _services(request).models.test_connection(body)
     return success(item.model_dump(mode="json"))

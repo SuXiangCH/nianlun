@@ -21,6 +21,4 @@ def test_embed_records_preserves_metadata_and_removes_input_text():
         FakeEmbedder(),
     )
 
-    assert result == [
-        {"doc_id": "doc-1", "source_type": "doc_desc", "vector": [0.0]}
-    ]
+    assert result == [{"doc_id": "doc-1", "source_type": "doc_desc", "vector": [0.0]}]
