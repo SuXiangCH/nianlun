@@ -247,7 +247,9 @@ def result_from_agent_output(
             answer=_clip(answer, (config or DeepSearchConfig()).max_answer_chars),
             evidence=evidence,
             open_questions=open_questions,
-            search_summary=_clip(search_summary, (config or DeepSearchConfig()).max_search_summary_chars),
+            search_summary=_clip(
+                search_summary, (config or DeepSearchConfig()).max_search_summary_chars
+            ),
         )
         return result
 
@@ -287,7 +289,9 @@ def failed_result(code: str, message: str) -> DeepSearchResult:
     )
 
 
-def bound_result(result: DeepSearchResult, config: DeepSearchConfig) -> DeepSearchResult:
+def bound_result(
+    result: DeepSearchResult, config: DeepSearchConfig
+) -> DeepSearchResult:
     """Materialize the configured result limits before a result leaves the runner."""
     return result_from_agent_output(result.to_dict(config), config)
 

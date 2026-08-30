@@ -22,7 +22,10 @@ def test_write_workspace_doc_writes_document_and_manifest_atomically(tmp_path):
     write_workspace_doc(tmp_path, "doc-1", _document())
 
     assert json.loads((tmp_path / "doc-1.json").read_text()) == _document()
-    assert json.loads((tmp_path / "_meta.json").read_text())["doc-1"]["doc_name"] == "report.md"
+    assert (
+        json.loads((tmp_path / "_meta.json").read_text())["doc-1"]["doc_name"]
+        == "report.md"
+    )
 
 
 def test_write_workspace_doc_rejects_corrupt_manifest(tmp_path):

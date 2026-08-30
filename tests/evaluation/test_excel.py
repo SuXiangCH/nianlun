@@ -20,7 +20,9 @@ class UnusedJudge:
     metadata = JudgeMetadata(provider="fake", model="fake", temperature=0.0)
 
     async def generate_structured_output(self, *, prompt: str, schema: type[T]) -> T:
-        raise AssertionError(f"empty answers must not invoke judge: {prompt!r} {schema}")
+        raise AssertionError(
+            f"empty answers must not invoke judge: {prompt!r} {schema}"
+        )
 
 
 class FailingJudge:
@@ -59,7 +61,9 @@ def test_export_excel_writes_concise_latest_records(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     outcome = asyncio.run(
-        RagEvaluator(judge=UnusedJudge()).evaluate(EvaluationCase.model_validate(case_payload))
+        RagEvaluator(judge=UnusedJudge()).evaluate(
+            EvaluationCase.model_validate(case_payload)
+        )
     )
     failed_outcome = asyncio.run(
         RagEvaluator(judge=FailingJudge()).evaluate(
@@ -72,7 +76,10 @@ def test_export_excel_writes_concise_latest_records(tmp_path: Path) -> None:
                 json.dumps(
                     {
                         "input_line": 1,
-                        "error": {"code": "evaluation_task_failed", "message": "failed"},
+                        "error": {
+                            "code": "evaluation_task_failed",
+                            "message": "failed",
+                        },
                     }
                 ),
                 json.dumps(

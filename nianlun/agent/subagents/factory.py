@@ -22,9 +22,7 @@ def build_deep_search_agent(
 ) -> Any:
     """Compile a one-shot child Agent with no checkpointer or recursive tool."""
     resolved_prompt = (
-        build_deep_search_system_prompt()
-        if system_prompt is None
-        else system_prompt
+        build_deep_search_system_prompt() if system_prompt is None else system_prompt
     )
     return create_agent(
         model=llm,

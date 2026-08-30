@@ -7,6 +7,7 @@ from nianlun.evaluation.stages.common import (
     json_block,
     untrusted_input_notice,
 )
+
 PROMPT_VERSION = "2026-08-20.v3"
 
 

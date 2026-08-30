@@ -166,7 +166,9 @@ class DocVectorStore:
                 f"向量 collection 缺少新 schema 字段: {', '.join(missing)}；请重建索引"
             )
         vector_params = fields["vector"].get("params", {})
-        actual_dimension = vector_params.get("dim") if isinstance(vector_params, dict) else None
+        actual_dimension = (
+            vector_params.get("dim") if isinstance(vector_params, dict) else None
+        )
         if actual_dimension != self.dimension:
             raise RuntimeError(
                 f"向量 collection 维度不匹配: configured={self.dimension}, "
@@ -269,8 +271,7 @@ class DocVectorStore:
         search_kwargs: dict[str, Any] = {}
         if self.knowledge_base_id is not None:
             search_kwargs["filter"] = (
-                'knowledge_base_id == "'
-                f'{_escape_filter_value(self.knowledge_base_id)}"'
+                f'knowledge_base_id == "{_escape_filter_value(self.knowledge_base_id)}"'
             )
 
         result = self.client.search(
@@ -292,9 +293,7 @@ class DocVectorStore:
         for group in result:
             for hit in group:
                 entity = hit.get("entity", {}) if isinstance(hit, dict) else {}
-                item = {
-                    field: entity.get(field) for field in _output_fields()
-                }
+                item = {field: entity.get(field) for field in _output_fields()}
                 item["score"] = hit.get("distance")
                 hits.append(item)
         return sorted(
@@ -322,7 +321,9 @@ def _smoke_search() -> None:
 
     store = DocVectorStore()
     if not store.client.has_collection(store.collection):
-        print(f"collection {store.collection!r} 不存在；请先构建向量索引", file=sys.stderr)
+        print(
+            f"collection {store.collection!r} 不存在；请先构建向量索引", file=sys.stderr
+        )
         sys.exit(1)
 
     embedder = build_embedding_client(model=get_embedding_model())

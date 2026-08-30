@@ -26,9 +26,10 @@ def _now() -> str:
 
 def _collection_name(base: str | None, knowledge_base_id: str) -> str:
     """Return a deterministic vector collection name per knowledge base."""
-    prefix = re.sub(
-        r"[^a-zA-Z0-9_]", "_", base or "pageindex_doc_vectors"
-    ).strip("_") or "pageindex_doc_vectors"
+    prefix = (
+        re.sub(r"[^a-zA-Z0-9_]", "_", base or "pageindex_doc_vectors").strip("_")
+        or "pageindex_doc_vectors"
+    )
     suffix = hashlib.sha256(knowledge_base_id.encode("utf-8")).hexdigest()[:16]
     return f"{prefix[:200]}_{suffix}"
 
@@ -185,7 +186,9 @@ class VectorIndexService:
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
 
-    def delete_collection(self, collection_name: str | None, knowledge_base_id: str) -> None:
+    def delete_collection(
+        self, collection_name: str | None, knowledge_base_id: str
+    ) -> None:
         """Stop a pending build and best-effort drop the KB's vector collection."""
         with self._lock:
             active = self._jobs.pop(knowledge_base_id, None)
@@ -334,7 +337,9 @@ class VectorIndexService:
         """
         if full_rebuild:
             self.repository.mark_all_vector_dirty(knowledge_base_id, _now())
-            dirty_doc_ids = self.repository.list_vector_dirty_documents(knowledge_base_id)
+            dirty_doc_ids = self.repository.list_vector_dirty_documents(
+                knowledge_base_id
+            )
             build_doc_vectors(
                 workspace_dir,
                 uri=self.settings.milvus_uri,

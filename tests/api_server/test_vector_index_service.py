@@ -64,10 +64,12 @@ def test_vector_service_builds_isolated_collection_without_real_milvus(
         workspace_root=tmp_path,
         vector_collection="nianlun_vectors",
     )
+
     def repository_lookup(_id: str) -> dict[str, object]:
         item = repository.get("knowledge_bases", "kb-1")
         assert item is not None
         return {**item, "workspace_dir": str(workspace)}
+
     service = VectorIndexService(
         repository,
         repository_lookup,
@@ -249,12 +251,23 @@ class _FakeVecStore:
 
     _client: _FakeVecClient = _FakeVecClient(exists=True)
 
-    def __init__(self, *, uri=None, token=None, collection_name=None, dimension=None, knowledge_base_id=None, **_: object) -> None:
+    def __init__(
+        self,
+        *,
+        uri=None,
+        token=None,
+        collection_name=None,
+        dimension=None,
+        knowledge_base_id=None,
+        **_: object,
+    ) -> None:
         self.collection = collection_name or "vec-coll"
         self.client = _FakeVecStore._client
 
 
-def _embedding_config(profile_updated_at: str = PROFILE_UPDATED, dimension: int = 8) -> dict:
+def _embedding_config(
+    profile_updated_at: str = PROFILE_UPDATED, dimension: int = 8
+) -> dict:
     return {
         "enabled": True,
         "profile_id": "embedding-1",
@@ -322,7 +335,9 @@ def _run_vector_service(
     return captured
 
 
-def test_vector_incremental_processes_only_dirty_set(tmp_path: Path, monkeypatch) -> None:
+def test_vector_incremental_processes_only_dirty_set(
+    tmp_path: Path, monkeypatch
+) -> None:
     repository = _repository(tmp_path)
     workspace = tmp_path / "workspace"
     _seed_built_kb(repository, workspace, content_version=6)
@@ -330,8 +345,10 @@ def test_vector_incremental_processes_only_dirty_set(tmp_path: Path, monkeypatch
     _seed_vector_doc(repository, "doc-2", vector_indexed_version=None)  # 脏
 
     captured = _run_vector_service(
-        repository, workspace,
-        collection_exists=True, force=False,
+        repository,
+        workspace,
+        collection_exists=True,
+        force=False,
         embedding_config=_embedding_config(),
         monkeypatch=monkeypatch,
     )
@@ -356,8 +373,10 @@ def test_vector_model_change_triggers_full_rebuild(tmp_path: Path, monkeypatch) 
     changed_config = _embedding_config(profile_updated_at="2026-08-12T00:00:00+00:00")
 
     captured = _run_vector_service(
-        repository, workspace,
-        collection_exists=True, force=False,
+        repository,
+        workspace,
+        collection_exists=True,
+        force=False,
         embedding_config=changed_config,
         monkeypatch=monkeypatch,
     )
@@ -371,7 +390,9 @@ def test_vector_model_change_triggers_full_rebuild(tmp_path: Path, monkeypatch) 
     assert item["vector_revision"] == 5
 
 
-def test_vector_empty_dirty_set_finishes_without_build(tmp_path: Path, monkeypatch) -> None:
+def test_vector_empty_dirty_set_finishes_without_build(
+    tmp_path: Path, monkeypatch
+) -> None:
     repository = _repository(tmp_path)
     workspace = tmp_path / "workspace"
     _seed_built_kb(repository, workspace, content_version=6)
@@ -461,12 +482,16 @@ def test_vector_missing_collection_falls_back_to_full_incremental(
     repository = _repository(tmp_path)
     workspace = tmp_path / "workspace"
     _seed_built_kb(repository, workspace, content_version=6)
-    _seed_vector_doc(repository, "doc-1", vector_indexed_version=5)  # 标干净但 collection 已丢
+    _seed_vector_doc(
+        repository, "doc-1", vector_indexed_version=5
+    )  # 标干净但 collection 已丢
     _seed_vector_doc(repository, "doc-2", vector_indexed_version=None)
 
     captured = _run_vector_service(
-        repository, workspace,
-        collection_exists=False, force=False,
+        repository,
+        workspace,
+        collection_exists=False,
+        force=False,
         embedding_config=_embedding_config(),
         monkeypatch=monkeypatch,
     )

@@ -67,9 +67,7 @@ def test_create_collection_idempotent(tmp_path):
         store.create_collection()  # 首建
         collection_info: Any = store.client.describe_collection(store.collection)
         text_field = next(
-            field
-            for field in collection_info["fields"]
-            if field["name"] == "text"
+            field for field in collection_info["fields"] if field["name"] == "text"
         )
         assert json.loads(text_field["params"]["analyzer_params"]) == (
             get_fts_analyzer_params()
