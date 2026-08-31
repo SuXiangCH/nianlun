@@ -67,6 +67,7 @@ class AgentRequestContext(TypedDict):
     tool_logging: bool
     clarification_enabled: bool
     retrieval_deduplication_state: Any
+    loop_guard_state: NotRequired[Any]
     status_sink: NotRequired[Any]
 
 

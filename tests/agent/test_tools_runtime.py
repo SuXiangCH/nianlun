@@ -12,6 +12,7 @@ from nianlun.knowledgebase import KnowledgeBase, KnowledgeBaseConfig
 from nianlun.agent.lead_agent.runtime import AgentRuntime
 from nianlun.agent.lead_agent.runner import RetrievalCollector
 from nianlun.agent.lead_agent.factory import AgentRuntimeFactory
+from nianlun.agent.middleware import GuardFinalizationError, LoopGuardState
 from nianlun.agent.tools import (
     build_tools,
     find_semantic_documents_tool,
@@ -330,6 +331,9 @@ def test_agent_runtime_exposes_application_context():
     )
 
     collector, context = runtime.new_request_context()
+    assert runtime.runner.recursion_limit == 192
+    loop_guard_state = context.pop("loop_guard_state")
+    assert isinstance(loop_guard_state, LoopGuardState)
     assert context == {
         "knowledge_base": kb,
         "retrieval_collector": collector,
@@ -344,6 +348,7 @@ def test_agent_runtime_exposes_application_context():
         second_context["retrieval_deduplication_state"]
         is not context["retrieval_deduplication_state"]
     )
+    assert second_context["loop_guard_state"] is not loop_guard_state
 
 
 def test_agent_runtime_does_not_retain_factory_secrets_or_worker_builder():
@@ -459,6 +464,39 @@ def test_batch_worker_runtime_uses_explicit_factory():
     assert second is worker
     assert created == [True]
     batch_module._BATCH_RUNTIME_LOCAL.__dict__.clear()
+
+
+def test_batch_finalization_failure_is_not_retried_and_keeps_guard_summary():
+    import nianlun.agent.batch as batch_module
+
+    guard = LoopGuardState(
+        model_rounds=32,
+        tool_rounds=31,
+        total_tool_calls=42,
+        finalizing=True,
+        trigger="model_round_limit",
+    )
+    failure = GuardFinalizationError(TimeoutError("sensitive request"), guard)
+    attempts = []
+
+    class FailingRuntime:
+        def invoke(self, *_args, **_kwargs):
+            attempts.append(True)
+            raise failure
+
+    result = batch_module.process_batch_case(
+        {"question": "测试问题"},
+        local_idx=0,
+        case_index=7,
+        runtime=FailingRuntime(),
+        retry_times=3,
+    )
+
+    assert attempts == [True]
+    assert result.attempt_count == 1
+    assert result.output_record["guard"] == failure.guard
+    assert result.output_record["guard"]["tool_calls"] == 42
+    assert "sensitive" not in result.output_record["error"]
 
 
 def test_langgraph_injects_context_into_tool_runtime():

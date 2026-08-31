@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 # 唯一的运行时提示词修订号，用于 Agent runtime 缓存失效判断。
-PROMPT_VERSION = 9
+PROMPT_VERSION = 10
 
 # 文档节点定位通过 search_document_nodes 完成，语义文档路由通过
 # find_semantic_documents 完成；不向 system prompt 注入全量文档目录。

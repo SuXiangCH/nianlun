@@ -56,3 +56,4 @@ docs/*
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/evaluation.md
+!docs/architecture/agent_tool_loop_guard.md

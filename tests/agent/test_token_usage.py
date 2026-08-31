@@ -16,6 +16,7 @@ from nianlun.agent.lead_agent.runtime import (
     AgentRuntime,
     iter_agent_stream_events,
     run_agent,
+    run_agent_streaming,
 )
 from nianlun.agent.lead_agent.runner import _last_usage, _message_usage, _sum_usage
 
@@ -145,6 +146,15 @@ def test_run_agent_sums_all_model_usage_from_the_current_turn() -> None:
         "total_tokens": 380,
         "cached_tokens": 0,
     }
+    assert result["guard"] == {
+        "triggered": False,
+        "trigger": None,
+        "model_rounds": 0,
+        "tool_rounds": 0,
+        "tool_calls": 0,
+        "blocked_tool_calls": 0,
+        "finalized": False,
+    }
 
 
 class _FakeAgent:
@@ -246,6 +256,7 @@ def test_iter_agent_stream_events_direct_route_has_no_usage() -> None:
     done = next(e for e in events if e["type"] == "done")
     assert done["data"]["route"] == "direct"
     assert done["data"]["usage"] is None
+    assert done["data"]["guard"]["triggered"] is False
     # Direct route still reports TTFT (time to emit the single answer delta).
     assert isinstance(done["data"]["ttft_ms"], int)
     assert done["data"]["ttft_ms"] >= 0
@@ -323,7 +334,13 @@ def test_iter_agent_stream_events_ttft_is_end_to_end_not_first_llm_call(
     events = _collect_events(_runtime(chunks), "请检索文档里的营收数据")
 
     deltas = [e for e in events if e["type"] == "message"]
-    assert "".join(e["data"]["delta"] for e in deltas) == "我先检索一下答案是"
+    assert "".join(e["data"]["delta"] for e in deltas) == "答案是"
+    assert deltas[-1]["data"]["phase"] == "answer"
+    assert [e["data"] for e in events if e["type"] == "trace"] == [
+        {"kind": "agent_message_delta", "delta": "我先检索一下", "round": 1},
+        {"kind": "agent_message", "message": "我先检索一下", "round": 1},
+        {"kind": "agent_message_delta", "delta": "答案是", "round": 2},
+    ]
 
     done = next(e for e in events if e["type"] == "done")
     # 若误取 generation 1 的前言 token，则 ttft=1000；端到端应为 5000（含检索耗时）。
@@ -337,6 +354,9 @@ def test_iter_agent_stream_events_done_includes_recorded_tool_calls() -> None:
     class _RecordingAgent:
         def stream(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
             collector = kwargs["context"]["retrieval_collector"]
+            kwargs["context"]["status_sink"].emit(
+                "context_compaction_completed", "历史上下文整理完成。"
+            )
             collector.record_tool_call(
                 "search_document_nodes",
                 {"query": "营收"},
@@ -402,6 +422,12 @@ def test_iter_agent_stream_events_done_includes_recorded_tool_calls() -> None:
         kb=None,
     )
     events = _collect_events(runtime, "请检索文档里的营收数据")
+    trace_events = [e["data"] for e in events if e["type"] == "trace"]
+    assert trace_events[0] == {
+        "kind": "status",
+        "event": "context_compaction_completed",
+        "message": "历史上下文整理完成。",
+    }
     done = next(e for e in events if e["type"] == "done")
     assert done["data"]["tool_calls"] == [
         {
@@ -426,6 +452,9 @@ def test_iter_agent_stream_events_done_includes_recorded_tool_calls() -> None:
             "batch": 2,
         },
     ]
+    assert done["data"]["trace"] == [
+        event for event in trace_events if event["kind"] != "agent_message_delta"
+    ]
     assert done["data"]["route"] == "retrieval"
 
 
@@ -447,3 +476,63 @@ def test_iter_agent_stream_events_ttft_ms_is_none_when_no_tokens_streamed() -> N
     events = _collect_events(_runtime(chunks), "请检索")
     done = next(e for e in events if e["type"] == "done")
     assert done["data"]["ttft_ms"] is None
+
+
+class _GuardFinalStreamAgent:
+    """Emit an unsafe provider chunk followed by the guard-sanitized final state."""
+
+    safe_answer = "基于目前已获得的证据，我无法确认答案。"
+
+    def stream(self, *args: Any, **kwargs: Any):  # type: ignore[no-untyped-def]
+        guard = kwargs["context"]["loop_guard_state"]
+        guard.finalizing = True
+        guard.final_model_started = True
+        yield {
+            "type": "messages",
+            "data": (
+                AIMessage(content="I will retrieve one more document."),
+                {"langgraph_node": "model"},
+            ),
+        }
+        guard.finalized = True
+        guard.trigger = "identical_tool_call"
+        yield {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="请检索文档"),
+                    AIMessage(content=self.safe_answer),
+                ]
+            },
+        }
+
+
+def _guard_final_runtime() -> AgentRuntime:
+    return AgentRuntime(
+        agent=_GuardFinalStreamAgent(),
+        model="test-model",
+        effective_url="",
+        tool_logging=False,
+        kb=None,
+    )
+
+
+def test_iter_agent_stream_events_only_emits_sanitized_guard_final_answer() -> None:
+    events = _collect_events(_guard_final_runtime(), "请检索文档")
+
+    deltas = "".join(
+        event["data"]["delta"] for event in events if event["type"] == "message"
+    )
+    done = next(event["data"] for event in events if event["type"] == "done")
+
+    assert deltas == _GuardFinalStreamAgent.safe_answer
+    assert done["answer"] == _GuardFinalStreamAgent.safe_answer
+    assert done["guard"]["finalized"] is True
+    assert isinstance(done["ttft_ms"], int)
+
+
+def test_run_agent_streaming_only_prints_sanitized_guard_final_answer(capsys) -> None:
+    result = run_agent_streaming(_guard_final_runtime(), "请检索文档")
+
+    assert capsys.readouterr().out == f"{_GuardFinalStreamAgent.safe_answer}\n"
+    assert result["answer"] == _GuardFinalStreamAgent.safe_answer
