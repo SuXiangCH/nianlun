@@ -310,6 +310,7 @@ def test_chat_service_persists_blocking_result(monkeypatch, tmp_path):
                 {"doc_id": "doc-1", "line_num": 7, "text": "实际检索文本"}
             ],
             "status_events": [],
+            "trace": [{"kind": "status", "event": "ready", "message": "准备完成。"}],
             "ttft_ms": 321,
         },
     )
@@ -325,7 +326,9 @@ def test_chat_service_persists_blocking_result(monkeypatch, tmp_path):
     assert messages[1]["sources"][0]["text"] == "实际检索文本"
     assert messages[1]["sources"][0]["citation_id"] == 1
     assert messages[1]["ttft_ms"] == 321
+    assert messages[1]["trace"][0]["message"] == "准备完成。"
     assert response.ttft_ms == 321
+    assert response.trace[0].message == "准备完成。"
 
 
 def test_chat_service_persists_streaming_diagnostics(monkeypatch, tmp_path):
@@ -357,6 +360,13 @@ def test_chat_service_persists_streaming_diagnostics(monkeypatch, tmp_path):
                 },
                 "ttft_ms": 2500,
                 "status_events": [],
+                "trace": [
+                    {
+                        "kind": "agent_message",
+                        "message": "我先检索相关文档。",
+                        "round": 1,
+                    }
+                ],
             },
         }
 
@@ -376,6 +386,13 @@ def test_chat_service_persists_streaming_diagnostics(monkeypatch, tmp_path):
     assert assistant["tool_calls"][0]["elapsed_ms"] == 120
     assert assistant["usage"]["total_tokens"] == 15
     assert assistant["ttft_ms"] == 2500
+    assert assistant["trace"] == [
+        {
+            "kind": "agent_message",
+            "message": "我先检索相关文档。",
+            "round": 1,
+        }
+    ]
 
 
 def test_chat_service_forwards_request_clarification_and_persists_question(
@@ -539,6 +556,13 @@ def test_chat_history_endpoints_return_persisted_messages_and_sources(tmp_path):
                 "elapsed_ms": 45,
             }
         ],
+        trace=[
+            {
+                "kind": "agent_message",
+                "message": "我先读取对应行。",
+                "round": 1,
+            }
+        ],
         usage={
             "input_tokens": 100,
             "output_tokens": 50,
@@ -562,6 +586,7 @@ def test_chat_history_endpoints_return_persisted_messages_and_sources(tmp_path):
     assert assistant["tool_calls"][0]["elapsed_ms"] == 45
     assert assistant["usage"]["total_tokens"] == 150
     assert assistant["ttft_ms"] == 4321
+    assert assistant["trace"][0]["message"] == "我先读取对应行。"
 
     source_response = client.get(
         "/api/v1/apps/app-1/conversations/conversation-1/messages/"

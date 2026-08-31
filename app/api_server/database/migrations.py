@@ -8,7 +8,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -20,10 +20,20 @@ def _record_current_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO schema_migrations(version, name, applied_at)
-        VALUES (?, 'initial_schema', CURRENT_TIMESTAMP)
+        VALUES (?, 'message_trace', CURRENT_TIMESTAMP)
         """,
         (SCHEMA_VERSION,),
     )
+
+
+def _migrate_message_trace(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1]) for row in connection.execute('PRAGMA table_info("messages")')
+    }
+    if "trace_json" not in columns:
+        connection.execute(
+            "ALTER TABLE messages ADD COLUMN trace_json TEXT NOT NULL DEFAULT '[]'"
+        )
 
 
 def _require_current_schema(connection: sqlite3.Connection) -> None:
@@ -56,11 +66,10 @@ def _require_current_schema(connection: sqlite3.Connection) -> None:
 
 
 def initialize_database(factory: SQLiteConnectionFactory) -> None:
-    """Create the current schema and normalize pre-release schema markers.
+    """Create the current schema and migrate existing databases forward.
 
-    Pre-release databases already contain the same business tables. Their
-    historical migration rows are replaced by the V1 baseline marker without
-    changing application data.
+    Pre-release databases already contain the business tables. Their historical
+    marker is normalized after the additive message-trace migration succeeds.
     """
     Base.metadata.create_all(factory.engine)
 
@@ -76,6 +85,7 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
             )
             """
         )
+        _migrate_message_trace(connection)
         _require_current_schema(connection)
         applied = {
             int(row[0])
@@ -96,7 +106,7 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
 
 
 def database_is_initialized(factory: SQLiteConnectionFactory) -> bool:
-    """Return whether the V1 schema baseline has been recorded."""
+    """Return whether the current schema version has been recorded."""
     connection = factory.connect()
     try:
         row = connection.execute(

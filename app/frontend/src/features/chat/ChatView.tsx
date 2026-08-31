@@ -6,7 +6,7 @@ import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 import { api } from "../../api/client";
 import { parseSse } from "../../api/sse";
-import type { Application, ChatDoneEvent, ChatMessage, ClarificationRequest, ConversationMessageRecord, ConversationSummary, SourceSnippet, TokenUsage, ToolCall } from "../../types";
+import type { AgentTraceStep, Application, ChatDoneEvent, ChatMessage, ClarificationRequest, ConversationMessageRecord, ConversationSummary, SourceSnippet, TokenUsage, ToolCall } from "../../types";
 import { normalizeHtmlTables } from "./markdown";
 
 interface ChatViewProps { apps: Application[]; selectedAppId: string; onSelectApp: (id: string) => void; onNewConversation: () => void; resetToken: number; conversationId: string; onConversationId: (id: string) => void; toast: (message: string, error?: boolean) => void; }
@@ -103,12 +103,14 @@ const mapMessage = (item: ConversationMessageRecord): ChatMessage => ({
   pending: item.status === "pending",
   error: item.status === "failed",
   tool_calls: item.tool_calls ?? null,
+  trace: item.trace ?? null,
   usage: item.usage ?? null,
   ttft_ms: item.ttft_ms ?? null,
   sources: item.sources || [],
 });
 const TOOL_LABELS: Record<string, string> = {
   search_across_docs: "搜索知识库",
+  search_document_nodes: "搜索知识库",
   find_relevant_documents: "语义检索文档",
   get_document: "读取文档信息",
   get_structure_outline: "查看目录结构",
@@ -126,6 +128,21 @@ const formatToolArgs = (args?: Record<string, unknown>): string =>
       return `${key}=${text.length > 60 ? `${text.slice(0, 60)}…` : text}`;
     })
     .join("，");
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const parseTraceStep = (value: unknown): AgentTraceStep | null => {
+  if (!isRecord(value)) return null;
+  if (value.kind === "status" && typeof value.event === "string" && typeof value.message === "string") {
+    return { kind: "status", event: value.event, message: value.message };
+  }
+  if (value.kind === "agent_message" && typeof value.message === "string") {
+    return { kind: "agent_message", message: value.message, round: typeof value.round === "number" ? value.round : undefined };
+  }
+  return null;
+};
+const parseTraceDelta = (value: unknown): { delta: string; round: number } | null => {
+  if (!isRecord(value) || value.kind !== "agent_message_delta" || typeof value.delta !== "string" || typeof value.round !== "number") return null;
+  return { delta: value.delta, round: value.round };
+};
 const formatUsage = (usage: TokenUsage, ttftMs?: number | null): string => {
   const n = (v: number): string => v.toLocaleString();
   const parts = [`输入 ${n(usage.input_tokens)}`, `输出 ${n(usage.output_tokens)}`, `共 ${n(usage.total_tokens)}`];
@@ -214,6 +231,34 @@ const timeAgo = (ts: number): string => {
     return "";
   }
 };
+
+function AgentTraceDetails({ trace, pending }: { trace?: AgentTraceStep[] | null; pending: boolean }) {
+  const steps = trace || [];
+  const [open, setOpen] = useState(pending);
+  const wasPending = useRef(pending);
+  useEffect(() => {
+    if (pending && !wasPending.current) setOpen(true);
+    if (!pending && wasPending.current) setOpen(false);
+    wasPending.current = pending;
+  }, [pending]);
+  if (!steps.length) return null;
+  return (
+    <details className="message-details agent-trace" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <span className="agent-trace-mark" aria-hidden="true"><i /><i /><i /></span>
+        <span>{pending ? "正在处理" : "处理过程"}</span>
+      </summary>
+      <div className="agent-trace-list" role="list">
+        {steps.map((step, index) => {
+          if (step.kind === "status") {
+            return <div className={`agent-trace-step is-status ${step.event.endsWith("_failed") ? "is-failed" : ""}`} role="listitem" key={`${step.event}-${index}`}><span className="agent-trace-node" aria-hidden="true" /><span className="agent-trace-copy">{step.message}</span></div>;
+          }
+          return <div className="agent-trace-step is-agent-message" role="listitem" key={`agent-message-${index}`}><span className="agent-trace-node" aria-hidden="true" /><span className="agent-trace-copy">{step.message}</span></div>;
+        })}
+      </div>
+    </details>
+  );
+}
 
 function ToolCallDetails({ toolCalls }: { toolCalls: ToolCall[] }) {
   // batch 相同的是模型同一轮响应里（可能并行）发出的调用；按出现顺序连续分组。
@@ -401,14 +446,15 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
         // usage/TTFT/tool calls in the history API. Fall back to the client-side
         // values recorded for these message ids (kept in localStorage); server
         // values win when present.
-        const storedMeta = new Map<string, { usage: TokenUsage | null; ttftMs: number | null; toolCalls: ToolCall[] | null }>();
+        const storedMeta = new Map<string, { trace: AgentTraceStep[] | null; usage: TokenUsage | null; ttftMs: number | null; toolCalls: ToolCall[] | null }>();
         for (const message of readStoredChat(applicationId, conversationId)?.messages ?? []) {
-          if (message.id) storedMeta.set(message.id, { usage: message.usage ?? null, ttftMs: message.ttft_ms ?? null, toolCalls: message.tool_calls ?? null });
+          if (message.id) storedMeta.set(message.id, { trace: message.trace ?? null, usage: message.usage ?? null, ttftMs: message.ttft_ms ?? null, toolCalls: message.tool_calls ?? null });
         }
         const nextMessages = records.map((item) => {
           const message = mapMessage(item);
           const meta = message.id ? storedMeta.get(message.id) : undefined;
           if (meta) {
+            message.trace = message.trace?.length ? message.trace : meta.trace;
             message.usage = message.usage ?? meta.usage;
             message.ttft_ms = message.ttft_ms ?? meta.ttftMs;
             message.tool_calls = message.tool_calls?.length ? message.tool_calls : meta.toolCalls;
@@ -536,7 +582,7 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
     setMessages((current) =>
       current.flatMap((message) => {
         if (message.pending && message.role === "assistant") {
-          return message.text ? [{ ...message, pending: false, stopped: true }] : [];
+          return message.text || message.trace?.length ? [{ ...message, pending: false, stopped: true }] : [];
         }
         return [message];
       }),
@@ -556,12 +602,59 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
     setSources([]); setBusy(true);
     const activeController = new AbortController(); controller.current = activeController;
     let receivedDone = false;
+    let liveAnswer = "";
+    const liveTrace: AgentTraceStep[] = [];
+    const liveTraceRoundIndexes = new Map<number, number>();
     try {
       const response = await api.chat(selected.id, message, conversationId, clarificationEnabled, activeController.signal);
       for await (const item of parseSse(response)) {
         if (version !== requestVersion.current) return;
         if (item.event === "ready") adoptConversationId(String(item.data.conversation_id || conversationId));
-        else if (item.event === "message") { const delta = String(item.data.delta || ""); if (delta) setMessages((current) => current.map((entry) => entry.id === assistantId ? { ...entry, text: entry.text + delta } : entry)); }
+        else if (item.event === "message") {
+          const delta = String(item.data.delta || "");
+          if (delta) {
+            const answerRound = typeof item.data.round === "number" ? item.data.round : null;
+            if (item.data.phase === "answer" && answerRound != null) {
+              const draftIndex = liveTraceRoundIndexes.get(answerRound);
+              if (draftIndex != null) {
+                liveTrace.splice(draftIndex, 1);
+                liveTraceRoundIndexes.delete(answerRound);
+              }
+            }
+            liveAnswer += delta;
+            setMessages((current) => current.map((entry) => entry.id === assistantId ? { ...entry, text: liveAnswer, trace: [...liveTrace] } : entry));
+          }
+        }
+        else if (item.event === "trace") {
+          const delta = parseTraceDelta(item.data);
+          if (delta) {
+            const existingIndex = liveTraceRoundIndexes.get(delta.round);
+            if (existingIndex == null) {
+              liveTraceRoundIndexes.set(delta.round, liveTrace.length);
+              liveTrace.push({ kind: "agent_message", message: delta.delta, round: delta.round });
+            } else {
+              const existing = liveTrace[existingIndex];
+              if (existing?.kind === "agent_message") existing.message += delta.delta;
+            }
+            setMessages((current) => current.map((entry) => entry.id === assistantId ? { ...entry, trace: [...liveTrace] } : entry));
+            continue;
+          }
+          const step = parseTraceStep(item.data);
+          if (step) {
+            if (step.kind === "agent_message" && step.round != null) {
+              const existingIndex = liveTraceRoundIndexes.get(step.round);
+              if (existingIndex == null) {
+                liveTraceRoundIndexes.set(step.round, liveTrace.length);
+                liveTrace.push(step);
+              } else {
+                liveTrace[existingIndex] = step;
+              }
+            } else {
+              liveTrace.push(step);
+            }
+            setMessages((current) => current.map((entry) => entry.id === assistantId ? { ...entry, trace: [...liveTrace] } : entry));
+          }
+        }
         else if (item.event === "clarification") {
           const clarification = item.data as unknown as ClarificationRequest;
           const text = `${clarification.context ? `${clarification.context}\n\n` : ""}${clarification.question}${clarification.options?.length ? `\n\n${clarification.options.map((option, index) => `${index + 1}. ${option}`).join("\n")}` : ""}`;
@@ -571,7 +664,9 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
           const done = item.data as unknown as ChatDoneEvent;
           const completedMessageId = done.message_id || assistantId;
           const nextSources = (done.retrieved_snippets || []).map((source) => ({ ...source, message_id: source.message_id || completedMessageId }));
-          const completedAssistant: ChatMessage = { id: completedMessageId, role: "assistant", text: done.answer || "", pending: false, tool_calls: done.tool_calls ?? null, usage: done.usage ?? null, ttft_ms: done.ttft_ms ?? null, sources: nextSources };
+          const doneTrace = (done.trace || []).map(parseTraceStep).filter((step): step is AgentTraceStep => step !== null);
+          const completedTrace = Array.isArray(done.trace) ? doneTrace : liveTrace;
+          const completedAssistant: ChatMessage = { id: completedMessageId, role: "assistant", text: done.answer || "", pending: false, tool_calls: done.tool_calls ?? null, trace: completedTrace, usage: done.usage ?? null, ttft_ms: done.ttft_ms ?? null, sources: nextSources };
           const currentMessages = latestChat.current.messages;
           const nextMessages = currentMessages.some((entry) => entry.id === assistantId)
             ? currentMessages.map((entry) => entry.id === assistantId ? { ...entry, ...completedAssistant } : entry)
@@ -600,5 +695,5 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
     setPendingCitation(citationId);
   };
   if (!selected) return null;
- return <section className="chat-layout"><div className="chat-panel"><div className="chat-toolbar"><div className="app-picker"><div className="app-avatar" aria-hidden="true">⌘</div><select value={selected.id} onChange={(event) => { resetConversation(); onSelectApp(event.target.value); }} aria-label="选择应用">{apps.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div><div className="toolbar-meta"><span className="toolbar-search-mode">{selected.search_mode || "scan"} 检索</span><div className="conv-picker"><button className="quiet-button" type="button" onClick={() => setShowConversations((open) => !open)} aria-expanded={showConversations} aria-label="会话列表">会话{conversations.length ? ` (${conversations.length})` : ""} ▾</button>{showConversations && (<><div className="conv-backdrop" onClick={() => setShowConversations(false)} aria-hidden="true" /><div className="conv-popover" role="menu">{conversations.length ? conversations.map((conv) => (<div key={conv.id} className={`conv-item ${conv.id === conversationId ? "is-active" : ""}`} role="button" tabIndex={0} onClick={() => switchConversation(conv.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); switchConversation(conv.id); } }}><span className="conv-title" title={conv.title}>{conv.title}</span><span className="conv-time">{timeAgo(conv.updatedAt)}</span><button className="conv-del" type="button" aria-label="删除会话" onClick={(event) => { event.stopPropagation(); deleteConversation(conv.id); }}>×</button></div>)) : <div className="conv-empty">还没有会话</div>}</div></>)}</div><button className="quiet-button" onClick={resetConversation} type="button">新对话</button></div></div><div ref={scrollRef} className="chat-scroll" aria-live="polite" aria-busy={busy}>{messages.length ? messages.map((message) => <article key={message.id} className={`message ${message.role === "user" ? "user" : ""} ${message.error ? "error" : ""}`}><div className="message-avatar" aria-hidden="true">{message.role === "user" ? "你" : "N"}</div><div className="message-body"><div className="message-label">{message.role === "user" ? "你" : "Nianlun"}</div><div className="message-text">{message.role === "assistant" ? <MarkdownContent className="message-markdown" text={message.text} onCitationClick={message.sources?.length ? (citationId) => showCitation(message.sources || [], citationId) : undefined} /> : message.text}</div>{message.role === "assistant" && !message.pending && message.usage ? <div className="message-usage">{formatUsage(message.usage, message.ttft_ms)}</div> : null}{message.role === "assistant" && !message.pending && message.tool_calls?.length ? <ToolCallDetails toolCalls={message.tool_calls} /> : null}{message.pending && <div className="message-status"><span className="typing" aria-hidden="true"><i /><i /><i /></span>正在整理知识库内容</div>}{message.stopped && <div className="message-status">已停止 · 回答未完成</div>}</div></article>) : <div className="welcome-copy"><div className="eyebrow">{selected.search_mode || "scan"} 检索</div><h2>开始一段新的探索</h2><p>向 {selected.name} 提问，答案会优先基于绑定知识库中的内容生成。</p></div>}</div><form className="composer" onSubmit={send}><div className="composer-box"><textarea name="message" rows={1} maxLength={32000} disabled={busy} aria-label="输入问题" placeholder="问问你的知识库..." onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />{busy ? <button className="stop-button" type="button" title="停止回答" aria-label="停止回答" onClick={stop}>■</button> : <button className="send-button" type="submit" title="发送" aria-label="发送">↑</button>}</div><div className="composer-hint">回答会显示引用片段 · Enter 发送，Shift + Enter 换行</div></form></div><aside className="sources-panel"><div className="panel-heading"><h3>检索片段</h3><span>{sources.length ? `${sources.length} 条` : "等待检索"}</span></div><div className="source-list">{sources.length ? sources.map((source, index) => { const text = sourceText(source); const key = sourceItemKey(source, index); const citationId = sourceCitation(source, index); const expanded = Boolean(expandedSources[key]); const visibleText = expanded ? text : text.slice(0, 180); return <article className={`source-item ${activeCitation === citationId ? "is-citation-active" : ""}`} id={`citation-${citationId}`} key={key}><div className="source-item-heading"><span className="source-citation">[{citationId}]</span><strong title={sourceName(source)}>{sourceName(source)}</strong></div><MarkdownContent className="source-markdown" text={`${visibleText}${!expanded && text.length > 180 ? "…" : ""}`} /><button className="source-toggle" type="button" onClick={() => setExpandedSources((current) => ({ ...current, [key]: !expanded }))}>{expanded ? "收起片段" : "查看本次检索内容"}</button><small>{sourceLocation(source)}</small></article>; }) : <div className="source-empty">当对话产生检索结果时，相关片段会出现在这里。</div>}</div></aside></section>;
+ return <section className="chat-layout"><div className="chat-panel"><div className="chat-toolbar"><div className="app-picker"><div className="app-avatar" aria-hidden="true">⌘</div><select value={selected.id} onChange={(event) => { resetConversation(); onSelectApp(event.target.value); }} aria-label="选择应用">{apps.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div><div className="toolbar-meta"><span className="toolbar-search-mode">{selected.search_mode || "scan"} 检索</span><div className="conv-picker"><button className="quiet-button" type="button" onClick={() => setShowConversations((open) => !open)} aria-expanded={showConversations} aria-label="会话列表">会话{conversations.length ? ` (${conversations.length})` : ""} ▾</button>{showConversations && (<><div className="conv-backdrop" onClick={() => setShowConversations(false)} aria-hidden="true" /><div className="conv-popover" role="menu">{conversations.length ? conversations.map((conv) => (<div key={conv.id} className={`conv-item ${conv.id === conversationId ? "is-active" : ""}`} role="button" tabIndex={0} onClick={() => switchConversation(conv.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); switchConversation(conv.id); } }}><span className="conv-title" title={conv.title}>{conv.title}</span><span className="conv-time">{timeAgo(conv.updatedAt)}</span><button className="conv-del" type="button" aria-label="删除会话" onClick={(event) => { event.stopPropagation(); deleteConversation(conv.id); }}>×</button></div>)) : <div className="conv-empty">还没有会话</div>}</div></>)}</div><button className="quiet-button" onClick={resetConversation} type="button">新对话</button></div></div><div ref={scrollRef} className="chat-scroll" aria-live="polite" aria-busy={busy}>{messages.length ? messages.map((message) => <article key={message.id} className={`message ${message.role === "user" ? "user" : ""} ${message.error ? "error" : ""}`}><div className="message-avatar" aria-hidden="true">{message.role === "user" ? "你" : "N"}</div><div className="message-body"><div className="message-label">{message.role === "user" ? "你" : "Nianlun"}</div>{message.role === "assistant" ? <AgentTraceDetails trace={message.trace} pending={Boolean(message.pending)} /> : null}<div className="message-text">{message.role === "assistant" ? <MarkdownContent className="message-markdown" text={message.text} onCitationClick={message.sources?.length ? (citationId) => showCitation(message.sources || [], citationId) : undefined} /> : message.text}</div>{message.role === "assistant" && !message.pending && message.usage ? <div className="message-usage">{formatUsage(message.usage, message.ttft_ms)}</div> : null}{message.role === "assistant" && !message.pending && message.tool_calls?.length ? <ToolCallDetails toolCalls={message.tool_calls} /> : null}{message.pending && <div className="message-status"><span className="typing" aria-hidden="true"><i /><i /><i /></span>正在整理知识库内容</div>}{message.stopped && <div className="message-status">已停止 · 回答未完成</div>}</div></article>) : <div className="welcome-copy"><div className="eyebrow">{selected.search_mode || "scan"} 检索</div><h2>开始一段新的探索</h2><p>向 {selected.name} 提问，答案会优先基于绑定知识库中的内容生成。</p></div>}</div><form className="composer" onSubmit={send}><div className="composer-box"><textarea name="message" rows={1} maxLength={32000} disabled={busy} aria-label="输入问题" placeholder="问问你的知识库..." onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />{busy ? <button className="stop-button" type="button" title="停止回答" aria-label="停止回答" onClick={stop}>■</button> : <button className="send-button" type="submit" title="发送" aria-label="发送">↑</button>}</div><div className="composer-hint">回答会显示引用片段 · Enter 发送，Shift + Enter 换行</div></form></div><aside className="sources-panel"><div className="panel-heading"><h3>检索片段</h3><span>{sources.length ? `${sources.length} 条` : "等待检索"}</span></div><div className="source-list">{sources.length ? sources.map((source, index) => { const text = sourceText(source); const key = sourceItemKey(source, index); const citationId = sourceCitation(source, index); const expanded = Boolean(expandedSources[key]); const visibleText = expanded ? text : text.slice(0, 180); return <article className={`source-item ${activeCitation === citationId ? "is-citation-active" : ""}`} id={`citation-${citationId}`} key={key}><div className="source-item-heading"><span className="source-citation">[{citationId}]</span><strong title={sourceName(source)}>{sourceName(source)}</strong></div><MarkdownContent className="source-markdown" text={`${visibleText}${!expanded && text.length > 180 ? "…" : ""}`} /><button className="source-toggle" type="button" onClick={() => setExpandedSources((current) => ({ ...current, [key]: !expanded }))}>{expanded ? "收起片段" : "查看本次检索内容"}</button><small>{sourceLocation(source)}</small></article>; }) : <div className="source-empty">当对话产生检索结果时，相关片段会出现在这里。</div>}</div></aside></section>;
 }
