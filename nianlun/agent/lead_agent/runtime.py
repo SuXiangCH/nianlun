@@ -36,6 +36,7 @@ class AgentRuntime:
         effective_url: str,
         tool_logging: bool,
         kb: KnowledgeBasePort,
+        recursion_limit: int = 192,
     ) -> None:
         self.runner = AgentRunner(
             agent=agent,
@@ -43,6 +44,7 @@ class AgentRuntime:
                 knowledge_base=kb,
                 tool_logging=tool_logging,
             ),
+            recursion_limit=recursion_limit,
         )
         self.model = model
         self.effective_url = effective_url

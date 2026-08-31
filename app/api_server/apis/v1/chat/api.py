@@ -57,6 +57,7 @@ async def chat(
                         "retrieved_snippets": payload.get("retrieved_snippets", []),
                         "status_events": payload.get("status_events", []),
                         "tool_calls": payload.get("tool_calls", []),
+                        "trace": payload.get("trace", []),
                         "usage": payload.get("usage"),
                         "ttft_ms": payload.get("ttft_ms"),
                         "clarification": payload.get("clarification"),

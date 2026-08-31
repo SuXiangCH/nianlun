@@ -112,5 +112,5 @@ def test_prompt_requires_answer_coverage_check_before_stopping():
     assert prompt.rfind("<回答前覆盖检查>") > prompt.rfind("<停止条件>")
 
 
-def test_prompt_revision_is_v9():
-    assert PROMPT_VERSION == 9
+def test_prompt_revision_is_v10():
+    assert PROMPT_VERSION == 10

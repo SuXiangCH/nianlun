@@ -988,6 +988,13 @@ class _FakeChatService:
             "message-1",
             iter(
                 [
+                    {
+                        "type": "trace",
+                        "data": {
+                            "kind": "agent_message",
+                            "message": "我先检索知识库。",
+                        },
+                    },
                     {"type": "message", "data": {"delta": "hello"}},
                     {
                         "type": "done",
@@ -996,6 +1003,12 @@ class _FakeChatService:
                             "route": "direct",
                             "retrieved_snippets": [],
                             "status_events": [],
+                            "trace": [
+                                {
+                                    "kind": "agent_message",
+                                    "message": "我先检索知识库。",
+                                }
+                            ],
                         },
                     },
                 ]
@@ -1024,6 +1037,7 @@ def test_chat_blocking_and_streaming_contract(tmp_path: Path) -> None:
     )
     assert response.status_code == 200
     assert response.json()["data"]["answer"] == "echo: hello"
+    assert "guard" not in response.json()["data"]
 
     response = client.post(
         "/api/v1/apps/app-1/chat",
@@ -1036,8 +1050,10 @@ def test_chat_blocking_and_streaming_contract(tmp_path: Path) -> None:
     assert response.status_code == 200
     assert response.headers["X-Request-Id"]
     assert "event: ready" in response.text
+    assert "event: trace" in response.text
     assert "event: message" in response.text
     assert "event: done" in response.text
+    assert '"guard"' not in response.text
 
 
 def test_request_id_is_reused_and_logged(caplog: Any, tmp_path: Path) -> None:

@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,7 +21,14 @@ from nianlun.models.llm import content_to_text
 from nianlun.agent.contracts import AgentRequestContext, KnowledgeBasePort
 from nianlun.knowledgebase import sanitize_text
 from nianlun.agent.middleware import CONTEXT_SUMMARIZATION_NO_STREAM_TAG
+from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
+    LoopGuardState,
+    LoopGuardSummary,
+    snapshot_loop_guard,
+)
 from nianlun.agent.lead_agent.routing import maybe_handle_non_retrieval_query
+
+logger = logging.getLogger(__name__)
 
 
 # ============ 检索状态收集 ============
@@ -158,6 +167,7 @@ class AgentRequestContextFactory:
             "tool_logging": self.tool_logging,
             "clarification_enabled": clarification_enabled,
             "retrieval_deduplication_state": {"documents": set(), "nodes": set()},
+            "loop_guard_state": LoopGuardState(),
         }
         if status_sink is not None:
             context["status_sink"] = status_sink
@@ -170,6 +180,7 @@ class AgentRunner:
 
     agent: Any
     context_factory: AgentRequestContextFactory
+    recursion_limit: int = 192
 
     def new_request_context(
         self,
@@ -214,6 +225,35 @@ class AgentRunner:
             thread_id=thread_id,
             clarification_enabled=clarification_enabled,
         )
+
+
+def _guard_summary(context: AgentRequestContext, thread_id: str) -> LoopGuardSummary:
+    state = context.get("loop_guard_state")
+    guard = state if isinstance(state, LoopGuardState) else LoopGuardState()
+    summary = snapshot_loop_guard(guard)
+    thread_ref = hashlib.sha256(
+        thread_id.encode("utf-8", errors="replace")
+    ).hexdigest()[:12]
+    logger.info(
+        "agent.guard.completed thread_ref=%s trigger=%s model_rounds=%s "
+        "tool_rounds=%s tool_calls=%s blocked=%s finalized=%s",
+        thread_ref,
+        summary["trigger"],
+        summary["model_rounds"],
+        summary["tool_rounds"],
+        summary["tool_calls"],
+        summary["blocked_tool_calls"],
+        summary["finalized"],
+    )
+    return summary
+
+
+def _guard_final_model_started(context: AgentRequestContext) -> bool:
+    state = context.get("loop_guard_state")
+    if not isinstance(state, LoopGuardState):
+        return False
+    with state.lock:
+        return state.final_model_started
 
 
 # ============ content 归一化辅助 ============
@@ -407,12 +447,16 @@ def _run_agent_impl(
             "route_reason": route_decision["route_reason"],
             "status_events": list(status_sink.events),
             "usage": None,
+            "guard": _guard_summary(context, thread_id),
         }
 
     messages = [{"role": "user", "content": user_query}]
     result = agent.invoke(
         {"messages": messages},
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": runner.recursion_limit,
+        },
         context=context,
     )
     used_retrieval = (
@@ -457,6 +501,7 @@ def _run_agent_impl(
             result.get("messages") if isinstance(result, dict) else None
         ),
         "clarification": clarification,
+        "guard": _guard_summary(context, thread_id),
     }
 
 
@@ -486,6 +531,7 @@ def _run_agent_streaming_impl(
             "route_reason": route_decision["route_reason"],
             "status_events": list(status_sink.events),
             "usage": None,
+            "guard": _guard_summary(context, thread_id),
         }
 
     final_state: dict[str, Any] | None = None
@@ -494,7 +540,10 @@ def _run_agent_streaming_impl(
     messages = [{"role": "user", "content": user_query}]
     for chunk in agent.stream(
         {"messages": messages},
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": runner.recursion_limit,
+        },
         context=context,
         stream_mode=["messages", "values"],
         version="v2",
@@ -507,6 +556,12 @@ def _run_agent_streaming_impl(
             if CONTEXT_SUMMARIZATION_NO_STREAM_TAG in metadata.get("tags", ()):
                 continue
 
+            # The provider may stream text before revealing a forbidden tool call.
+            # The guard sanitizes that response only after the model call completes,
+            # so never expose chunks from its forced tool-free finalization round.
+            if _guard_final_model_started(context):
+                continue
+
             text = _stream_message_text(message)
             if text:
                 print(text, end="", flush=True)
@@ -516,12 +571,13 @@ def _run_agent_streaming_impl(
             if isinstance(maybe_state, dict):
                 final_state = maybe_state
 
+    guard_final_model_started = _guard_final_model_started(context)
     if streamed_any_text:
         print()
 
     result_payload = final_state if final_state is not None else ""
     answer = _extract_final_answer(result_payload)
-    if not streamed_any_text and answer:
+    if (guard_final_model_started or not streamed_any_text) and answer:
         print(answer)
     used_retrieval = (
         retrieval_collector is not None and len(retrieval_collector.tool_calls) > 0
@@ -552,6 +608,7 @@ def _run_agent_streaming_impl(
         "usage": _usage_for_current_turn(
             final_state.get("messages") if isinstance(final_state, dict) else None
         ),
+        "guard": _guard_summary(context, thread_id),
     }
 
 
@@ -597,6 +654,22 @@ def _annotate_tool_call_batches(
         )
 
 
+def _trace_status_event(event: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": "status",
+        "event": str(event.get("event", "status")),
+        "message": str(event.get("message", "Agent 正在处理。")),
+    }
+
+
+def _trace_agent_message(message: str, round_id: int) -> dict[str, Any]:
+    return {"kind": "agent_message", "message": message, "round": round_id}
+
+
+def _trace_agent_message_delta(delta: str, round_id: int) -> dict[str, Any]:
+    return {"kind": "agent_message_delta", "delta": delta, "round": round_id}
+
+
 def _iter_agent_stream_events_impl(
     runner: AgentRunner,
     user_query: str,
@@ -608,8 +681,8 @@ def _iter_agent_stream_events_impl(
 
     The CLI-specific ``run_agent_streaming`` prints tokens directly.  API callers
     need the same LangGraph stream without stdout side effects, so this iterator
-    emits ``message`` deltas and one final ``done`` event containing the normal
-    ``run_agent`` result shape.
+    emits ``message`` deltas, structured ``trace`` steps, and one final ``done``
+    event containing the normal ``run_agent`` result shape.
     """
     agent = runner.agent
     status_sink = AgentStatusSink()
@@ -634,8 +707,10 @@ def _iter_agent_stream_events_impl(
             "route_source": route_decision["route_source"],
             "route_reason": route_decision["route_reason"],
             "status_events": list(status_sink.events),
+            "trace": [],
             "usage": None,
             "ttft_ms": _elapsed_ms(start, first_token_at),
+            "guard": _guard_summary(context, thread_id),
         }
         yield {"type": "message", "data": {"delta": result["answer"]}}
         yield {"type": "done", "data": result}
@@ -644,10 +719,28 @@ def _iter_agent_stream_events_impl(
     final_state: dict[str, Any] | None = None
     # 每轮模型生成的最终 chunk 携带完整 usage，逐条收集后累加得本轮用量。
     usage_messages: list[Any] = []
+    trace: list[dict[str, Any]] = []
+    status_trace_index = 0
+    current_model_text: list[str] = []
+    current_model_round: int | None = None
+    model_round = 0
+
+    def drain_trace() -> list[dict[str, Any]]:
+        nonlocal status_trace_index
+        pending: list[dict[str, Any]] = []
+        while status_trace_index < len(status_sink.events):
+            pending.append(_trace_status_event(status_sink.events[status_trace_index]))
+            status_trace_index += 1
+        trace.extend(pending)
+        return pending
+
     messages = [{"role": "user", "content": user_query}]
     for chunk in agent.stream(
         {"messages": messages},
-        config={"configurable": {"thread_id": thread_id}},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": runner.recursion_limit,
+        },
         context=context,
         stream_mode=["messages", "values"],
         version="v2",
@@ -659,31 +752,67 @@ def _iter_agent_stream_events_impl(
                 usage_messages.append(message)
             node = metadata.get("langgraph_node")
             if node == "tools":
+                # Text emitted by the preceding model round belongs to the
+                # Agent's execution trajectory: the round continued into a
+                # tool node, so it was not the final answer. Promote the exact
+                # streamed text to a trace event before the next model round.
+                if current_model_round is not None:
+                    progress_message = "".join(current_model_text).strip()
+                    current_model_text.clear()
+                    if progress_message:
+                        trace_event = _trace_agent_message(
+                            progress_message, current_model_round
+                        )
+                        trace.append(trace_event)
+                        yield {"type": "trace", "data": trace_event}
+                    current_model_round = None
+                for trace_event in drain_trace():
+                    yield {"type": "trace", "data": trace_event}
                 # 工具执行说明后面还有新一轮模型生成；重置打点，让存活的
                 # first_token_at 落在最后一次工具之后那轮（最终答案）的首个文本 token。
                 first_token_at = None
                 continue
+            for trace_event in drain_trace():
+                yield {"type": "trace", "data": trace_event}
             if node != "model":
                 continue
             if CONTEXT_SUMMARIZATION_NO_STREAM_TAG in metadata.get("tags", ()):
                 continue
+            if _guard_final_model_started(context):
+                continue
             text = _stream_message_text(message)
             if text:
+                if current_model_round is None:
+                    model_round += 1
+                    current_model_round = model_round
+                current_model_text.append(text)
                 if first_token_at is None:
                     first_token_at = time.monotonic()
-                yield {"type": "message", "data": {"delta": text}}
+                yield {
+                    "type": "trace",
+                    "data": _trace_agent_message_delta(text, current_model_round),
+                }
         elif chunk_type == "values":
+            for trace_event in drain_trace():
+                yield {"type": "trace", "data": trace_event}
             maybe_state = chunk.get("data")
             if isinstance(maybe_state, dict):
                 final_state = maybe_state
+
+    for trace_event in drain_trace():
+        yield {"type": "trace", "data": trace_event}
 
     used_retrieval = len(retrieval_collector.tool_calls) > 0
     _annotate_tool_call_batches(
         retrieval_collector.tool_calls,
         final_state.get("messages") if isinstance(final_state, dict) else None,
     )
+    guard_final_model_started = _guard_final_model_started(context)
+    answer = _extract_final_answer(final_state if final_state is not None else "")
+    if guard_final_model_started and answer and first_token_at is None:
+        first_token_at = time.monotonic()
     result = {
-        "answer": _extract_final_answer(final_state if final_state is not None else ""),
+        "answer": answer,
         "retrieved_texts": list(retrieval_collector.texts),
         "retrieved_snippets": list(retrieval_collector.snippets),
         "tool_calls": list(retrieval_collector.tool_calls),
@@ -693,11 +822,13 @@ def _iter_agent_stream_events_impl(
         if used_retrieval
         else "主 agent 直接回答，未调用知识库工具。",
         "status_events": list(status_sink.events),
+        "trace": trace,
         "usage": _sum_usage(usage_messages)
         or _last_usage(
             final_state.get("messages") if isinstance(final_state, dict) else None
         ),
         "ttft_ms": _elapsed_ms(start, first_token_at),
+        "guard": _guard_summary(context, thread_id),
     }
     clarification = next(
         (
@@ -712,6 +843,15 @@ def _iter_agent_stream_events_impl(
         result["clarification"] = clarification
         result["answer"] = str(clarification.get("question", "请补充必要信息。"))
         yield {"type": "clarification", "data": clarification}
+    elif result["answer"]:
+        yield {
+            "type": "message",
+            "data": {
+                "delta": result["answer"],
+                "phase": "answer",
+                "round": current_model_round,
+            },
+        }
     yield {"type": "done", "data": result}
 
 

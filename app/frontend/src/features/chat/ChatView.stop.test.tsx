@@ -144,4 +144,39 @@ describe("ChatView stop button", () => {
     expect(container.querySelectorAll("article.message").length).toBe(1);
     expect(container.textContent).toContain("问题");
   });
+
+  it("keeps an interrupted processing draft in the trace instead of the answer", async () => {
+    const { parseSse } = await import("../../api/sse");
+    const { api } = await import("../../api/client");
+    (api.chat as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true } as Response);
+    (parseSse as unknown as ReturnType<typeof vi.fn>).mockImplementation(async function* () {
+      yield { event: "ready", data: { conversation_id: "conv-processing" } };
+      yield {
+        event: "trace",
+        data: {
+          kind: "agent_message_delta",
+          delta: "我先确认需要检索哪些文档。",
+          round: 1,
+        },
+      };
+      await new Promise(() => undefined);
+    });
+    act(() => root.render(<ChatHarness initialConversationId="conv-processing" />));
+
+    const textarea = container.querySelector<HTMLTextAreaElement>('textarea[name="message"]')!;
+    const form = container.querySelector<HTMLFormElement>("form.composer")!;
+    await act(async () => {
+      textarea.value = "问题";
+      form.requestSubmit();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const stopButton = container.querySelector<HTMLButtonElement>('button[aria-label="停止回答"]')!;
+    act(() => stopButton.click());
+
+    const assistant = container.querySelector("article.message:not(.user)");
+    expect(assistant?.querySelector(".agent-trace")?.textContent).toContain("我先确认需要检索哪些文档。");
+    expect(assistant?.querySelector(".message-text")?.textContent).toBe("");
+    expect(assistant?.textContent).toContain("已停止");
+  });
 });

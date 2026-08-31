@@ -19,6 +19,7 @@ from typing import Any
 from nianlun.config import RESULTS_DIR
 from nianlun.knowledgebase import sanitize_text
 from nianlun.agent.lead_agent.runtime import AgentRuntime
+from nianlun.agent.middleware import GuardFinalizationError
 
 _BATCH_RUNTIME_LOCAL = threading.local()
 RuntimeFactory = Callable[[], AgentRuntime]
@@ -78,6 +79,8 @@ def write_jsonl(path: Path, item: dict[str, Any]) -> None:
 
 def is_retryable_batch_error(exc: Exception) -> bool:
     """判断单题失败是否适合做批量级重试。"""
+    if isinstance(exc, GuardFinalizationError):
+        return False
     for attr in ("status_code", "status"):
         value = getattr(exc, attr, None)
         if isinstance(value, int):
@@ -211,6 +214,7 @@ def process_batch_case(
                     "retrieved_texts": run_result["retrieved_texts"],
                     "retrieved_snippets": retrieved_snippets,
                     "retrieved_count": len(retrieved_snippets),
+                    "guard": run_result.get("guard"),
                     "duration_sec": duration_sec,
                     "attempt_count": attempt_count,
                     "retry_count": max(attempt_count - 1, 0),
@@ -251,6 +255,7 @@ def process_batch_case(
             "retrieved_texts": [],
             "retrieved_snippets": [],
             "retrieved_count": 0,
+            "guard": getattr(exc, "guard", None),
             "duration_sec": duration_sec,
             "attempt_count": attempt_count,
             "retry_count": max(attempt_count - 1, 0),

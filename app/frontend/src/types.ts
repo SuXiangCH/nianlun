@@ -235,6 +235,10 @@ export interface ToolCall {
   batch?: number | null;
 }
 
+export type AgentTraceStep =
+  | { kind: "status"; event: string; message: string }
+  | { kind: "agent_message"; message: string; round?: number };
+
 export interface ChatDoneEvent {
   app_id: string;
   conversation_id: string;
@@ -243,6 +247,7 @@ export interface ChatDoneEvent {
   route: string;
   retrieved_snippets: SourceSnippet[];
   tool_calls?: ToolCall[];
+  trace?: AgentTraceStep[];
   usage?: TokenUsage | null;
   ttft_ms?: number | null;
   clarification?: ClarificationRequest | null;
@@ -264,6 +269,7 @@ export interface ChatMessage {
   stopped?: boolean;
   error?: boolean;
   tool_calls?: ToolCall[] | null;
+  trace?: AgentTraceStep[] | null;
   usage?: TokenUsage | null;
   ttft_ms?: number | null;
   sources?: SourceSnippet[];
@@ -296,6 +302,7 @@ export interface ConversationMessageRecord {
   route: string | null;
   error_message: string | null;
   tool_calls?: ToolCall[];
+  trace?: AgentTraceStep[];
   usage?: TokenUsage | null;
   ttft_ms?: number | null;
   created_at: string;

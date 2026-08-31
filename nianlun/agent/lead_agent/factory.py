@@ -15,7 +15,11 @@ from nianlun.agent.middleware import (
     ContextSummarizationMiddleware,
     DanglingToolCallMiddleware,
     RetrievalDeduplicationMiddleware,
+    RetrievalLoopGuardMiddleware,
     ToolErrorHandlingMiddleware,
+)
+from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
+    AgentLoopGuardConfig,
 )
 from nianlun.agent.tools import build_tools
 from nianlun.config import (
@@ -43,6 +47,7 @@ class AgentRuntimeFactory:
     api_key: str | None = None
     context_window_tokens: int | None = None
     allow_env_fallback: bool = True
+    loop_guard_config: AgentLoopGuardConfig | None = None
 
     def __post_init__(self) -> None:
         if self.knowledge_base is not None and self.knowledge_base_config is not None:
@@ -89,6 +94,7 @@ class AgentRuntimeFactory:
             include_clarification=True,
         )
         system_prompt = build_system_prompt(knowledge_base)
+        loop_guard_config = self.loop_guard_config or AgentLoopGuardConfig()
         middleware = [
             ContextSummarizationMiddleware(
                 llm,
@@ -99,6 +105,7 @@ class AgentRuntimeFactory:
             ),
             DanglingToolCallMiddleware(),
             ToolErrorHandlingMiddleware(),
+            RetrievalLoopGuardMiddleware(loop_guard_config),
             RetrievalDeduplicationMiddleware(),
             ClarificationMiddleware(),
         ]
@@ -117,6 +124,7 @@ class AgentRuntimeFactory:
             effective_url=base_url or "https://api.openai.com/v1",
             tool_logging=self.tool_logging,
             kb=knowledge_base,
+            recursion_limit=loop_guard_config.recursion_limit,
         )
 
 

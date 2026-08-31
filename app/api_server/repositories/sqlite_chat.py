@@ -97,6 +97,7 @@ def _message_dict(item: Message) -> dict[str, Any]:
         "route": item.route,
         "error_message": item.error_message,
         "tool_calls": _parse_json_list(item.tool_calls_json),
+        "trace": _parse_json_list(item.trace_json),
         "usage": _parse_json_dict(item.usage_json),
         "ttft_ms": item.ttft_ms,
         "created_at": item.created_at,
@@ -230,6 +231,7 @@ class SQLiteChatRepository:
         route: str,
         snippets: list[dict[str, Any]],
         tool_calls: list[dict[str, Any]] | None = None,
+        trace: list[dict[str, Any]] | None = None,
         usage: dict[str, int] | None = None,
         ttft_ms: int | None = None,
         now: datetime,
@@ -255,6 +257,9 @@ class SQLiteChatRepository:
             message.error_message = None
             message.tool_calls_json = json.dumps(
                 tool_calls or [], ensure_ascii=False, default=str
+            )
+            message.trace_json = json.dumps(
+                trace or [], ensure_ascii=False, default=str
             )
             message.usage_json = (
                 json.dumps(usage, ensure_ascii=False) if usage else None

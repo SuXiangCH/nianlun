@@ -67,7 +67,7 @@ def test_orm_models_cover_all_business_tables():
     }
 
 
-def test_schema_initialization_records_v1_baseline(tmp_path):
+def test_schema_initialization_records_current_version(tmp_path):
     factory = _factory(tmp_path)
     connection = factory.connect()
     try:
@@ -83,8 +83,8 @@ def test_schema_initialization_records_v1_baseline(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 1
-    assert versions == {1}
+    assert migrations.SCHEMA_VERSION == 2
+    assert versions == {2}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -98,6 +98,15 @@ def test_schema_initialization_records_v1_baseline(tmp_path):
     assert "summary_enabled" in columns
     assert "vector_status" in columns
     assert "vector_progress_stage" in columns
+
+    connection = factory.connect()
+    try:
+        message_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(messages)")
+        }
+    finally:
+        connection.close()
+    assert "trace_json" in message_columns
 
 
 def test_schema_initialization_preserves_pre_release_data(tmp_path):
@@ -137,7 +146,60 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {1}
+    assert versions == {2}
+
+
+def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    repository = SQLiteChatRepository(factory)
+    now = datetime.now(timezone.utc)
+    repository.begin_turn(
+        application_id="app-1",
+        conversation_id="conversation-v1",
+        user_message_id="user-v1",
+        assistant_message_id="assistant-v1",
+        user_content="旧数据库问题",
+        now=now,
+    )
+    repository.complete_turn(
+        application_id="app-1",
+        conversation_id="conversation-v1",
+        assistant_message_id="assistant-v1",
+        answer="旧数据库回答",
+        route="direct",
+        snippets=[],
+        now=now,
+    )
+
+    connection = factory.connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ALTER TABLE messages DROP COLUMN trace_json")
+        connection.execute("DELETE FROM schema_migrations")
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) "
+            "VALUES (1, 'initial_schema', CURRENT_TIMESTAMP)"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(factory)
+
+    messages = repository.get_messages("app-1", "conversation-v1")
+    assert messages is not None
+    assert messages[1]["content"] == "旧数据库回答"
+    assert messages[1]["trace"] == []
+    connection = factory.connect()
+    try:
+        versions = {
+            int(row[0])
+            for row in connection.execute("SELECT version FROM schema_migrations")
+        }
+    finally:
+        connection.close()
+    assert versions == {2}
 
 
 def test_knowledge_base_settings_update_preserves_concurrent_index_state(tmp_path):

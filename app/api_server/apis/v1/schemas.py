@@ -62,6 +62,21 @@ class ToolCall(ApiSchema):
     batch: int | None = None
 
 
+class AgentTraceStatusStep(ApiSchema):
+    kind: Literal["status"]
+    event: str
+    message: str
+
+
+class AgentTraceMessageStep(ApiSchema):
+    kind: Literal["agent_message"]
+    message: str
+    round: int | None = None
+
+
+AgentTraceStep = AgentTraceStatusStep | AgentTraceMessageStep
+
+
 class ChatResponse(ApiSchema):
     app_id: str
     conversation_id: str
@@ -71,6 +86,7 @@ class ChatResponse(ApiSchema):
     retrieved_snippets: list[dict[str, Any]]
     status_events: list[dict[str, Any]]
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    trace: list[AgentTraceStep] = Field(default_factory=list)
     usage: dict[str, int] | None = None
     ttft_ms: int | None = None
     clarification: dict[str, Any] | None = None
@@ -116,6 +132,7 @@ class ConversationMessageResponse(ApiSchema):
     route: str | None = None
     error_message: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
+    trace: list[AgentTraceStep] = Field(default_factory=list)
     usage: dict[str, int] | None = None
     ttft_ms: int | None = None
     created_at: datetime
@@ -417,6 +434,9 @@ class ApplicationResponse(ApiSchema):
 
 
 __all__ = [
+    "AgentTraceMessageStep",
+    "AgentTraceStatusStep",
+    "AgentTraceStep",
     "ApplicationCreateRequest",
     "ApplicationResponse",
     "ApiSchema",
