@@ -69,6 +69,7 @@ describe("ChatView tool-call details", () => {
 
   afterEach(() => {
     act(() => root.unmount());
+    Reflect.deleteProperty(document, "startViewTransition");
     container.remove();
   });
 
@@ -79,10 +80,10 @@ describe("ChatView tool-call details", () => {
     (parseSse as unknown as ReturnType<typeof vi.fn>).mockImplementation(async function* () {
       yield { event: "ready", data: { conversation_id: "conv-1" } };
       yield { event: "trace", data: TRACE[0] };
-      yield { event: "trace", data: { kind: "agent_message_delta", delta: AGENT_PROGRESS, round: 1 } };
+      yield { event: "message", data: { delta: AGENT_PROGRESS, phase: "candidate", round: 1 } };
       yield { event: "trace", data: TRACE[1] };
-      yield { event: "trace", data: { kind: "agent_message_delta", delta: "答案是", round: 2 } };
-      yield { event: "message", data: { delta: "答案是", phase: "answer", round: 2 } };
+      yield { event: "message", data: { delta: "答案", phase: "candidate", round: 2 } };
+      yield { event: "message", data: { delta: "是", phase: "candidate", round: 2 } };
       yield {
         event: "done",
         data: {
@@ -144,29 +145,45 @@ describe("ChatView tool-call details", () => {
     const stored = JSON.parse(localStorage.getItem(`nianlun.chat.${application.id}.conv-1`) || "{}");
     expect(stored.messages[1].tool_calls).toEqual(TOOL_CALLS);
     expect(stored.messages[1].trace).toEqual(TRACE);
+    expect(stored.messages[1].keepTraceOpen).toBeUndefined();
 
     await act(async () => {
       traceDetails?.querySelector("summary")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect((traceDetails as HTMLDetailsElement).open).toBe(true);
+    expect((traceDetails as HTMLDetailsElement).open).toBe(false);
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="会话列表"]')!.click());
-    expect((traceDetails as HTMLDetailsElement).open).toBe(true);
+    expect((traceDetails as HTMLDetailsElement).open).toBe(false);
   });
 
-  it("shows promoted Agent messages in the open trace while the answer is still streaming", async () => {
+  it("smoothly promotes a candidate round and keeps the final round streaming", async () => {
     const { parseSse } = await import("../../api/sse");
     const { api } = await import("../../api/client");
     let finishStream!: () => void;
     const waitForFinish = new Promise<void>((resolve) => { finishStream = resolve; });
+    const transitionNames: Array<{ source: string; target: string }> = [];
+    Object.defineProperty(document, "startViewTransition", {
+      configurable: true,
+      value: (update: () => void) => {
+        const source = container.querySelector<HTMLElement>(".message-text.is-stream-candidate")?.style.viewTransitionName || "";
+        const updateCallbackDone = Promise.resolve().then(() => {
+          update();
+          const target = container.querySelector<HTMLElement>(".agent-trace-step.is-promoted")?.style.viewTransitionName || "";
+          transitionNames.push({ source, target });
+        });
+        return { finished: updateCallbackDone, updateCallbackDone };
+      },
+    });
     (api.chat as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true } as Response);
     (parseSse as unknown as ReturnType<typeof vi.fn>).mockImplementation(async function* () {
       yield { event: "ready", data: { conversation_id: "conv-live" } };
-      yield { event: "trace", data: { kind: "agent_message_delta", delta: AGENT_PROGRESS, round: 1 } };
+      yield { event: "trace", data: { kind: "status", event: "ignored", message: "  " } };
+      yield { event: "trace", data: { kind: "agent_message", message: "\n", round: 0 } };
+      yield { event: "message", data: { delta: AGENT_PROGRESS, phase: "candidate", round: 1 } };
       yield { event: "trace", data: TRACE[1] };
+      yield { event: "message", data: { delta: "最终", phase: "candidate", round: 2 } };
       await waitForFinish;
-      yield { event: "trace", data: { kind: "agent_message_delta", delta: "最终答案", round: 2 } };
-      yield { event: "message", data: { delta: "最终答案", phase: "answer", round: 2 } };
+      yield { event: "message", data: { delta: "答案", phase: "candidate", round: 2 } };
       yield {
         event: "done",
         data: {
@@ -195,11 +212,17 @@ describe("ChatView tool-call details", () => {
     });
 
     const liveTrace = container.querySelector<HTMLDetailsElement>(".agent-trace");
-    const liveAnswer = liveTrace?.closest(".message-body")?.querySelector(".message-text");
+    const liveBubble = liveTrace?.closest(".message-body")?.querySelector(".message-text");
     expect(liveTrace?.open).toBe(true);
+    expect(liveTrace?.classList.contains("is-pending")).toBe(true);
     expect(liveTrace?.querySelector("summary")?.textContent).toBe("正在处理");
     expect(liveTrace?.textContent).toContain(AGENT_PROGRESS);
-    expect(liveAnswer?.textContent).toBe("");
+    expect(liveTrace?.querySelectorAll(".agent-trace-step")).toHaveLength(1);
+    expect(liveTrace?.querySelector(".agent-trace-step.is-agent-message")).not.toBeNull();
+    expect(liveBubble?.textContent).toBe("最终");
+    expect(transitionNames).toHaveLength(1);
+    expect(transitionNames[0]?.source).not.toBe("");
+    expect(transitionNames[0]?.target).toBe(transitionNames[0]?.source);
 
     await act(async () => {
       finishStream();
@@ -208,7 +231,9 @@ describe("ChatView tool-call details", () => {
 
     const completedTrace = container.querySelector<HTMLDetailsElement>(".agent-trace");
     const completedAnswer = completedTrace?.closest(".message-body")?.querySelector(".message-text");
-    expect(completedTrace?.open).toBe(false);
+    expect(completedAnswer).toBe(liveBubble);
+    expect(completedTrace?.open).toBe(true);
+    expect(completedTrace?.classList.contains("is-pending")).toBe(false);
     expect(completedAnswer?.textContent).toBe("最终答案");
   });
 
@@ -223,9 +248,10 @@ describe("ChatView tool-call details", () => {
     act(() => root.render(<ChatHarness initialConversationId="conv-2" />));
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 50)); });
 
-    const traceDetails = container.querySelector(".agent-trace");
+    const traceDetails = container.querySelector<HTMLDetailsElement>(".agent-trace");
     const toolDetails = container.querySelector("details.message-details:not(.agent-trace)");
     expect(traceDetails?.textContent).toContain(AGENT_PROGRESS);
+    expect(traceDetails?.open).toBe(false);
     expect(toolDetails?.querySelector("summary")?.textContent).toContain("详情 · 3 次工具调用 · 2 轮");
     expect(container.querySelector(".message-usage")?.textContent).toContain("首字 2.5s");
   });

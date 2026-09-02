@@ -165,9 +165,24 @@ h3 { font-size: 14px; }
 .agent-trace-node { position: absolute; left: -21px; top: 5px; width: 7px; height: 7px; border: 2px solid var(--paper); border-radius: 50%; background: var(--teal); box-shadow: 0 0 0 1px var(--line); }
 .agent-trace-step.is-status .agent-trace-node { background: var(--muted); }
 .agent-trace-step.is-agent-message .agent-trace-copy { color: var(--ink); white-space: pre-wrap; }
+.agent-trace-step.is-promoted { animation: agent-trace-settle 260ms cubic-bezier(.2,.75,.25,1) both; }
 .agent-trace-step.is-failed .agent-trace-node { background: var(--coral); }
 .agent-trace-copy { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--muted); }
 .agent-trace-step.is-failed .agent-trace-copy { color: var(--coral); }
+@keyframes agent-trace-settle {
+  from { opacity: .72; transform: translateY(2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+::view-transition-old(root), ::view-transition-new(root) { animation: none; mix-blend-mode: normal; }
+::view-transition-group(*) { animation-duration: 260ms; animation-timing-function: cubic-bezier(.2,.75,.25,1); }
+::view-transition-old(*), ::view-transition-new(*) { mix-blend-mode: normal; }
+@supports (view-transition-name: none) {
+  .agent-trace-step.is-promoted { animation: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-trace-step.is-promoted { animation: none; }
+  ::view-transition-group(*) { animation-duration: 1ms; }
+}
 .tool-call-list { margin: 6px 0 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--paper-muted); display: flex; flex-direction: column; gap: 8px; }
 .tool-call-batch ul { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
 .tool-call-batch + .tool-call-batch { padding-top: 8px; border-top: 1px dashed var(--line); }

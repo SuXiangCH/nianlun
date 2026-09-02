@@ -989,13 +989,29 @@ class _FakeChatService:
             iter(
                 [
                     {
+                        "type": "message",
+                        "data": {
+                            "delta": "我先检索相关文档。",
+                            "phase": "candidate",
+                            "round": 1,
+                        },
+                    },
+                    {
                         "type": "trace",
                         "data": {
                             "kind": "agent_message",
-                            "message": "我先检索知识库。",
+                            "message": "我先检索相关文档。",
+                            "round": 1,
                         },
                     },
-                    {"type": "message", "data": {"delta": "hello"}},
+                    {
+                        "type": "message",
+                        "data": {"delta": "hel", "phase": "candidate", "round": 2},
+                    },
+                    {
+                        "type": "message",
+                        "data": {"delta": "lo", "phase": "candidate", "round": 2},
+                    },
                     {
                         "type": "done",
                         "data": {
@@ -1006,7 +1022,8 @@ class _FakeChatService:
                             "trace": [
                                 {
                                     "kind": "agent_message",
-                                    "message": "我先检索知识库。",
+                                    "message": "我先检索相关文档。",
+                                    "round": 1,
                                 }
                             ],
                         },
@@ -1051,7 +1068,9 @@ def test_chat_blocking_and_streaming_contract(tmp_path: Path) -> None:
     assert response.headers["X-Request-Id"]
     assert "event: ready" in response.text
     assert "event: trace" in response.text
+    assert "event: candidate" not in response.text
     assert "event: message" in response.text
+    assert '"phase":"candidate"' in response.text
     assert "event: done" in response.text
     assert '"guard"' not in response.text
 

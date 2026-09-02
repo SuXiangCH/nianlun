@@ -237,7 +237,7 @@ export interface ToolCall {
 
 export type AgentTraceStep =
   | { kind: "status"; event: string; message: string }
-  | { kind: "agent_message"; message: string; round?: number };
+  | { kind: "agent_message"; message: string; round?: number; transitionName?: string };
 
 export interface ChatDoneEvent {
   app_id: string;
@@ -263,6 +263,11 @@ export interface ClarificationRequest {
 
 export interface ChatMessage {
   id: string;
+  // Server-persisted message id. During streaming `id` stays the stable
+  // client-side placeholder (so React does not remount the bubble when the
+  // final `done` event assigns the real id); `server_id` records that real id
+  // for matching against history-API records after a reload.
+  server_id?: string | null;
   role: "user" | "assistant";
   text: string;
   pending?: boolean;
@@ -270,6 +275,9 @@ export interface ChatMessage {
   error?: boolean;
   tool_calls?: ToolCall[] | null;
   trace?: AgentTraceStep[] | null;
+  keepTraceOpen?: boolean;
+  streamRound?: number | null;
+  streamTransitionName?: string | null;
   usage?: TokenUsage | null;
   ttft_ms?: number | null;
   sources?: SourceSnippet[];

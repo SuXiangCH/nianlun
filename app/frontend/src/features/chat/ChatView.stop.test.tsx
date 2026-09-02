@@ -145,7 +145,7 @@ describe("ChatView stop button", () => {
     expect(container.textContent).toContain("问题");
   });
 
-  it("keeps an interrupted processing draft in the trace instead of the answer", async () => {
+  it("keeps an interrupted tool trace without creating an answer bubble", async () => {
     const { parseSse } = await import("../../api/sse");
     const { api } = await import("../../api/client");
     (api.chat as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true } as Response);
@@ -154,9 +154,9 @@ describe("ChatView stop button", () => {
       yield {
         event: "trace",
         data: {
-          kind: "agent_message_delta",
-          delta: "我先确认需要检索哪些文档。",
-          round: 1,
+          kind: "status",
+          event: "tool_call_started",
+          message: "正在搜索相关文档。",
         },
       };
       await new Promise(() => undefined);
@@ -175,8 +175,10 @@ describe("ChatView stop button", () => {
     act(() => stopButton.click());
 
     const assistant = container.querySelector("article.message:not(.user)");
-    expect(assistant?.querySelector(".agent-trace")?.textContent).toContain("我先确认需要检索哪些文档。");
+    expect(assistant?.querySelector(".agent-trace")?.textContent).toContain("正在搜索相关文档。");
+    expect(assistant?.querySelectorAll(".agent-trace-step")).toHaveLength(1);
     expect(assistant?.querySelector(".message-text")?.textContent).toBe("");
     expect(assistant?.textContent).toContain("已停止");
   });
+
 });

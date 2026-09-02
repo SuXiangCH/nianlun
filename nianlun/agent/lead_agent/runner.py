@@ -319,6 +319,45 @@ def _stream_message_text(message: Any) -> str:
     return ""
 
 
+def _stream_message_has_tool_call(message: Any) -> bool:
+    """判断模型流分片是否已经开始输出工具调用。"""
+    for attribute in ("tool_call_chunks", "tool_calls"):
+        calls = getattr(message, attribute, None)
+        if isinstance(calls, (list, tuple)) and calls:
+            return True
+
+    additional_kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        calls = additional_kwargs.get("tool_calls")
+        return isinstance(calls, (list, tuple)) and bool(calls)
+    return False
+
+
+def _stream_message_tool_names(message: Any) -> list[str]:
+    """提取当前流分片中已出现的工具名，忽略供应商的空名称增量。"""
+    containers = [
+        getattr(message, "tool_call_chunks", None),
+        getattr(message, "tool_calls", None),
+    ]
+    additional_kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(additional_kwargs, dict):
+        containers.append(additional_kwargs.get("tool_calls"))
+
+    names: list[str] = []
+    for calls in containers:
+        if not isinstance(calls, (list, tuple)):
+            continue
+        for call in calls:
+            name = (
+                call.get("name")
+                if isinstance(call, dict)
+                else getattr(call, "name", None)
+            )
+            if isinstance(name, str) and name.strip() and name.strip() not in names:
+                names.append(name.strip())
+    return names
+
+
 # ============ token usage 提取 ============
 #
 # LangChain 把各提供商的 ``usage`` 归一成 ``AIMessage.usage_metadata``：
@@ -654,11 +693,14 @@ def _annotate_tool_call_batches(
         )
 
 
-def _trace_status_event(event: dict[str, Any]) -> dict[str, Any]:
+def _trace_status_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    message = str(event.get("message", "Agent 正在处理。")).strip()
+    if not message:
+        return None
     return {
         "kind": "status",
-        "event": str(event.get("event", "status")),
-        "message": str(event.get("message", "Agent 正在处理。")),
+        "event": str(event.get("event", "status")).strip() or "status",
+        "message": message,
     }
 
 
@@ -666,8 +708,33 @@ def _trace_agent_message(message: str, round_id: int) -> dict[str, Any]:
     return {"kind": "agent_message", "message": message, "round": round_id}
 
 
-def _trace_agent_message_delta(delta: str, round_id: int) -> dict[str, Any]:
-    return {"kind": "agent_message_delta", "delta": delta, "round": round_id}
+_TOOL_PROGRESS_MESSAGES = {
+    "search_document_nodes": "正在搜索相关文档。",
+    "find_semantic_documents": "正在进行语义检索。",
+    "get_structure_outline": "正在查看文档结构。",
+    "get_line_content": "正在读取相关内容。",
+    "get_document": "正在读取文档信息。",
+    "ask_clarification": "正在确认需要补充的信息。",
+}
+
+
+def _trace_tool_call_started(tool_names: list[str]) -> dict[str, Any]:
+    """把真实工具调用转换成不泄漏参数的用户可见轨迹。"""
+    messages = [
+        _TOOL_PROGRESS_MESSAGES.get(name, "正在调用工具。") for name in tool_names
+    ]
+    unique_messages = list(dict.fromkeys(messages))
+    if not unique_messages:
+        message = "正在调用工具。"
+    elif len(unique_messages) == 1:
+        message = unique_messages[0]
+    else:
+        message = " ".join(unique_messages)
+    return {
+        "kind": "status",
+        "event": "tool_call_started",
+        "message": message,
+    }
 
 
 def _iter_agent_stream_events_impl(
@@ -680,9 +747,10 @@ def _iter_agent_stream_events_impl(
     """Yield transport-neutral events for HTTP or other streaming frontends.
 
     The CLI-specific ``run_agent_streaming`` prints tokens directly.  API callers
-    need the same LangGraph stream without stdout side effects, so this iterator
-    emits ``message`` deltas, structured ``trace`` steps, and one final ``done``
-    event containing the normal ``run_agent`` result shape.
+    need the same LangGraph stream without stdout side effects. Model text emits
+    provisional ``message`` deltas immediately; a round that proceeds to tools
+    is confirmed as a ``trace`` step, while the final round remains the streamed
+    answer. One final ``done`` event contains the persisted result.
     """
     agent = runner.agent
     status_sink = AgentStatusSink()
@@ -691,8 +759,8 @@ def _iter_agent_stream_events_impl(
     )
     # 首 token 时延（TTFT）：从本函数入口计到「最终答案」的首个文本 token 产出。
     # 含路由判定、工具决策轮与检索/工具执行耗时——即用户等到第一个答案字的真实时延。
-    # 纯客户端网络往返不计入。注意：工具决策轮也可能吐出文本（前言/思考外显），
-    # 遇到 tools 节点必须重置计时，只保留最后一轮工具之后那次模型生成的首 token。
+    # 纯客户端网络往返不计入。工具轮的自然进度说明不是答案；遇到工具调用时
+    # 重置打点，只保留最后一轮工具之后最终答案的首 token。
     start = time.monotonic()
     first_token_at: float | None = None
     route_decision = maybe_handle_non_retrieval_query(user_query)
@@ -723,16 +791,50 @@ def _iter_agent_stream_events_impl(
     status_trace_index = 0
     current_model_text: list[str] = []
     current_model_round: int | None = None
+    current_model_tool_trace_emitted = False
+    in_tools_node = False
     model_round = 0
 
     def drain_trace() -> list[dict[str, Any]]:
         nonlocal status_trace_index
         pending: list[dict[str, Any]] = []
         while status_trace_index < len(status_sink.events):
-            pending.append(_trace_status_event(status_sink.events[status_trace_index]))
+            trace_event = _trace_status_event(status_sink.events[status_trace_index])
+            if trace_event is not None:
+                pending.append(trace_event)
             status_trace_index += 1
         trace.extend(pending)
         return pending
+
+    def ensure_current_model_round() -> int:
+        nonlocal current_model_round
+        nonlocal model_round
+        if current_model_round is None:
+            model_round += 1
+            current_model_round = model_round
+        return current_model_round
+
+    def start_tool_trace(tool_names: list[str]) -> dict[str, Any] | None:
+        nonlocal current_model_tool_trace_emitted
+        if current_model_tool_trace_emitted:
+            return None
+        current_model_tool_trace_emitted = True
+        round_id = ensure_current_model_round()
+        progress_message = "".join(current_model_text).strip()
+        trace_event = (
+            _trace_agent_message(progress_message, round_id)
+            if progress_message
+            else _trace_tool_call_started(tool_names)
+        )
+        trace.append(trace_event)
+        return trace_event
+
+    def reset_current_model_round() -> None:
+        nonlocal current_model_round
+        nonlocal current_model_tool_trace_emitted
+        current_model_text.clear()
+        current_model_round = None
+        current_model_tool_trace_emitted = False
 
     messages = [{"role": "user", "content": user_query}]
     for chunk in agent.stream(
@@ -752,20 +854,14 @@ def _iter_agent_stream_events_impl(
                 usage_messages.append(message)
             node = metadata.get("langgraph_node")
             if node == "tools":
-                # Text emitted by the preceding model round belongs to the
-                # Agent's execution trajectory: the round continued into a
-                # tool node, so it was not the final answer. Promote the exact
-                # streamed text to a trace event before the next model round.
-                if current_model_round is not None:
-                    progress_message = "".join(current_model_text).strip()
-                    current_model_text.clear()
-                    if progress_message:
-                        trace_event = _trace_agent_message(
-                            progress_message, current_model_round
-                        )
-                        trace.append(trace_event)
+                # Providers that do not expose tool-call chunks are classified
+                # here as a fallback. The trace still reflects the real tool node.
+                if not in_tools_node:
+                    trace_event = start_tool_trace([])
+                    if trace_event is not None:
                         yield {"type": "trace", "data": trace_event}
-                    current_model_round = None
+                    reset_current_model_round()
+                    in_tools_node = True
                 for trace_event in drain_trace():
                     yield {"type": "trace", "data": trace_event}
                 # 工具执行说明后面还有新一轮模型生成；重置打点，让存活的
@@ -776,28 +872,54 @@ def _iter_agent_stream_events_impl(
                 yield {"type": "trace", "data": trace_event}
             if node != "model":
                 continue
+            in_tools_node = False
             if CONTEXT_SUMMARIZATION_NO_STREAM_TAG in metadata.get("tags", ()):
                 continue
             if _guard_final_model_started(context):
                 continue
             text = _stream_message_text(message)
             if text:
-                if current_model_round is None:
-                    model_round += 1
-                    current_model_round = model_round
+                round_id = ensure_current_model_round()
                 current_model_text.append(text)
                 if first_token_at is None:
                     first_token_at = time.monotonic()
                 yield {
-                    "type": "trace",
-                    "data": _trace_agent_message_delta(text, current_model_round),
+                    "type": "message",
+                    "data": {
+                        "delta": text,
+                        "phase": "candidate",
+                        "round": round_id,
+                    },
                 }
+            has_tool_call = _stream_message_has_tool_call(message)
+            if has_tool_call:
+                tool_names = _stream_message_tool_names(message)
+                known_tool_names = [
+                    name for name in tool_names if name in _TOOL_PROGRESS_MESSAGES
+                ]
+                # Natural model text is authoritative for the visible activity.
+                # When it is absent, wait for a complete known tool name before
+                # emitting the deterministic fallback.
+                if current_model_text or known_tool_names:
+                    trace_event = start_tool_trace(known_tool_names)
+                    if trace_event is not None:
+                        yield {"type": "trace", "data": trace_event}
+                first_token_at = None
         elif chunk_type == "values":
             for trace_event in drain_trace():
                 yield {"type": "trace", "data": trace_event}
             maybe_state = chunk.get("data")
             if isinstance(maybe_state, dict):
                 final_state = maybe_state
+                state_messages = maybe_state.get("messages")
+                if isinstance(state_messages, (list, tuple)) and state_messages:
+                    latest_message = state_messages[-1]
+                    if _stream_message_has_tool_call(latest_message):
+                        tool_names = _stream_message_tool_names(latest_message)
+                        if tool_names:
+                            trace_event = start_tool_trace(tool_names)
+                            if trace_event is not None:
+                                yield {"type": "trace", "data": trace_event}
 
     for trace_event in drain_trace():
         yield {"type": "trace", "data": trace_event}
@@ -843,7 +965,9 @@ def _iter_agent_stream_events_impl(
         result["clarification"] = clarification
         result["answer"] = str(clarification.get("question", "请补充必要信息。"))
         yield {"type": "clarification", "data": clarification}
-    elif result["answer"]:
+    elif result["answer"] and (
+        guard_final_model_started or "".join(current_model_text) != result["answer"]
+    ):
         yield {
             "type": "message",
             "data": {
