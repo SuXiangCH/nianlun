@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
 from nianlun.agent.lead_agent.runtime import (
     AgentRuntime,
@@ -295,18 +295,38 @@ def test_iter_agent_stream_events_falls_back_to_final_state_when_no_usage_chunk(
 def test_iter_agent_stream_events_ttft_is_end_to_end_not_first_llm_call(
     monkeypatch,
 ) -> None:
-    # 工具决策轮（generation 1）也会吐出文本（前言/思考外显），但端到端首 token 时延
-    # 必须落在最后一次工具调用之后那轮（最终答案）的首个文本 token 上——检索耗时要计入。
+    # 工具决策轮会先输出自然进度说明；端到端首 token 时延仍必须落在最后一次
+    # 工具调用之后那轮最终答案的首个文本 token 上——检索耗时要计入。
     import time as time_module
 
-    ticks = iter([0.0, 1.0, 5.0])  # start / gen1 前言 token / gen2 答案首 token
+    ticks = iter([0.0, 1.0, 5.0])  # start / gen1 进度说明 / gen2 答案首 token
     monkeypatch.setattr(time_module, "monotonic", lambda: next(ticks, 5.0))
 
     chunks = [
-        # generation 1: 工具决策轮吐了一段前言文本（1.0s 时刻），随后发起工具调用
+        # generation 1: 自然进度说明随后进入同一轮的工具调用。
         {
             "type": "messages",
-            "data": (AIMessage(content="我先检索一下"), {"langgraph_node": "model"}),
+            "data": (
+                AIMessage(content="我先检索相关文档。"),
+                {"langgraph_node": "model"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": "search_document_nodes",
+                            "args": "{}",
+                            "id": "t1",
+                            "index": 0,
+                        }
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
         },
         # 工具节点执行检索
         {
@@ -334,17 +354,231 @@ def test_iter_agent_stream_events_ttft_is_end_to_end_not_first_llm_call(
     events = _collect_events(_runtime(chunks), "请检索文档里的营收数据")
 
     deltas = [e for e in events if e["type"] == "message"]
-    assert "".join(e["data"]["delta"] for e in deltas) == "答案是"
-    assert deltas[-1]["data"]["phase"] == "answer"
+    assert "".join(e["data"]["delta"] for e in deltas) == "我先检索相关文档。答案是"
+    assert deltas[0]["data"]["phase"] == "candidate"
+    assert deltas[-1]["data"]["round"] == 2
     assert [e["data"] for e in events if e["type"] == "trace"] == [
-        {"kind": "agent_message_delta", "delta": "我先检索一下", "round": 1},
-        {"kind": "agent_message", "message": "我先检索一下", "round": 1},
-        {"kind": "agent_message_delta", "delta": "答案是", "round": 2},
+        {
+            "kind": "agent_message",
+            "message": "我先检索相关文档。",
+            "round": 1,
+        },
     ]
 
     done = next(e for e in events if e["type"] == "done")
     # 若误取 generation 1 的前言 token，则 ttft=1000；端到端应为 5000（含检索耗时）。
     assert done["data"]["ttft_ms"] == 5000
+
+
+def test_iter_agent_stream_events_promotes_natural_activity_before_tool_runs() -> None:
+    chunks = [
+        {
+            "type": "messages",
+            "data": (
+                AIMessageChunk(
+                    content="我先搜索相关文档。",
+                    tool_call_chunks=[
+                        {
+                            "name": "search_document_nodes",
+                            "args": "{}",
+                            "id": "t1",
+                            "index": 0,
+                        }
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
+        },
+    ]
+
+    events = iter_agent_stream_events(_runtime(chunks), "请检索文档", thread_id="t1")
+    try:
+        assert next(events) == {
+            "type": "message",
+            "data": {
+                "delta": "我先搜索相关文档。",
+                "phase": "candidate",
+                "round": 1,
+            },
+        }
+        assert next(events) == {
+            "type": "trace",
+            "data": {
+                "kind": "agent_message",
+                "message": "我先搜索相关文档。",
+                "round": 1,
+            },
+        }
+    finally:
+        events.close()
+
+
+def test_iter_agent_stream_events_waits_for_complete_tool_name() -> None:
+    chunks = [
+        {
+            "type": "messages",
+            "data": (
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {"name": "get_line", "args": "", "id": "t1", "index": 0}
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (
+                AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": "get_line_content",
+                            "args": "{}",
+                            "id": None,
+                            "index": 0,
+                        }
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (
+                ToolMessage(content="doc", tool_call_id="t1"),
+                {"langgraph_node": "tools"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (AIMessage(content="最终答案"), {"langgraph_node": "model"}),
+        },
+        {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="请读取正文"),
+                    AIMessage(content="最终答案"),
+                ]
+            },
+        },
+    ]
+
+    events = _collect_events(_runtime(chunks), "请读取正文")
+
+    assert [event["data"] for event in events if event["type"] == "trace"] == [
+        {
+            "kind": "status",
+            "event": "tool_call_started",
+            "message": "正在读取相关内容。",
+        }
+    ]
+
+
+def test_iter_agent_stream_events_reads_tool_name_from_model_state() -> None:
+    chunks = [
+        {
+            "type": "messages",
+            "data": (AIMessageChunk(content=""), {"langgraph_node": "model"}),
+        },
+        {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="请查看目录"),
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "get_structure_outline",
+                                "args": {"doc_id": "doc-1"},
+                                "id": "t1",
+                            }
+                        ],
+                    ),
+                ]
+            },
+        },
+        {
+            "type": "messages",
+            "data": (
+                ToolMessage(content="outline", tool_call_id="t1"),
+                {"langgraph_node": "tools"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (AIMessage(content="最终答案"), {"langgraph_node": "model"}),
+        },
+        {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="请查看目录"),
+                    AIMessage(content="最终答案"),
+                ]
+            },
+        },
+    ]
+
+    events = _collect_events(_runtime(chunks), "请查看目录")
+
+    trace_index = next(
+        index for index, event in enumerate(events) if event["type"] == "trace"
+    )
+    answer_index = next(
+        index for index, event in enumerate(events) if event["type"] == "message"
+    )
+    assert events[trace_index]["data"] == {
+        "kind": "status",
+        "event": "tool_call_started",
+        "message": "正在查看文档结构。",
+    }
+    assert trace_index < answer_index
+
+
+def test_iter_agent_stream_events_emits_one_trace_for_parallel_tool_messages() -> None:
+    chunks = [
+        {
+            "type": "messages",
+            "data": (
+                ToolMessage(content="doc-1", tool_call_id="t1"),
+                {"langgraph_node": "tools"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (
+                ToolMessage(content="doc-2", tool_call_id="t2"),
+                {"langgraph_node": "tools"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (AIMessage(content="最终答案"), {"langgraph_node": "model"}),
+        },
+        {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="请检索"),
+                    AIMessage(content="最终答案"),
+                ]
+            },
+        },
+    ]
+
+    events = _collect_events(_runtime(chunks), "请检索")
+
+    assert [event["data"] for event in events if event["type"] == "trace"] == [
+        {
+            "kind": "status",
+            "event": "tool_call_started",
+            "message": "正在调用工具。",
+        }
+    ]
 
 
 def test_iter_agent_stream_events_done_includes_recorded_tool_calls() -> None:
@@ -452,9 +686,7 @@ def test_iter_agent_stream_events_done_includes_recorded_tool_calls() -> None:
             "batch": 2,
         },
     ]
-    assert done["data"]["trace"] == [
-        event for event in trace_events if event["kind"] != "agent_message_delta"
-    ]
+    assert done["data"]["trace"] == trace_events
     assert done["data"]["route"] == "retrieval"
 
 
@@ -476,6 +708,48 @@ def test_iter_agent_stream_events_ttft_ms_is_none_when_no_tokens_streamed() -> N
     events = _collect_events(_runtime(chunks), "请检索")
     done = next(e for e in events if e["type"] == "done")
     assert done["data"]["ttft_ms"] is None
+
+
+def test_iter_agent_stream_events_drops_whitespace_only_processing_round() -> None:
+    chunks = [
+        {
+            "type": "messages",
+            "data": (AIMessage(content=" \n "), {"langgraph_node": "model"}),
+        },
+        {
+            "type": "messages",
+            "data": (
+                ToolMessage(content="doc", tool_call_id="t1"),
+                {"langgraph_node": "tools"},
+            ),
+        },
+        {
+            "type": "messages",
+            "data": (AIMessage(content="最终答案"), {"langgraph_node": "model"}),
+        },
+        {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="请检索"),
+                    AIMessage(content="最终答案"),
+                ]
+            },
+        },
+    ]
+
+    events = _collect_events(_runtime(chunks), "请检索")
+
+    assert [event["data"] for event in events if event["type"] == "trace"] == [
+        {
+            "kind": "status",
+            "event": "tool_call_started",
+            "message": "正在调用工具。",
+        }
+    ]
+    assert [
+        event["data"]["delta"] for event in events if event["type"] == "message"
+    ] == [" \n ", "最终答案"]
 
 
 class _GuardFinalStreamAgent:
