@@ -7,25 +7,18 @@ delete+insert，设计文档 §5.3）两种模式。
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from nianlun.indexing.fts.build_records import build_records
 from nianlun.indexing.fts.store import NodeFtsStore
+from nianlun.knowledgebase.workspace_view import WorkspaceView
 
 logger = logging.getLogger(__name__)
 
 # 攒批插入：减少往返。~8k 记录十几批完事。
 BATCH_SIZE = 500
-
-
-def _load_meta(workspace: Path) -> dict[str, Any]:
-    meta_path = workspace / "_meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"workspace 缺少 _meta.json: {workspace}")
-    return json.loads(meta_path.read_text(encoding="utf-8"))
 
 
 def build_node_fts(
@@ -37,6 +30,9 @@ def build_node_fts(
     knowledge_base_id: str | None = None,
     doc_ids: list[str] | None = None,
     force: bool = False,
+    snapshot_relpath: str | None = None,
+    snapshot_manifest_sha256: str | None = None,
+    snapshot_content_version: int | None = None,
 ) -> NodeFtsStore:
     """重建 FTS 索引：遍历 workspace -> 三源记录 -> insert -> load。
 
@@ -53,7 +49,23 @@ def build_node_fts(
         已 load 的 ``NodeFtsStore``，可继续 ``search``。
     """
     ws = Path(workspace_dir)
-    meta = _load_meta(ws)
+    if snapshot_relpath is None:
+        view = WorkspaceView.legacy(ws)
+    else:
+        if (
+            knowledge_base_id is None
+            or snapshot_manifest_sha256 is None
+            or snapshot_content_version is None
+        ):
+            raise ValueError("V2 snapshot 构建缺少知识库 ID、manifest hash 或 revision")
+        view = WorkspaceView.revision(
+            ws,
+            snapshot_relpath,
+            snapshot_manifest_sha256,
+            knowledge_base_id=knowledge_base_id,
+            content_version=snapshot_content_version,
+        )
+    meta = view.meta
     store = NodeFtsStore(
         uri=uri,
         token=token,
@@ -73,13 +85,14 @@ def build_node_fts(
     total = 0
     processed = 0
     for doc_id in target_ids:
-        doc_path = ws / f"{doc_id}.json"
-        if not doc_path.exists():
+        if doc_id not in meta:
             logger.warning(
-                "[fts_index] 跳过：%s.json 不存在（_meta 与文件不一致）", doc_id
+                "[fts_index] 跳过：文档 %s 不在目标 workspace revision", doc_id
             )
+            if not force:
+                store.delete_by_doc(doc_id)
             continue
-        doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        doc = view.load_document(doc_id)
         records = build_records(doc, knowledge_base_id=knowledge_base_id)
         if not force:
             # Read and build first: malformed new data must not erase live results.

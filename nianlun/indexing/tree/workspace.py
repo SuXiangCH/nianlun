@@ -35,6 +35,8 @@ def build_workspace_doc(
     llm: Any = None,
     thin: bool = False,
     min_node_token: int | None = None,
+    heading_recovery_mode: str = "off",
+    heading_recovery_llm: Any = None,
 ) -> tuple[str, dict[str, Any]]:
     """Build one Markdown index and normalize it to the workspace contract."""
     result = build_md_index_sync(
@@ -48,6 +50,8 @@ def build_workspace_doc(
         atx_only=atx_only,
         thin=thin,
         min_node_token=min_node_token,
+        heading_recovery_mode=heading_recovery_mode,
+        heading_recovery_llm=heading_recovery_llm,
     )
     doc_id = str(uuid.uuid4())
     doc = {
@@ -59,6 +63,8 @@ def build_workspace_doc(
         "line_count": result["line_count"],
         "structure": result["structure"],
     }
+    if "heading_recovery" in result:
+        doc["heading_recovery"] = result["heading_recovery"]
     return doc_id, doc
 
 

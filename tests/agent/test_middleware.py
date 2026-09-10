@@ -1024,6 +1024,35 @@ def test_loop_guard_final_tool_call_fallback_matches_english_request():
     )
 
 
+def test_loop_guard_final_tool_call_fallback_keeps_english_with_chinese_name():
+    middleware = RetrievalLoopGuardMiddleware()
+    guard = LoopGuardState(finalizing=True)
+    runtime = SimpleNamespace(context={"loop_guard_state": guard})
+    request = ModelRequest(
+        model=object(),
+        messages=[HumanMessage(content="What did Zhang San say about revenue?")],
+        tools=[object()],
+        runtime=runtime,
+    )
+    call = {
+        "name": "get_document",
+        "args": {"doc_id": "doc-1"},
+        "id": "english-name-final-call",
+        "type": "tool_call",
+    }
+
+    response = middleware.wrap_model_call(
+        request,
+        lambda _updated: ModelResponse(
+            result=[AIMessage(content="Let me retrieve it.", tool_calls=[call])]
+        ),
+    )
+
+    assert response.result[0].content == (
+        "I cannot confirm the answer based on the evidence currently available."
+    )
+
+
 def test_loop_guard_async_final_model_call_clears_anthropic_tool_metadata():
     middleware = RetrievalLoopGuardMiddleware()
     guard = LoopGuardState(finalizing=True)

@@ -2,13 +2,14 @@ from collections.abc import AsyncIterator, Iterator
 import json
 import logging
 from pathlib import Path
+import time
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 import app.api_server.services.model_config_service as model_config_service
-from app.api_server.apis.v1.schemas import ChatResponse
+from app.api_server.apis.v1.schemas import ChatResponse, DocumentResponse
 from app.api_server.config import ApiServerSettings
 from app.api_server.main import create_app
 from app.api_server.services.container import build_services
@@ -30,6 +31,26 @@ def _settings(tmp_path: Path) -> ApiServerSettings:
         # API route tests do not exercise FTS; keep them independent of Milvus.
         fts_enabled=False,
     )
+
+
+def test_document_response_progress_contract_is_strict() -> None:
+    schema = DocumentResponse.model_json_schema()
+
+    progress_ref = schema["properties"]["progress"]["$ref"]
+    parse_ref = schema["properties"]["parse"]["$ref"]
+    progress = schema["$defs"][progress_ref.rsplit("/", 1)[-1]]
+    parse = schema["$defs"][parse_ref.rsplit("/", 1)[-1]]
+    assert progress["additionalProperties"] is False
+    assert set(progress["properties"]) == {"completed", "total", "unit"}
+    assert parse["additionalProperties"] is False
+    assert set(parse["properties"]) == {
+        "chunks_completed",
+        "chunks_total",
+        "pages_completed",
+        "pages_total",
+    }
+    parse_task = schema["$defs"]["DocumentParseTaskResponse"]
+    assert "canceled" in parse_task["properties"]["state"]["enum"]
 
 
 def _create_profile(client: TestClient, kind: str) -> dict[str, Any]:
@@ -76,6 +97,20 @@ def _make_bindable(client: TestClient, knowledge_base_id: str) -> None:
     services.applications.fts_enabled = True
 
 
+def _wait_document_ready(
+    client: TestClient, knowledge_base_id: str, document_id: str
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for _ in range(200):
+        payload = client.get(
+            f"/api/v1/knowledge-bases/{knowledge_base_id}/documents/{document_id}"
+        ).json()["data"]
+        if payload["status"] == "ready":
+            return payload
+        time.sleep(0.01)
+    return payload
+
+
 def test_app_lifespan_shuts_down_background_services(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -119,7 +154,15 @@ def test_knowledge_base_upload_and_app_creation(
         files={"file": ("report.md", b"# Revenue\n\nRevenue grew.")},
     )
     assert response.status_code == 200
-    assert response.json()["data"]["document_count"] == 1
+    document_id = response.json()["data"]["document_id"]
+    assert (
+        _wait_document_ready(client, knowledge_base_id, document_id)["status"]
+        == "ready"
+    )
+    refreshed = client.get(f"/api/v1/knowledge-bases/{knowledge_base_id}").json()[
+        "data"
+    ]
+    assert refreshed["document_count"] == 1
     assert response.json()["data"]["vector_enabled"] is False
     assert (Path(knowledge_base["workspace_dir"]) / "_meta.json").exists()
     _make_bindable(client, knowledge_base_id)
@@ -138,7 +181,7 @@ def test_knowledge_base_upload_and_app_creation(
     assert response.json()["data"]["llm_model_id"] == llm["id"]
 
 
-def test_knowledge_base_summary_switch_defaults_on_and_can_be_disabled(
+def test_knowledge_base_processing_switches_default_on_and_can_be_disabled(
     tmp_path: Path,
 ) -> None:
     client = TestClient(create_app(_settings(tmp_path)))
@@ -148,17 +191,20 @@ def test_knowledge_base_summary_switch_defaults_on_and_can_be_disabled(
     _make_bindable(client, created["id"])
     knowledge_base_id = created["id"]
     assert created["summary_enabled"] is True
+    assert created["heading_recovery_enabled"] is True
 
     updated = client.patch(
         f"/api/v1/knowledge-bases/{knowledge_base_id}",
-        json={"summary_enabled": False},
+        json={"summary_enabled": False, "heading_recovery_enabled": False},
     )
     assert updated.status_code == 200
     assert updated.json()["data"]["summary_enabled"] is False
+    assert updated.json()["data"]["heading_recovery_enabled"] is False
 
     fetched = client.get(f"/api/v1/knowledge-bases/{knowledge_base_id}")
     assert fetched.status_code == 200
     assert fetched.json()["data"]["summary_enabled"] is False
+    assert fetched.json()["data"]["heading_recovery_enabled"] is False
 
 
 def test_new_knowledge_base_enables_subtree_folding_without_api_setting(
@@ -185,6 +231,12 @@ def test_new_knowledge_base_enables_subtree_folding_without_api_setting(
     )
     assert response.status_code == 200
     new_document_id = response.json()["data"]["document_id"]
+    assert (
+        _wait_document_ready(client, new_knowledge_base["id"], new_document_id)[
+            "status"
+        ]
+        == "ready"
+    )
     new_artifact = json.loads(
         (new_workspace / f"{new_document_id}.json").read_text(encoding="utf-8")
     )
@@ -205,6 +257,12 @@ def test_new_knowledge_base_enables_subtree_folding_without_api_setting(
     )
     assert response.status_code == 200
     legacy_document_id = response.json()["data"]["document_id"]
+    assert (
+        _wait_document_ready(client, legacy_knowledge_base["id"], legacy_document_id)[
+            "status"
+        ]
+        == "ready"
+    )
     legacy_artifact = json.loads(
         (legacy_workspace / f"{legacy_document_id}.json").read_text(encoding="utf-8")
     )
@@ -423,10 +481,16 @@ def test_document_and_knowledge_base_delete_remove_persisted_data(
     )
     assert uploaded.status_code == 200
     document_id = uploaded.json()["data"]["document_id"]
+    assert (
+        _wait_document_ready(client, knowledge_base_id, document_id)["status"]
+        == "ready"
+    )
     workspace = Path(created["workspace_dir"])
     manifest = json.loads((workspace / "_meta.json").read_text())
     source = workspace / manifest[document_id]["path"]
+    root_tree = workspace / f"{document_id}.json"
     assert source.exists()
+    assert root_tree.exists()
 
     deleted_document = client.delete(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/documents/{document_id}"
@@ -438,14 +502,27 @@ def test_document_and_knowledge_base_delete_remove_persisted_data(
         ]
         == []
     )
-    assert not source.exists()
     assert json.loads((workspace / "_meta.json").read_text()) == {}
-    assert (
-        client.get(f"/api/v1/knowledge-bases/{knowledge_base_id}").json()["data"][
-            "document_count"
-        ]
-        == 0
+    assert not root_tree.exists()
+    knowledge_base = client.get(f"/api/v1/knowledge-bases/{knowledge_base_id}").json()[
+        "data"
+    ]
+    assert knowledge_base["document_count"] == 0
+    current_snapshot = json.loads(
+        (
+            workspace
+            / "snapshots"
+            / f"r{knowledge_base['content_version']}"
+            / "manifest.json"
+        ).read_text()
     )
+    assert current_snapshot["documents"] == []
+    assert current_snapshot["artifact_files"] == []
+
+    # Historical revisions still reference immutable artifacts. Physical cleanup
+    # is deferred until a future revision-aware GC can prove they are unreferenced.
+    assert source.exists()
+    assert (workspace / "artifacts" / document_id).is_dir()
 
     deleted_knowledge_base = client.delete(
         f"/api/v1/knowledge-bases/{knowledge_base_id}"
@@ -623,6 +700,9 @@ def test_default_model_catalog_is_used_when_building_runtime(
     assert captured["knowledge_base_config"].vector_enabled is False
     assert captured["knowledge_base_config"].embedding_model == "runtime-embedding"
     assert captured["knowledge_base_config"].embedding_dim == 768
+    assert captured["knowledge_base_config"].snapshot_relpath == "snapshots/r0"
+    assert captured["knowledge_base_config"].snapshot_manifest_sha256
+    assert captured["knowledge_base_config"].content_version == 0
 
 
 def test_application_model_profile_overrides_default_profile(
@@ -708,6 +788,7 @@ def test_api_runtime_does_not_fallback_to_environment_credentials(
     assert captured["model"] == "catalog-chat"
     assert captured["base_url"] == "https://catalog.example/v1"
     assert captured["api_key"] is None
+    assert captured["context_window_tokens"] == 128_000
     assert captured["allow_env_fallback"] is False
 
 
@@ -1119,14 +1200,24 @@ def test_document_tree_outline_serves_without_node_text(
         lambda _self: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
-    knowledge_base_id = client.post(
+    knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "树测试"}
-    ).json()["data"]["id"]
+    ).json()["data"]
+    knowledge_base_id = knowledge_base["id"]
     upload = client.post(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/documents",
         files={"file": ("outline.md", b"# Alpha\n\nintro\n\n## Beta\n\ndetail")},
     ).json()["data"]
     document_id = upload["document_id"]
+    assert (
+        _wait_document_ready(client, knowledge_base_id, document_id)["status"]
+        == "ready"
+    )
+    # Online reads are pinned to the SQLite-selected V2 revision, not the
+    # mutable root V1 compatibility projection.
+    (Path(knowledge_base["workspace_dir"]) / f"{document_id}.json").write_text(
+        '{"doc_name":"stale root","structure":[]}', encoding="utf-8"
+    )
 
     response = client.get(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/documents/{document_id}/tree"

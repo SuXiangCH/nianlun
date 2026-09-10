@@ -144,6 +144,7 @@ class KnowledgeBaseCreateRequest(ApiSchema):
     name: str = Field(..., min_length=1, max_length=128)
     description: str = Field(default="", max_length=2_000)
     summary_enabled: bool = True
+    heading_recovery_enabled: bool = True
     embedding_model_id: str | None = Field(default=None, max_length=128)
 
     @field_validator("embedding_model_id")
@@ -156,6 +157,7 @@ class KnowledgeBaseCreateRequest(ApiSchema):
 class KnowledgeBaseUpdateRequest(ApiSchema):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     summary_enabled: bool | None = None
+    heading_recovery_enabled: bool | None = None
     embedding_model_id: str | None = Field(default=None, max_length=128)
     vector_enabled: bool | None = None
 
@@ -305,6 +307,7 @@ class KnowledgeBaseResponse(ApiSchema):
     status: Literal["creating", "ready", "indexing", "error"]
     document_count: int
     summary_enabled: bool = True
+    heading_recovery_enabled: bool = True
     workspace_dir: str
     workspace_relpath: str | None = None
     content_version: int = 0
@@ -350,10 +353,18 @@ class DocumentArtifactResponse(ApiSchema):
         "layout",
         "model",
         "asset",
+        "parse_chunk_source",
+        "parse_chunk_result",
+        "normalized_markdown",
+        "page_map",
+        "enriched_markdown",
+        "tree",
+        "diagnostics",
     ]
     relpath: str
     mime_type: str
     size_bytes: int
+    pipeline_generation: int = 1
     created_at: datetime
 
 
@@ -363,6 +374,11 @@ class DocumentParseTaskResponse(ApiSchema):
     provider: Literal["mineru"]
     api_mode: Literal["saas_precision", "self_hosted"]
     attempt: int
+    pipeline_generation: int = 1
+    chunk_index: int = 0
+    chunk_count: int = 1
+    source_page_start: int | None = None
+    source_page_end: int | None = None
     data_id: str
     batch_id: str | None
     task_id: str | None
@@ -376,7 +392,13 @@ class DocumentParseTaskResponse(ApiSchema):
         "converting",
         "done",
         "failed",
+        "canceled",
     ]
+    dispatch_state: Literal[
+        "queued", "leased", "waiting", "succeeded", "failed", "canceled"
+    ] = "queued"
+    available_at: datetime | None = None
+    next_poll_at: datetime | None = None
     extracted_pages: int | None = None
     total_pages: int | None = None
     error_code: str | None = None
@@ -385,6 +407,19 @@ class DocumentParseTaskResponse(ApiSchema):
     updated_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
+
+
+class DocumentProgressResponse(ApiSchema):
+    completed: int | None = None
+    total: int | None = None
+    unit: Literal["pages", "chunks", "nodes", "documents"] | None = None
+
+
+class DocumentParseProgressResponse(ApiSchema):
+    chunks_completed: int = 0
+    chunks_total: int = 0
+    pages_completed: int = 0
+    pages_total: int = 0
 
 
 class DocumentResponse(ApiSchema):
@@ -398,7 +433,24 @@ class DocumentResponse(ApiSchema):
     status: Literal[
         "uploaded", "parsing", "parsed", "indexing", "ready", "failed", "deleted"
     ]
+    pipeline_generation: int = 1
+    current_stage: Literal[
+        "parse", "normalize", "enrich", "publish", "index", "complete"
+    ] = "complete"
+    stage_state: Literal[
+        "queued", "running", "succeeded", "partial", "failed", "skipped"
+    ] = "succeeded"
+    failed_stage: Literal["parse", "normalize", "enrich", "index"] | None = None
+    progress_completed: int | None = None
+    progress_total: int | None = None
+    progress_unit: Literal["pages", "chunks", "nodes", "documents"] | None = None
+    warnings: list[dict[str, Any]] = Field(default_factory=list)
     parsed_content_version: int | None = None
+    published_content_version: int | None = None
+    progress: DocumentProgressResponse = Field(default_factory=DocumentProgressResponse)
+    parse: DocumentParseProgressResponse = Field(
+        default_factory=DocumentParseProgressResponse
+    )
     error_code: str | None = None
     error_message: str | None = None
     latest_task: DocumentParseTaskResponse | None = None
@@ -445,7 +497,9 @@ __all__ = [
     "ConversationMessageResponse",
     "ConversationResponse",
     "DocumentArtifactResponse",
+    "DocumentParseProgressResponse",
     "DocumentParseTaskResponse",
+    "DocumentProgressResponse",
     "DocumentResponse",
     "KnowledgeBaseCreateRequest",
     "KnowledgeBaseUpdateRequest",

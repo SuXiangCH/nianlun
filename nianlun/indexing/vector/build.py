@@ -11,7 +11,6 @@ Supports two modes (design doc §5.3/§5.6):
 
 from __future__ import annotations
 
-import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -27,30 +26,13 @@ from nianlun.models.embedding import (
     embed_records,
 )
 from nianlun.indexing.vector.store import DocVectorStore
+from nianlun.knowledgebase.workspace_view import WorkspaceView
 
 logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 64
 INSERT_BATCH_SIZE = 500
 ProgressCallback = Callable[[str, int, int, int], None]
-
-
-def _load_meta(workspace: Path) -> dict[str, Any]:
-    meta_path = workspace / "_meta.json"
-    if not meta_path.exists():
-        raise FileNotFoundError(f"workspace 缺少 _meta.json: {workspace}")
-    return json.loads(meta_path.read_text(encoding="utf-8"))
-
-
-def _resolve_document_ids(workspace: Path, doc_ids: list[str] | None) -> list[str]:
-    meta = _load_meta(workspace)
-    if doc_ids is None:
-        return [
-            str(doc_id) for doc_id in meta if (workspace / f"{doc_id}.json").is_file()
-        ]
-    return [
-        str(doc_id) for doc_id in doc_ids if (workspace / f"{doc_id}.json").is_file()
-    ]
 
 
 def build_doc_vectors(
@@ -69,6 +51,9 @@ def build_doc_vectors(
     progress_callback: ProgressCallback | None = None,
     doc_ids: list[str] | None = None,
     force: bool = False,
+    snapshot_relpath: str | None = None,
+    snapshot_manifest_sha256: str | None = None,
+    snapshot_content_version: int | None = None,
 ) -> DocVectorStore:
     """Build (or incrementally refresh) a vector collection.
 
@@ -81,7 +66,27 @@ def build_doc_vectors(
             regardless of ``doc_ids``. Used for force rebuilds and model changes.
     """
     workspace = Path(workspace_dir)
-    document_ids = _resolve_document_ids(workspace, doc_ids)
+    if snapshot_relpath is None:
+        view = WorkspaceView.legacy(workspace)
+    else:
+        if (
+            knowledge_base_id is None
+            or snapshot_manifest_sha256 is None
+            or snapshot_content_version is None
+        ):
+            raise ValueError("V2 snapshot 构建缺少知识库 ID、manifest hash 或 revision")
+        view = WorkspaceView.revision(
+            workspace,
+            snapshot_relpath,
+            snapshot_manifest_sha256,
+            knowledge_base_id=knowledge_base_id,
+            content_version=snapshot_content_version,
+        )
+    document_ids = (
+        list(view.meta)
+        if doc_ids is None or force
+        else [str(doc_id) for doc_id in doc_ids]
+    )
     total_documents = len(document_ids)
 
     def report(
@@ -120,7 +125,7 @@ def build_doc_vectors(
     full_blue_green = force or doc_ids is None
     if full_blue_green:
         return _build_full_blue_green(
-            workspace,
+            view,
             document_ids,
             target_store,
             uri,
@@ -131,12 +136,12 @@ def build_doc_vectors(
             report,
         )
     return _build_incremental(
-        workspace, document_ids, target_store, knowledge_base_id, client, report
+        view, document_ids, target_store, knowledge_base_id, client, report
     )
 
 
 def _build_full_blue_green(
-    workspace: Path,
+    view: WorkspaceView,
     document_ids: list[str],
     target_store: DocVectorStore,
     uri: str | None,
@@ -167,8 +172,7 @@ def _build_full_blue_green(
         total = 0
         records_processed = 0
         for document_number, doc_id in enumerate(document_ids, start=1):
-            doc_path = workspace / f"{doc_id}.json"
-            doc = json.loads(doc_path.read_text(encoding="utf-8"))
+            doc = view.load_document(doc_id)
             report("embedding", document_number - 1, total_documents, records_processed)
             pending.extend(build_records(doc, knowledge_base_id=knowledge_base_id))
             while len(pending) >= BATCH_SIZE:
@@ -213,7 +217,7 @@ def _build_full_blue_green(
 
 
 def _build_incremental(
-    workspace: Path,
+    view: WorkspaceView,
     document_ids: list[str],
     target_store: DocVectorStore,
     knowledge_base_id: str | None,
@@ -228,8 +232,13 @@ def _build_incremental(
     total = 0
     records_processed = 0
     for document_number, doc_id in enumerate(document_ids, start=1):
-        doc_path = workspace / f"{doc_id}.json"
-        doc = json.loads(doc_path.read_text(encoding="utf-8"))
+        if doc_id not in view.meta:
+            # Tombstones have no source tree to embed, but their stale live
+            # vectors must still be removed from the incremental collection.
+            target_store.delete_by_doc(doc_id)
+            report("embedding", document_number, total_documents, records_processed)
+            continue
+        doc = view.load_document(doc_id)
         report("embedding", document_number - 1, total_documents, records_processed)
         records = build_records(doc, knowledge_base_id=knowledge_base_id)
         embedded_records: list[dict[str, Any]] = []

@@ -407,6 +407,24 @@ def test_structure_to_list_order():
     assert [n["title"] for n in flat] == ["A", "A1", "A2", "B"]
 
 
+def test_build_md_index_reports_node_progress():
+    updates: list[tuple[int, int]] = []
+
+    async def record(completed: int, total: int) -> None:
+        updates.append((completed, total))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "progress.md"
+        path.write_text("# A\nbody\n## B\nbody", encoding="utf-8")
+        build_md_index_sync(
+            str(path),
+            add_node_summary=False,
+            node_progress_callback=record,
+        )
+
+    assert updates == [(0, 2), (2, 2)]
+
+
 def test_format_structure_drops_empty_nodes_and_orders():
     nodes, _ = _make_nodes()
     tree = build_tree(nodes)

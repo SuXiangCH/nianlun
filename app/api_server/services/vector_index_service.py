@@ -6,6 +6,8 @@ import hashlib
 import logging
 import re
 import threading
+import uuid
+from contextlib import nullcontext
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -32,6 +34,15 @@ def _collection_name(base: str | None, knowledge_base_id: str) -> str:
     )
     suffix = hashlib.sha256(knowledge_base_id.encode("utf-8")).hexdigest()[:16]
     return f"{prefix[:200]}_{suffix}"
+
+
+def _collection_root(collection_name: str) -> str:
+    return collection_name.split("__build_", 1)[0]
+
+
+def _staging_collection_name(collection_name: str, revision: int) -> str:
+    suffix = f"__build_r{revision}_{uuid.uuid4().hex[:8]}"
+    return f"{_collection_root(collection_name)[: 255 - len(suffix)]}{suffix}"
 
 
 logger = logging.getLogger(__name__)
@@ -163,6 +174,7 @@ class VectorIndexService:
 
     def recover_pending(self) -> None:
         """Resume pending vector builds after an API process restart."""
+        self._cleanup_orphan_collections()
         for item in self.repository.list("knowledge_bases"):
             if item.get("vector_status") in {"pending", "building"}:
                 try:
@@ -225,6 +237,9 @@ class VectorIndexService:
         model_updated_at = str(config["profile_updated_at"])
         dimension = int(config["dimension"])
         ready = False
+        built_collection = collection_name
+        indexed_document_ids: list[str] = []
+        staging_collection: str | None = None
 
         def report_progress(
             stage: str,
@@ -265,8 +280,16 @@ class VectorIndexService:
                 _now(),
             )
             if building:
-                with workspace_lock(workspace_dir):
-                    self._build_vector_index(
+                revision_record = self.repository.get_revision(
+                    knowledge_base_id, revision
+                )
+                lock = (
+                    nullcontext()
+                    if revision_record is not None
+                    else workspace_lock(workspace_dir)
+                )
+                with lock:
+                    built_collection, indexed_document_ids = self._build_vector_index(
                         knowledge_base_id,
                         revision,
                         collection_name,
@@ -275,15 +298,19 @@ class VectorIndexService:
                         dimension,
                         full_rebuild,
                         report_progress,
+                        revision_record=revision_record,
                     )
+                if built_collection != collection_name:
+                    staging_collection = built_collection
                 ready = self.repository.finish_vector_build(
                     knowledge_base_id,
                     revision,
-                    collection_name,
+                    built_collection,
                     model_id,
                     model_updated_at,
                     dimension,
                     _now(),
+                    indexed_document_ids=indexed_document_ids,
                 )
         except Exception as exc:
             self.repository.fail_vector_build(
@@ -299,6 +326,10 @@ class VectorIndexService:
         finally:
             with self._lock:
                 self._jobs.pop(knowledge_base_id, None)
+
+        if staging_collection is not None:
+            if not ready:
+                self._drop_collection(staging_collection, dimension)
 
         if not ready:
             try:
@@ -325,7 +356,9 @@ class VectorIndexService:
         dimension: int,
         full_rebuild: bool,
         report_progress,
-    ) -> None:
+        *,
+        revision_record: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str]]:
         """驱动向量增量/全量构建（设计文档 §5.3/§5.4）。
 
         - ``full_rebuild``（force / 模型变更）-> 全量蓝绿：``mark_all_vector_dirty`` ->
@@ -335,37 +368,52 @@ class VectorIndexService:
           脏集为空则跳过（仅 finish 推进 revision）。
         - 不变式（§6）：先落库 Milvus（insert+flush）、后置干净。
         """
+        snapshot_relpath = (
+            str(revision_record["snapshot_relpath"])
+            if revision_record is not None
+            else None
+        )
+        snapshot_manifest_sha256 = (
+            str(revision_record["manifest_sha256"])
+            if revision_record is not None
+            else None
+        )
         if full_rebuild:
             self.repository.mark_all_vector_dirty(knowledge_base_id, _now())
             dirty_doc_ids = self.repository.list_vector_dirty_documents(
                 knowledge_base_id
             )
-            build_doc_vectors(
-                workspace_dir,
-                uri=self.settings.milvus_uri,
-                token=self.settings.milvus_token,
-                collection_name=collection_name,
-                embedding_model=str(config["model"]),
-                embedding_dim=dimension,
-                knowledge_base_id=knowledge_base_id,
-                api_key=str(config["api_key"]),
-                base_url=str(config["base_url"]),
-                allow_env_fallback=False,
-                progress_callback=report_progress,
-                doc_ids=dirty_doc_ids,
-                force=True,
-            )
-            self.repository.mark_documents_vector_indexed(
-                knowledge_base_id, dirty_doc_ids, revision, _now()
-            )
-            return
+            staging_collection = _staging_collection_name(collection_name, revision)
+            try:
+                build_doc_vectors(
+                    workspace_dir,
+                    uri=self.settings.milvus_uri,
+                    token=self.settings.milvus_token,
+                    collection_name=staging_collection,
+                    embedding_model=str(config["model"]),
+                    embedding_dim=dimension,
+                    knowledge_base_id=knowledge_base_id,
+                    api_key=str(config["api_key"]),
+                    base_url=str(config["base_url"]),
+                    allow_env_fallback=False,
+                    progress_callback=report_progress,
+                    doc_ids=dirty_doc_ids,
+                    force=True,
+                    snapshot_relpath=snapshot_relpath,
+                    snapshot_manifest_sha256=snapshot_manifest_sha256,
+                    snapshot_content_version=revision if revision_record else None,
+                )
+            except Exception:
+                self._drop_collection(staging_collection, dimension)
+                raise
+            return staging_collection, dirty_doc_ids
 
         if not self._vector_collection_exists(collection_name, dimension):
             # collection 缺失（被外部 drop / 首次构建）：建空表后全量写入，无需蓝绿。
             self.repository.mark_all_vector_dirty(knowledge_base_id, _now())
         dirty_doc_ids = self.repository.list_vector_dirty_documents(knowledge_base_id)
         if not dirty_doc_ids:
-            return
+            return collection_name, []
         build_doc_vectors(
             workspace_dir,
             uri=self.settings.milvus_uri,
@@ -380,10 +428,81 @@ class VectorIndexService:
             progress_callback=report_progress,
             doc_ids=dirty_doc_ids,
             force=False,
+            snapshot_relpath=snapshot_relpath,
+            snapshot_manifest_sha256=snapshot_manifest_sha256,
+            snapshot_content_version=revision if revision_record else None,
         )
-        self.repository.mark_documents_vector_indexed(
-            knowledge_base_id, dirty_doc_ids, revision, _now()
+        return collection_name, dirty_doc_ids
+
+    def _drop_collection(self, collection_name: str, dimension: int) -> None:
+        try:
+            store = DocVectorStore(
+                uri=self.settings.milvus_uri,
+                token=self.settings.milvus_token,
+                collection_name=collection_name,
+                dimension=dimension,
+            )
+            if store.client.has_collection(collection_name):
+                store.client.drop_collection(collection_name)
+        except Exception:
+            logger.warning(
+                "knowledge_base.vector_staging_cleanup_failed collection=%s",
+                collection_name,
+                exc_info=True,
+            )
+
+    def _cleanup_orphan_collections(self) -> None:
+        knowledge_bases = [
+            item
+            for item in self.repository.list("knowledge_bases")
+            if item.get("vector_status") != "disabled" or item.get("vector_collection")
+        ]
+        if not knowledge_bases:
+            return
+        referenced = {
+            str(item["vector_collection"])
+            for item in knowledge_bases
+            if item.get("vector_collection")
+        }
+        first = knowledge_bases[0]
+        probe_name = str(
+            first.get("vector_collection")
+            or _collection_name(self.settings.vector_collection, str(first["id"]))
         )
+        try:
+            store = DocVectorStore(
+                uri=self.settings.milvus_uri,
+                token=self.settings.milvus_token,
+                collection_name=probe_name,
+                dimension=max(int(first.get("vector_dimension") or 1), 1),
+            )
+            list_collections = getattr(store.client, "list_collections", None)
+            if not callable(list_collections):
+                return
+            collections = list_collections()
+            if not isinstance(collections, list):
+                return
+            roots = {
+                _collection_root(
+                    str(
+                        item.get("vector_collection")
+                        or _collection_name(
+                            self.settings.vector_collection, str(item["id"])
+                        )
+                    )
+                )
+                for item in knowledge_bases
+            }
+            for collection in collections:
+                name = str(collection)
+                if name in referenced:
+                    continue
+                if any(
+                    name == root or name.startswith(f"{root}__build_") for root in roots
+                ):
+                    store.client.drop_collection(name)
+        except Exception:
+            logger.warning("knowledge_base.vector_orphan_cleanup_failed", exc_info=True)
 
     def _vector_collection_exists(self, collection_name: str, dimension: int) -> bool:
         """探测 collection 是否存在（增量路径使用）。Milvus 不可用时抛出。"""

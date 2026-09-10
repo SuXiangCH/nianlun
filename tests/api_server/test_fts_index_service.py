@@ -92,9 +92,18 @@ class _FakeFtsClient:
     def __init__(self, *, exists: bool, current_schema: bool = True) -> None:
         self.exists = exists
         self.current_schema = current_schema
+        self.collections = {"fts-coll"} if exists else set()
+        self.dropped: list[str] = []
 
-    def has_collection(self, _name: str) -> bool:
-        return self.exists
+    def has_collection(self, name: str) -> bool:
+        return name in self.collections
+
+    def drop_collection(self, name: str) -> None:
+        self.dropped.append(name)
+        self.collections.discard(name)
+
+    def list_collections(self) -> list[str]:
+        return sorted(self.collections)
 
 
 class _FakeFtsStore:
@@ -143,6 +152,7 @@ def _run_service(
 
     def fake_build(_workspace, **kwargs: Any) -> Any:
         captured["kwargs"] = kwargs
+        _FakeFtsStore._client.collections.add(str(kwargs["collection_name"]))
         build_started.set()
         assert release_build.wait(timeout=5)
         return object()
@@ -151,6 +161,7 @@ def _run_service(
         exists=collection_exists,
         current_schema=collection_current_schema,
     )
+    captured["client"] = _FakeFtsStore._client
     monkeypatch.setattr(
         "app.api_server.services.fts_index_service.build_node_fts", fake_build
     )
@@ -220,12 +231,15 @@ def test_force_rebuild_marks_all_dirty_and_full(tmp_path: Path, monkeypatch) -> 
     )
 
     assert captured["kwargs"]["force"] is True
+    assert captured["kwargs"]["collection_name"].startswith("fts-coll__build_r6_")
+    assert captured["client"].dropped == []
     # force 后两篇都被置脏再全量，最终都置干净。
     assert repository.get_document("kb-1", "doc-1")["fts_indexed_version"] == 6
     assert repository.get_document("kb-1", "doc-2")["fts_indexed_version"] == 6
     item = repository.get("knowledge_bases", "kb-1")
     assert item["fts_status"] == "ready"
     assert item["fts_revision"] == 6
+    assert item["fts_collection"] == captured["kwargs"]["collection_name"]
 
 
 def test_empty_dirty_set_finishes_without_build(tmp_path: Path, monkeypatch) -> None:
@@ -310,6 +324,83 @@ def test_obsolete_collection_schema_falls_back_to_full(
 
     assert captured["kwargs"]["force"] is True
     assert sorted(captured["kwargs"]["doc_ids"]) == ["doc-1", "doc-2"]
+
+
+def test_rejected_full_build_drops_staging_and_keeps_live_pointer(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = _repository(tmp_path)
+    workspace = tmp_path / "workspace"
+    _seed_kb(repository, workspace, content_version=6)
+    _seed_doc(repository, "doc-1", fts_indexed_version=None)
+    client = _FakeFtsClient(exists=True)
+    _FakeFtsStore._client = client
+    built: list[str] = []
+
+    def fake_build(_workspace: Path, **kwargs: Any) -> object:
+        collection = str(kwargs["collection_name"])
+        built.append(collection)
+        client.collections.add(collection)
+        return object()
+
+    monkeypatch.setattr(
+        "app.api_server.services.fts_index_service.build_node_fts", fake_build
+    )
+    monkeypatch.setattr(
+        "app.api_server.services.fts_index_service.NodeFtsStore", _FakeFtsStore
+    )
+    monkeypatch.setattr(repository, "finish_fts_build", lambda *_args, **_kwargs: False)
+    service = FTSIndexService(
+        repository,
+        lambda _id: {
+            **(repository.get("knowledge_bases", "kb-1") or {}),
+            "workspace_dir": str(workspace),
+        },
+        _make_settings(tmp_path),
+    )
+    try:
+        service._build(  # pyright: ignore[reportPrivateUsage]
+            "kb-1", 6, "fts-coll", workspace, force=True
+        )
+    finally:
+        service.shutdown()
+
+    assert len(built) == 1
+    assert built[0].startswith("fts-coll__build_r6_")
+    assert client.dropped == [built[0]]
+    assert repository.get("knowledge_bases", "kb-1")["fts_collection"] == "fts-coll"
+
+
+def test_recovery_drops_only_unreferenced_staging_collections(
+    tmp_path: Path, monkeypatch
+) -> None:
+    repository = _repository(tmp_path)
+    workspace = tmp_path / "workspace"
+    _seed_kb(repository, workspace, content_version=6, fts_status="ready")
+    client = _FakeFtsClient(exists=True)
+    client.collections.update(
+        {"fts-coll__build_r5_deadbeef", "unrelated__build_r1_deadbeef"}
+    )
+    _FakeFtsStore._client = client
+    monkeypatch.setattr(
+        "app.api_server.services.fts_index_service.NodeFtsStore", _FakeFtsStore
+    )
+    service = FTSIndexService(
+        repository,
+        lambda _id: {
+            **(repository.get("knowledge_bases", "kb-1") or {}),
+            "workspace_dir": str(workspace),
+        },
+        _make_settings(tmp_path),
+    )
+    try:
+        service._cleanup_orphan_collections()  # pyright: ignore[reportPrivateUsage]
+    finally:
+        service.shutdown()
+
+    assert client.dropped == ["fts-coll__build_r5_deadbeef"]
+    assert "fts-coll" in client.collections
+    assert "unrelated__build_r1_deadbeef" in client.collections
 
 
 def test_recover_pending_rebuilds_ready_collection_with_obsolete_schema(

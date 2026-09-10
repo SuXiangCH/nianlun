@@ -6,6 +6,8 @@ import hashlib
 import logging
 import re
 import threading
+import uuid
+from contextlib import nullcontext
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -35,6 +37,15 @@ def _collection_name(base: str | None, knowledge_base_id: str) -> str:
     )
     suffix = hashlib.sha256(knowledge_base_id.encode("utf-8")).hexdigest()[:16]
     return f"{prefix[:200]}_{suffix}"
+
+
+def _collection_root(collection_name: str) -> str:
+    return collection_name.split("__build_", 1)[0]
+
+
+def _staging_collection_name(collection_name: str, revision: int) -> str:
+    suffix = f"__build_r{revision}_{uuid.uuid4().hex[:8]}"
+    return f"{_collection_root(collection_name)[: 255 - len(suffix)]}{suffix}"
 
 
 logger = logging.getLogger(__name__)
@@ -114,6 +125,7 @@ class FTSIndexService:
         """Resume builds and check ready collection schemas in the background."""
         if not self.settings.fts_enabled:
             return
+        self._cleanup_orphan_collections()
         ready_knowledge_base_ids: list[str] = []
         for item in self.repository.list("knowledge_bases"):
             if item.get("fts_status") in {"pending", "building"}:
@@ -250,16 +262,36 @@ class FTSIndexService:
         *,
         force: bool = False,
     ) -> None:
+        built_collection = collection_name
+        indexed_document_ids: list[str] = []
+        staging_collection: str | None = None
         try:
             self.repository.mark_fts_building(
                 knowledge_base_id, revision, collection_name, _now()
             )
-            with workspace_lock(workspace_dir):
-                self._build_fts_index(
-                    knowledge_base_id, revision, collection_name, workspace_dir, force
+            revision_record = self.repository.get_revision(knowledge_base_id, revision)
+            lock = (
+                nullcontext()
+                if revision_record is not None
+                else workspace_lock(workspace_dir)
+            )
+            with lock:
+                built_collection, indexed_document_ids = self._build_fts_index(
+                    knowledge_base_id,
+                    revision,
+                    collection_name,
+                    workspace_dir,
+                    force,
+                    revision_record=revision_record,
                 )
+            if built_collection != collection_name:
+                staging_collection = built_collection
             ready = self.repository.finish_fts_build(
-                knowledge_base_id, revision, collection_name, _now()
+                knowledge_base_id,
+                revision,
+                built_collection,
+                _now(),
+                indexed_document_ids=indexed_document_ids,
             )
         except Exception as exc:
             self.repository.fail_fts_build(
@@ -269,6 +301,10 @@ class FTSIndexService:
         finally:
             with self._lock:
                 self._jobs.pop(knowledge_base_id, None)
+
+        if staging_collection is not None:
+            if not ready:
+                self._drop_collection(staging_collection)
 
         if not ready and self.settings.fts_enabled:
             try:
@@ -287,7 +323,9 @@ class FTSIndexService:
         collection_name: str,
         workspace_dir: Path,
         force: bool,
-    ) -> None:
+        *,
+        revision_record: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str]]:
         """驱动 FTS 增量/全量构建（设计文档 §5.3/§5.4）。
 
         - ``force`` 或 collection 缺失 -> 全量：``mark_all_fts_dirty`` -> ``create_collection``
@@ -299,25 +337,40 @@ class FTSIndexService:
         collection_is_current = force or self._fts_collection_is_current(
             collection_name
         )
+        snapshot_relpath = (
+            str(revision_record["snapshot_relpath"])
+            if revision_record is not None
+            else None
+        )
+        snapshot_manifest_sha256 = (
+            str(revision_record["manifest_sha256"])
+            if revision_record is not None
+            else None
+        )
         if force or not collection_is_current:
             self.repository.mark_all_fts_dirty(knowledge_base_id, _now())
             dirty_doc_ids = self.repository.list_fts_dirty_documents(knowledge_base_id)
-            build_node_fts(
-                workspace_dir,
-                uri=self.settings.milvus_uri,
-                token=self.settings.milvus_token,
-                collection_name=collection_name,
-                knowledge_base_id=knowledge_base_id,
-                doc_ids=dirty_doc_ids,
-                force=True,
-            )
-            self.repository.mark_documents_fts_indexed(
-                knowledge_base_id, dirty_doc_ids, revision, _now()
-            )
-            return
+            staging_collection = _staging_collection_name(collection_name, revision)
+            try:
+                build_node_fts(
+                    workspace_dir,
+                    uri=self.settings.milvus_uri,
+                    token=self.settings.milvus_token,
+                    collection_name=staging_collection,
+                    knowledge_base_id=knowledge_base_id,
+                    doc_ids=dirty_doc_ids,
+                    force=True,
+                    snapshot_relpath=snapshot_relpath,
+                    snapshot_manifest_sha256=snapshot_manifest_sha256,
+                    snapshot_content_version=revision if revision_record else None,
+                )
+            except Exception:
+                self._drop_collection(staging_collection)
+                raise
+            return staging_collection, dirty_doc_ids
         dirty_doc_ids = self.repository.list_fts_dirty_documents(knowledge_base_id)
         if not dirty_doc_ids:
-            return
+            return collection_name, []
         build_node_fts(
             workspace_dir,
             uri=self.settings.milvus_uri,
@@ -326,10 +379,75 @@ class FTSIndexService:
             knowledge_base_id=knowledge_base_id,
             doc_ids=dirty_doc_ids,
             force=False,
+            snapshot_relpath=snapshot_relpath,
+            snapshot_manifest_sha256=snapshot_manifest_sha256,
+            snapshot_content_version=revision if revision_record else None,
         )
-        self.repository.mark_documents_fts_indexed(
-            knowledge_base_id, dirty_doc_ids, revision, _now()
-        )
+        return collection_name, dirty_doc_ids
+
+    def _drop_collection(self, collection_name: str) -> None:
+        try:
+            store = NodeFtsStore(
+                uri=self.settings.milvus_uri,
+                token=self.settings.milvus_token,
+                collection_name=collection_name,
+            )
+            if store.client.has_collection(collection_name):
+                store.client.drop_collection(collection_name)
+        except Exception:
+            logger.warning(
+                "knowledge_base.fts_staging_cleanup_failed collection=%s",
+                collection_name,
+                exc_info=True,
+            )
+
+    def _cleanup_orphan_collections(self) -> None:
+        knowledge_bases = [
+            item
+            for item in self.repository.list("knowledge_bases")
+            if item.get("fts_status") != "disabled" or item.get("fts_collection")
+        ]
+        if not knowledge_bases:
+            return
+        referenced = {
+            str(item["fts_collection"])
+            for item in knowledge_bases
+            if item.get("fts_collection")
+        }
+        probe_name = next(iter(referenced), self.settings.fts_collection)
+        try:
+            store = NodeFtsStore(
+                uri=self.settings.milvus_uri,
+                token=self.settings.milvus_token,
+                collection_name=probe_name,
+            )
+            list_collections = getattr(store.client, "list_collections", None)
+            if not callable(list_collections):
+                return
+            collections = list_collections()
+            if not isinstance(collections, list):
+                return
+            roots = {
+                _collection_root(
+                    str(
+                        item.get("fts_collection")
+                        or _collection_name(
+                            self.settings.fts_collection, str(item["id"])
+                        )
+                    )
+                )
+                for item in knowledge_bases
+            }
+            for collection in collections:
+                name = str(collection)
+                if name in referenced:
+                    continue
+                if any(
+                    name == root or name.startswith(f"{root}__build_") for root in roots
+                ):
+                    store.client.drop_collection(name)
+        except Exception:
+            logger.warning("knowledge_base.fts_orphan_cleanup_failed", exc_info=True)
 
     def _fts_collection_is_current(self, collection_name: str) -> bool:
         """Check collection existence and its current query metadata schema."""

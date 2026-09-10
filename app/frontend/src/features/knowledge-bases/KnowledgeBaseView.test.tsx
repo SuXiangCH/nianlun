@@ -15,6 +15,7 @@ const knowledgeBase = (overrides: Partial<KnowledgeBase>): KnowledgeBase => ({
   status: "ready",
   document_count: 1,
   summary_enabled: true,
+  heading_recovery_enabled: true,
   workspace_dir: "/tmp/kb-1",
   workspace_relpath: "kb-1",
   content_version: 2,
@@ -95,6 +96,7 @@ describe("KnowledgeBaseView", () => {
       onRebuildFts: vi.fn(),
       onRebuildVector: vi.fn(),
       onUpdateSummary: vi.fn(),
+      onUpdateHeadingRecovery: vi.fn(),
       onUpdateName: vi.fn(),
       onUpdateEmbeddingModel: vi.fn(),
       onUpdateVectorEnabled: vi.fn(),
@@ -171,6 +173,7 @@ describe("KnowledgeBaseView", () => {
         onRebuildFts={vi.fn()}
         onRebuildVector={vi.fn()}
         onUpdateSummary={vi.fn()}
+        onUpdateHeadingRecovery={vi.fn()}
         onUpdateName={vi.fn()}
         onUpdateEmbeddingModel={vi.fn()}
         onUpdateVectorEnabled={vi.fn()}
@@ -204,6 +207,7 @@ describe("KnowledgeBaseView", () => {
         onRebuildFts={vi.fn()}
         onRebuildVector={vi.fn()}
         onUpdateSummary={vi.fn()}
+        onUpdateHeadingRecovery={vi.fn()}
         onUpdateName={vi.fn()}
         onUpdateEmbeddingModel={vi.fn()}
         onUpdateVectorEnabled={onUpdateVectorEnabled}
@@ -220,6 +224,23 @@ describe("KnowledgeBaseView", () => {
     expect(container.querySelector<HTMLSelectElement>(".detail-vector-model select")!.value).toBe("embedding-1");
     act(() => toggle.click());
     expect(onUpdateVectorEnabled).toHaveBeenCalledWith("kb-1", false);
+  });
+
+  it("updates the heading recovery setting from the knowledge base detail", async () => {
+    const onUpdateHeadingRecovery = vi.fn().mockResolvedValue(undefined);
+    renderView({
+      selectedId: "kb-1",
+      onUpdateHeadingRecovery,
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>(
+      ".detail-heading-recovery-switch input",
+    )!;
+    expect(toggle.checked).toBe(true);
+    await act(async () => {
+      toggle.click();
+    });
+    expect(onUpdateHeadingRecovery).toHaveBeenCalledWith("kb-1", false);
   });
 
   it("opens the reader with the index tree and jumps to a heading on click", async () => {
@@ -251,6 +272,17 @@ describe("KnowledgeBaseView", () => {
         parser: "native_markdown",
         status: "ready",
         parsed_content_version: 1,
+        pipeline_generation: 1,
+        current_stage: "complete",
+        stage_state: "succeeded",
+        failed_stage: null,
+        progress_completed: null,
+        progress_total: null,
+        progress_unit: null,
+        warnings: [],
+        published_content_version: 1,
+        progress: { completed: null, total: null, unit: null },
+        parse: { chunks_completed: 0, chunks_total: 0, pages_completed: 0, pages_total: 0 },
         error_code: null,
         error_message: null,
         latest_task: null,
@@ -320,6 +352,17 @@ describe("KnowledgeBaseView", () => {
         parser: "native_markdown",
         status: "ready",
         parsed_content_version: 1,
+        pipeline_generation: 1,
+        current_stage: "complete",
+        stage_state: "succeeded",
+        failed_stage: null,
+        progress_completed: null,
+        progress_total: null,
+        progress_unit: null,
+        warnings: [],
+        published_content_version: 1,
+        progress: { completed: null, total: null, unit: null },
+        parse: { chunks_completed: 0, chunks_total: 0, pages_completed: 0, pages_total: 0 },
         error_code: null,
         error_message: null,
         latest_task: null,
@@ -380,6 +423,17 @@ describe("KnowledgeBaseView", () => {
         parser: "native_markdown",
         status: "ready",
         parsed_content_version: 1,
+        pipeline_generation: 1,
+        current_stage: "complete",
+        stage_state: "succeeded",
+        failed_stage: null,
+        progress_completed: null,
+        progress_total: null,
+        progress_unit: null,
+        warnings: [],
+        published_content_version: 1,
+        progress: { completed: null, total: null, unit: null },
+        parse: { chunks_completed: 0, chunks_total: 0, pages_completed: 0, pages_total: 0 },
         error_code: null,
         error_message: null,
         latest_task: null,
@@ -426,6 +480,17 @@ describe("KnowledgeBaseView", () => {
         parser: "native_markdown",
         status: "ready",
         parsed_content_version: 1,
+        pipeline_generation: 1,
+        current_stage: "complete",
+        stage_state: "succeeded",
+        failed_stage: null,
+        progress_completed: null,
+        progress_total: null,
+        progress_unit: null,
+        warnings: [],
+        published_content_version: 1,
+        progress: { completed: null, total: null, unit: null },
+        parse: { chunks_completed: 0, chunks_total: 0, pages_completed: 0, pages_total: 0 },
         error_code: null,
         error_message: null,
         latest_task: null,

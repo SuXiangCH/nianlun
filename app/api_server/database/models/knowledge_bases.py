@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -58,6 +59,9 @@ class KnowledgeBase(Base):
     workspace_relpath: Mapped[str] = mapped_column(String, nullable=False, unique=True)
     document_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     summary_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("1")
+    )
+    heading_recovery_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("1")
     )
     content_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -159,3 +163,51 @@ class UploadOperation(Base):
     knowledge_base: Mapped[KnowledgeBase] = relationship(
         back_populates="upload_operations"
     )
+
+
+class KnowledgeBaseWorkspaceRevision(Base):
+    """Immutable V2 snapshot revision backing the knowledge-base visible view.
+
+    SQLite points at exactly one ``committed`` revision per knowledge base; the
+    referenced ``snapshots/r<N>/manifest.json`` is written and validated before
+    the row commits (单向发布协议，设计文档 §11.2)。``superseded`` revisions stay
+    readable for in-flight readers and index builders until GC.
+    """
+
+    __tablename__ = "knowledge_base_workspace_revisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "knowledge_base_id",
+            "content_version",
+            name="uq_kb_revision_content_version",
+        ),
+        Index(
+            "idx_kb_revisions_kb_state",
+            "knowledge_base_id",
+            "state",
+        ),
+        Index(
+            "uq_kb_revisions_current",
+            "knowledge_base_id",
+            unique=True,
+            sqlite_where=text("state = 'committed'"),
+        ),
+        CheckConstraint(
+            "state IN ('committed', 'superseded')",
+            name="ck_kb_revisions_state",
+        ),
+        CheckConstraint(
+            "content_version >= 0",
+            name="ck_kb_revisions_content_version",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    knowledge_base_id: Mapped[str] = mapped_column(
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False
+    )
+    content_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot_relpath: Mapped[str] = mapped_column(String, nullable=False)
+    manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    state: Mapped[str] = mapped_column(String, nullable=False, default="committed")
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)

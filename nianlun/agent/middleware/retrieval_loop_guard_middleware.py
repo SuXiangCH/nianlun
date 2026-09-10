@@ -23,6 +23,7 @@ from langchain.agents.middleware.types import hook_config
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langgraph.types import Command
 
+from nianlun.agent.language import prefers_english
 
 DEFAULT_PER_TOOL_HARD_LIMITS: Mapping[str, int] = MappingProxyType(
     {
@@ -806,10 +807,12 @@ def _final_tool_call_fallback(messages: list[Any]) -> str:
             continue
         content = _field(message, "content", "")
         text = content if isinstance(content, str) else str(content)
-        if any("\u4e00" <= char <= "\u9fff" for char in text):
-            return _FINAL_TOOL_CALL_FALLBACK_ZH
         if text.strip():
-            return _FINAL_TOOL_CALL_FALLBACK_EN
+            return (
+                _FINAL_TOOL_CALL_FALLBACK_EN
+                if prefers_english(text)
+                else _FINAL_TOOL_CALL_FALLBACK_ZH
+            )
     return _FINAL_TOOL_CALL_FALLBACK_ZH
 
 

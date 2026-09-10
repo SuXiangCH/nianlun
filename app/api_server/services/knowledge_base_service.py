@@ -28,6 +28,14 @@ from app.api_server.services.workspace_store import (
     WorkspaceArtifactStore,
     workspace_lock,
 )
+from app.api_server.services.workspace_snapshot import (
+    build_manifest,
+    discard_staging,
+    promote_staged_snapshot,
+    publish_document_snapshot,
+    snapshot_relpath,
+    stage_manifest,
+)
 
 
 def _now() -> datetime:
@@ -45,12 +53,15 @@ class KnowledgeBaseService:
         repository: SQLiteMetadataRepository,
         workspace_root: Path,
         models: ModelConfigService,
+        *,
+        fts_enabled: bool = True,
     ) -> None:
         self.repository = repository
         self.workspace_root = workspace_root.expanduser().resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.artifacts = WorkspaceArtifactStore()
         self.models = models
+        self.fts_enabled = fts_enabled
 
     def _workspace_path(self, relative_path: str) -> Path:
         candidate = (self.workspace_root / relative_path).resolve()
@@ -67,6 +78,12 @@ class KnowledgeBaseService:
         relative_path = str(result.get("workspace_relpath", result["id"]))
         result["workspace_dir"] = str(self._workspace_path(relative_path))
         result["vector_enabled"] = result.get("vector_status") != "disabled"
+        revision = self.repository.get_committed_revision(
+            str(result["id"]), int(result.get("content_version", 0))
+        )
+        if revision is not None:
+            result["snapshot_relpath"] = revision["snapshot_relpath"]
+            result["snapshot_manifest_sha256"] = revision["manifest_sha256"]
         return result
 
     @staticmethod
@@ -93,6 +110,10 @@ class KnowledgeBaseService:
         if item is None:
             raise ApiError("知识库不存在", status.HTTP_404_NOT_FOUND)
         return self._with_runtime_fields(item)
+
+    def workspace_path_for(self, item: dict[str, Any]) -> Path:
+        """Resolve the workspace directory for a knowledge-base record."""
+        return self._workspace_path(str(item["workspace_relpath"]))
 
     def reconcile(self) -> None:
         """Repair SQLite document counts from durable workspace manifests."""
@@ -132,6 +153,7 @@ class KnowledgeBaseService:
                 "workspace_relpath": knowledge_base_id,
                 "document_count": 0,
                 "summary_enabled": request.summary_enabled,
+                "heading_recovery_enabled": request.heading_recovery_enabled,
                 "embedding_model_id": request.embedding_model_id,
                 "content_version": 0,
                 "fts_status": "disabled",
@@ -141,8 +163,20 @@ class KnowledgeBaseService:
                 "created_at": timestamp.isoformat(),
                 "updated_at": timestamp.isoformat(),
             }
-            self.repository.put("knowledge_bases", knowledge_base_id, item)
+            initial_manifest = build_manifest(knowledge_base_id, 0, [], [])
+            staging, manifest_sha256 = stage_manifest(workspace_dir, initial_manifest)
+            try:
+                promote_staged_snapshot(workspace_dir, staging, initial_manifest)
+            except Exception:
+                discard_staging(staging)
+                raise
+            self.repository.create_knowledge_base_with_revision(
+                item,
+                snapshot_relpath=snapshot_relpath(0),
+                manifest_sha256=manifest_sha256,
+            )
         except Exception:
+            self.repository.delete_knowledge_base(knowledge_base_id)
             shutil.rmtree(workspace_dir, ignore_errors=True)
             raise
         return self._response(self._with_runtime_fields(item))
@@ -156,6 +190,8 @@ class KnowledgeBaseService:
             updates["name"] = request.name
         if request.summary_enabled is not None:
             updates["summary_enabled"] = request.summary_enabled
+        if request.heading_recovery_enabled is not None:
+            updates["heading_recovery_enabled"] = request.heading_recovery_enabled
         if "embedding_model_id" in request.model_fields_set:
             if request.embedding_model_id is None:
                 raise ApiError(
@@ -243,6 +279,20 @@ class KnowledgeBaseService:
 
         lock = nullcontext() if workspace_locked else workspace_lock(workspace_dir)
         with lock:
+            source_sha256 = hashlib.sha256(content).hexdigest()
+            existing_document = self.repository.get_document_by_hash(
+                knowledge_base_id, source_sha256
+            )
+            if (
+                existing_document is not None
+                and existing_document["status"] != "deleted"
+            ):
+                replay = self._with_runtime_fields(
+                    self.require_record(knowledge_base_id)
+                )
+                replay["document_id"] = existing_document["id"]
+                replay["idempotent_replay"] = True
+                return self._response(replay)
             operation = self.repository.get_upload(knowledge_base_id, operation_key)
             if operation is not None:
                 if operation["request_sha256"] != request_sha256:
@@ -293,7 +343,7 @@ class KnowledgeBaseService:
                         min_node_token=tree_options.min_subtree_tokens,
                     )
                 document["doc_name"] = source_name
-                document_count, artifact_sha256 = self.artifacts.write_document(
+                _document_count, artifact_sha256 = self.artifacts.write_document(
                     workspace_dir,
                     document_id,
                     source_relpath,
@@ -309,11 +359,34 @@ class KnowledgeBaseService:
                     artifact_sha256,
                     _now().isoformat(),
                 )
-                content_version = self.repository.commit_upload(
-                    knowledge_base_id,
-                    operation_key,
-                    document_count,
-                    _now().isoformat(),
+                now = _now().isoformat()
+                content_version = publish_document_snapshot(
+                    self.repository,
+                    workspace=workspace_dir,
+                    knowledge_base_id=knowledge_base_id,
+                    document_id=document_id,
+                    generation=1,
+                    content=content,
+                    source_relpath=source_relpath,
+                    source_mime_type="text/markdown",
+                    idempotency_key=operation_key,
+                    fts_enabled=self.fts_enabled,
+                    now=now,
+                    document_values={
+                        "id": document_id,
+                        "knowledge_base_id": knowledge_base_id,
+                        "original_filename": filename,
+                        "file_extension": ".md",
+                        "mime_type": "text/markdown",
+                        "size_bytes": len(content),
+                        "source_relpath": source_relpath,
+                        "source_sha256": hashlib.sha256(content).hexdigest(),
+                        "parser": "native_markdown",
+                        "status": "uploaded",
+                        "pipeline_generation": 1,
+                        "created_at": now,
+                        "updated_at": now,
+                    },
                 )
             except Exception as exc:
                 operation_state = None

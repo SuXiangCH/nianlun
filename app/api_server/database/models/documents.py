@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,8 +34,12 @@ class Document(Base):
             "status",
             "updated_at",
         ),
-        UniqueConstraint(
-            "knowledge_base_id", "source_sha256", name="uq_documents_kb_source_hash"
+        Index(
+            "uq_documents_kb_source_hash",
+            "knowledge_base_id",
+            "source_sha256",
+            unique=True,
+            sqlite_where=text("status != 'deleted'"),
         ),
         CheckConstraint("size_bytes > 0", name="ck_documents_size_bytes"),
         CheckConstraint(
@@ -61,6 +66,24 @@ class Document(Base):
     source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     parser: Mapped[str] = mapped_column(String, nullable=False)
     status: Mapped[str] = mapped_column(String, nullable=False, default="uploaded")
+    pipeline_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    parse_plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    current_stage: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="complete", server_default="complete"
+    )
+    stage_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="succeeded", server_default="succeeded"
+    )
+    failed_stage: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    progress_completed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    progress_unit: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    warning_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="[]", server_default="[]"
+    )
+    deleted_content_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     parsed_markdown_relpath: Mapped[str | None] = mapped_column(String, nullable=True)
     parsed_content_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     fts_indexed_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -90,16 +113,27 @@ class DocumentParseTask(Base):
 
     __tablename__ = "document_parse_tasks"
     __table_args__ = (
-        Index("idx_document_parse_tasks_polling", "state", "updated_at"),
+        Index("idx_document_parse_tasks_polling", "dispatch_state", "available_at"),
         Index("idx_document_parse_tasks_batch", "batch_id"),
-        UniqueConstraint("document_id", "attempt", name="uq_document_parse_attempt"),
         UniqueConstraint(
-            "provider", "data_id", "attempt", name="uq_document_parse_data_attempt"
+            "document_id",
+            "pipeline_generation",
+            "chunk_index",
+            "attempt",
+            name="uq_document_parse_attempt",
+        ),
+        UniqueConstraint(
+            "provider",
+            "data_id",
+            "pipeline_generation",
+            "chunk_index",
+            "attempt",
+            name="uq_document_parse_data_attempt",
         ),
         CheckConstraint("attempt > 0", name="ck_document_parse_attempt"),
         CheckConstraint(
             "state IN ('created', 'uploading', 'waiting-file', 'pending', "
-            "'running', 'converting', 'done', 'failed')",
+            "'running', 'converting', 'done', 'failed', 'canceled')",
             name="ck_document_parse_state",
         ),
     )
@@ -111,12 +145,37 @@ class DocumentParseTask(Base):
     provider: Mapped[str] = mapped_column(String, nullable=False, default="mineru")
     api_mode: Mapped[str] = mapped_column(String, nullable=False, default="precision")
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    pipeline_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    chunk_index: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    chunk_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    source_page_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_page_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chunk_source_relpath: Mapped[str | None] = mapped_column(String, nullable=True)
+    result_root_relpath: Mapped[str | None] = mapped_column(String, nullable=True)
+    input_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     data_id: Mapped[str] = mapped_column(String, nullable=False)
     batch_id: Mapped[str | None] = mapped_column(String, nullable=True)
     task_id: Mapped[str | None] = mapped_column(String, nullable=True)
     model_version: Mapped[str] = mapped_column(String, nullable=False)
     request_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     state: Mapped[str] = mapped_column(String, nullable=False, default="created")
+    dispatch_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="queued", server_default="queued"
+    )
+    available_at: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="", server_default=""
+    )
+    next_poll_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_owner: Mapped[str | None] = mapped_column(String, nullable=True)
+    lease_expires_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    lease_token: Mapped[str | None] = mapped_column(String, nullable=True)
     extracted_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_pages: Mapped[int | None] = mapped_column(Integer, nullable=True)
     result_zip_url: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -141,7 +200,9 @@ class DocumentArtifact(Base):
         ),
         CheckConstraint(
             "kind IN ('original', 'result_zip', 'full_markdown', 'content_list', "
-            "'layout', 'model', 'asset')",
+            "'layout', 'model', 'asset', 'parse_chunk_source', "
+            "'parse_chunk_result', 'normalized_markdown', 'page_map', "
+            "'enriched_markdown', 'tree', 'diagnostics')",
             name="ck_document_artifact_kind",
         ),
         CheckConstraint("size_bytes >= 0", name="ck_document_artifact_size"),
@@ -156,6 +217,9 @@ class DocumentArtifact(Base):
     mime_type: Mapped[str] = mapped_column(String(256), nullable=False)
     size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    pipeline_generation: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
     document: Mapped[Document] = relationship(back_populates="artifacts")

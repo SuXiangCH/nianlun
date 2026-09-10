@@ -57,3 +57,5 @@ docs/*
 docs/architecture/*
 !docs/architecture/evaluation.md
 !docs/architecture/agent_tool_loop_guard.md
+!docs/architecture/weak_titled_markdown_structure_design.md
+!docs/architecture/document_processing_pipeline_design.md

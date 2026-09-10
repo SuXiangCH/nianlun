@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+from typing import Literal
 
 # .env 是仓库既有约定（python-dotenv）；缺失时退化为不加载，不报错。
 try:
@@ -51,17 +52,51 @@ FTS_SCHEMA_CHECK_TIMEOUT_SECONDS = 5.0
 # collection；这个值只作为离线 CLI 和 smoke search 的默认目标。
 DEFAULT_NODE_FTS_COLLECTION = "pageindex_node_fts_18b7abeab1127eeb"
 
+LanguageIdentifier = Literal["lingua", "whatlang"]
+DEFAULT_MILVUS_LANGUAGE_IDENTIFIER: LanguageIdentifier = "lingua"
+_LANGUAGE_IDENTIFIER_ANALYZER_NAMES: dict[LanguageIdentifier, str] = {
+    "lingua": "Chinese",
+    "whatlang": "Mandarin",
+}
 
-def get_fts_analyzer_params() -> dict[str, object]:
+
+def get_milvus_language_identifier() -> LanguageIdentifier:
+    """Return the configured Milvus language detector with a safe default."""
+    identifier = (
+        os.environ.get("MILVUS_LANGUAGE_IDENTIFIER", DEFAULT_MILVUS_LANGUAGE_IDENTIFIER)
+        .strip()
+        .lower()
+    )
+    if identifier not in _LANGUAGE_IDENTIFIER_ANALYZER_NAMES:
+        choices = ", ".join(sorted(_LANGUAGE_IDENTIFIER_ANALYZER_NAMES))
+        raise ValueError(
+            f"MILVUS_LANGUAGE_IDENTIFIER must be one of {choices}; got {identifier!r}"
+        )
+    return identifier
+
+
+def get_fts_analyzer_params(
+    identifier: LanguageIdentifier | None = None,
+) -> dict[str, object]:
     """Return the mixed Chinese/English analyzer used by FTS collections.
 
-    ``jieba`` keeps the existing Chinese segmentation behavior, while
-    ``lowercase`` makes English terms case-insensitive and
-    ``cnalphanumonly`` removes punctuation-only tokens.
+    ``lingua`` is the default because it identifies Chinese as ``Chinese``;
+    ``whatlang`` instead uses ``Mandarin``. Both retain ``jieba`` segmentation
+    for Chinese while sending English text to Milvus's built-in English
+    analyzer, which also handles common word inflections.
     """
+    selected = identifier or get_milvus_language_identifier()
+    chinese_analyzer_name = _LANGUAGE_IDENTIFIER_ANALYZER_NAMES[selected]
     return {
-        "tokenizer": {"type": "jieba", "mode": "search"},
-        "filter": ["lowercase", "cnalphanumonly"],
+        "tokenizer": {
+            "type": "language_identifier",
+            "identifier": selected,
+            "analyzers": {
+                "default": {"tokenizer": "standard"},
+                "English": {"type": "english"},
+                chinese_analyzer_name: {"tokenizer": "jieba"},
+            },
+        },
     }
 
 

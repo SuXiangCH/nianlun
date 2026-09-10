@@ -5,12 +5,14 @@ from nianlun.knowledgebase.core import KnowledgeBase, parse_line_spec, sanitize_
 from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
 from nianlun.knowledgebase.factory import KnowledgeBaseFactory
 from nianlun.knowledgebase.full_text_retriever import FullTextNodeRetriever
+from nianlun.knowledgebase.local_scan_retriever import LocalScanNodeRetriever
 
 __all__ = [
     "KnowledgeBase",
     "KnowledgeBaseConfig",
     "KnowledgeBaseFactory",
     "FullTextNodeRetriever",
+    "LocalScanNodeRetriever",
     "META_PATH",
     "SemanticDocumentRetriever",
     "WORKSPACE_DIR",

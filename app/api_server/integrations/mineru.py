@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import httpx
@@ -175,6 +178,28 @@ class MineruClient:
             raise MineruError(f"下载 MinerU 解析结果返回 HTTP {response.status_code}")
         return response.content
 
+    def download_result_to(
+        self,
+        result_url: str,
+        destination: Path,
+        *,
+        max_bytes: int,
+        reserve_bytes: Callable[[int], bool] | None = None,
+    ) -> int:
+        try:
+            with self._client.stream("GET", result_url) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise self.response_error(response, _response_json(response))
+                return _write_streamed_response(
+                    response,
+                    destination,
+                    max_bytes=max_bytes,
+                    reserve_bytes=reserve_bytes,
+                )
+        except httpx.HTTPError as exc:
+            raise MineruError("下载 MinerU 解析结果失败") from exc
+
 
 class SelfHostedMineruClient:
     """Adapter for the official self-hosted ``mineru-api`` FastAPI service."""
@@ -285,6 +310,73 @@ class SelfHostedMineruClient:
         if response.status_code >= 400:
             raise MineruClient.response_error(response, _response_json(response))
         return response.content
+
+    def download_result_to(
+        self,
+        task_id: str,
+        destination: Path,
+        *,
+        max_bytes: int,
+        reserve_bytes: Callable[[int], bool] | None = None,
+    ) -> int:
+        try:
+            with self._client.stream(
+                "GET",
+                f"{self.base_url}/tasks/{task_id}/result",
+                headers=self._headers(),
+            ) as response:
+                if response.status_code >= 400:
+                    response.read()
+                    raise MineruClient.response_error(
+                        response, _response_json(response)
+                    )
+                return _write_streamed_response(
+                    response,
+                    destination,
+                    max_bytes=max_bytes,
+                    reserve_bytes=reserve_bytes,
+                )
+        except httpx.HTTPError as exc:
+            raise MineruError("下载 MinerU 解析结果失败") from exc
+
+
+def _write_streamed_response(
+    response: httpx.Response,
+    destination: Path,
+    *,
+    max_bytes: int,
+    reserve_bytes: Callable[[int], bool] | None,
+) -> int:
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                raise MineruError("MinerU 解析结果超过大小限制")
+        except ValueError:
+            pass
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    try:
+        with destination.open("xb") as output:
+            for chunk in response.iter_bytes(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                next_size = written + len(chunk)
+                if next_size > max_bytes:
+                    raise MineruError("MinerU 解析结果超过大小限制")
+                if reserve_bytes is not None and not reserve_bytes(next_size):
+                    raise MineruError("MinerU 下载租约失效或 staging 配额不足")
+                output.write(chunk)
+                written = next_size
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    if written == 0:
+        destination.unlink(missing_ok=True)
+        raise MineruError("MinerU 解析结果为空")
+    return written
 
 
 def _response_json(response: httpx.Response) -> Any:

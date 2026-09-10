@@ -231,6 +231,16 @@ def get_document(
     return success(item)
 
 
+@router.get("/{knowledge_base_id}/documents/{document_id}/pipeline")
+def get_document_pipeline(
+    knowledge_base_id: str, document_id: str, request: Request
+) -> dict[str, Any]:
+    item = _services(request).documents.get_document_pipeline(
+        knowledge_base_id, document_id
+    )
+    return success(item)
+
+
 @router.post("/{knowledge_base_id}/documents/{document_id}/retry")
 def retry_document(
     knowledge_base_id: str, document_id: str, request: Request

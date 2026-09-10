@@ -7,7 +7,12 @@ from typing import Any
 from sqlalchemy import delete, func, select
 
 from app.api_server.database.connection import SQLiteConnectionFactory
-from app.api_server.database.models import Document, KnowledgeBase, UploadOperation
+from app.api_server.database.models import (
+    Document,
+    DocumentNormalizationTask,
+    KnowledgeBase,
+    UploadOperation,
+)
 
 
 def _document_dict(item: Document) -> dict[str, Any]:
@@ -24,6 +29,16 @@ def _document_dict(item: Document) -> dict[str, Any]:
             "source_sha256",
             "parser",
             "status",
+            "pipeline_generation",
+            "parse_plan_json",
+            "current_stage",
+            "stage_state",
+            "failed_stage",
+            "progress_completed",
+            "progress_total",
+            "progress_unit",
+            "warning_json",
+            "deleted_content_version",
             "parsed_markdown_relpath",
             "parsed_content_version",
             "fts_indexed_version",
@@ -49,7 +64,54 @@ class DocumentRepositoryMixin:
             ).all()
             return [_document_dict(item) for item in items]
 
+    def list_unqueued_enrichment_documents(self) -> list[dict[str, Any]]:
+        """Return documents stranded between normalization and enrichment."""
+        with self.factory.session_scope() as session:
+            items = session.scalars(
+                select(Document).where(
+                    Document.status == "parsed",
+                    Document.current_stage == "enrich",
+                    Document.stage_state == "queued",
+                )
+            ).all()
+            return [_document_dict(item) for item in items]
+
+    def list_unqueued_markdown_normalization_documents(self) -> list[dict[str, Any]]:
+        """Return Markdown documents left without their first normalize task."""
+        with self.factory.session_scope() as session:
+            task_exists = select(DocumentNormalizationTask.id).where(
+                DocumentNormalizationTask.document_id == Document.id,
+                DocumentNormalizationTask.pipeline_generation
+                == Document.pipeline_generation,
+            ).exists()
+            items = session.scalars(
+                select(Document).where(
+                    Document.parser == "native_markdown",
+                    Document.status == "parsing",
+                    Document.current_stage == "normalize",
+                    Document.stage_state == "queued",
+                    Document.parsed_content_version.is_(None),
+                    ~task_exists,
+                )
+            ).all()
+            return [_document_dict(item) for item in items]
+
     def list_documents(self, knowledge_base_id: str) -> list[dict[str, Any]]:
+        with self.factory.session_scope() as session:
+            items = session.scalars(
+                select(Document)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    Document.status != "deleted",
+                )
+                .order_by(Document.created_at.desc())
+            ).all()
+            return [_document_dict(item) for item in items]
+
+    def list_documents_including_deleted(
+        self, knowledge_base_id: str
+    ) -> list[dict[str, Any]]:
+        """Return active records and tombstones for reconciliation/GC only."""
         with self.factory.session_scope() as session:
             items = session.scalars(
                 select(Document)
@@ -66,6 +128,7 @@ class DocumentRepositoryMixin:
                 select(Document).where(
                     Document.id == document_id,
                     Document.knowledge_base_id == knowledge_base_id,
+                    Document.status != "deleted",
                 )
             )
             return _document_dict(item) if item is not None else None
@@ -78,6 +141,7 @@ class DocumentRepositoryMixin:
                 select(Document).where(
                     Document.knowledge_base_id == knowledge_base_id,
                     Document.source_sha256 == source_sha256,
+                    Document.status != "deleted",
                 )
             )
             return _document_dict(item) if item is not None else None
@@ -95,6 +159,16 @@ class DocumentRepositoryMixin:
                 source_sha256=str(values["source_sha256"]),
                 parser=str(values["parser"]),
                 status=str(values.get("status", "uploaded")),
+                pipeline_generation=int(values.get("pipeline_generation", 1)),
+                parse_plan_json=values.get("parse_plan_json"),
+                current_stage=str(values.get("current_stage", "complete")),
+                stage_state=str(values.get("stage_state", "succeeded")),
+                failed_stage=values.get("failed_stage"),
+                progress_completed=values.get("progress_completed"),
+                progress_total=values.get("progress_total"),
+                progress_unit=values.get("progress_unit"),
+                warning_json=str(values.get("warning_json", "[]")),
+                deleted_content_version=values.get("deleted_content_version"),
                 parsed_markdown_relpath=values.get("parsed_markdown_relpath"),
                 parsed_content_version=values.get("parsed_content_version"),
                 fts_indexed_version=values.get("fts_indexed_version"),
@@ -116,6 +190,16 @@ class DocumentRepositoryMixin:
                 raise KeyError(document_id)
             for field in (
                 "status",
+                "pipeline_generation",
+                "parse_plan_json",
+                "current_stage",
+                "stage_state",
+                "failed_stage",
+                "progress_completed",
+                "progress_total",
+                "progress_unit",
+                "warning_json",
+                "deleted_content_version",
                 "parsed_markdown_relpath",
                 "parsed_content_version",
                 "error_code",

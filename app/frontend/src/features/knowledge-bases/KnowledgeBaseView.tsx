@@ -19,6 +19,7 @@ interface Props {
   onRebuildFts: (knowledgeBaseId: string) => Promise<void>;
   onRebuildVector: (knowledgeBaseId: string) => Promise<void>;
   onUpdateSummary: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
+  onUpdateHeadingRecovery: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
   onUpdateName: (knowledgeBaseId: string, name: string) => Promise<void>;
   onUpdateEmbeddingModel: (knowledgeBaseId: string, modelId: string) => Promise<void>;
   onUpdateVectorEnabled: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
@@ -32,8 +33,21 @@ interface Props {
 const statusLabel = (status: string) =>
   ({ ready: "可用", creating: "创建中", indexing: "索引中", error: "异常" }[status] || status || "未知");
 
-const documentStatusLabel = (status: KnowledgeBaseDocument["status"]) =>
-  ({ uploaded: "已上传", parsing: "解析中", parsed: "已解析", indexing: "建立索引", ready: "可检索", failed: "解析失败", deleted: "已删除" }[status]);
+const documentStageLabel = (document: KnowledgeBaseDocument) => {
+  const stage = ({ parse: "解析", normalize: "合并规范化", enrich: "LLM 增强", publish: "发布", index: "构建索引", complete: "处理完成" }[document.current_stage]);
+  const state = ({ queued: "排队中", running: "处理中", succeeded: "已完成", partial: "部分可用", failed: "失败", skipped: "已跳过" }[document.stage_state]);
+  return `${stage} · ${state}`;
+};
+
+const documentProgressLabel = (document: KnowledgeBaseDocument) => {
+  if (document.current_stage === "parse" && document.parse.chunks_total > 1) {
+    return `${document.parse.chunks_completed}/${document.parse.chunks_total} 段 · ${document.parse.pages_completed}/${document.parse.pages_total} 页`;
+  }
+  const { completed, total, unit } = document.progress;
+  if (completed === null || total === null) return null;
+  const unitLabel = ({ pages: "页", chunks: "段", nodes: "节点", documents: "文档" } as Record<string, string>)[unit || ""] || "项";
+  return `${completed}/${total} ${unitLabel}`;
+};
 
 const ftsStatusLabel = (status: KnowledgeBase["fts_status"]) =>
   ({ disabled: "未构建", pending: "等待构建", building: "构建中", ready: "已就绪", failed: "构建失败" }[status]);
@@ -74,6 +88,7 @@ export function KnowledgeBaseView({
   onRebuildFts,
   onRebuildVector,
   onUpdateSummary,
+  onUpdateHeadingRecovery,
   onUpdateName,
   onUpdateEmbeddingModel,
   onUpdateVectorEnabled,
@@ -91,6 +106,7 @@ export function KnowledgeBaseView({
   const [treeLoading, setTreeLoading] = useState(false);
   const [treeError, setTreeError] = useState<string | null>(null);
   const [summarySaving, setSummarySaving] = useState(false);
+  const [headingRecoverySaving, setHeadingRecoverySaving] = useState(false);
   const [editingItem, setEditingItem] = useState<KnowledgeBase | null>(null);
   const [nameSaving, setNameSaving] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
@@ -241,6 +257,17 @@ export function KnowledgeBaseView({
       setSummarySaving(false);
     }
   };
+  const toggleHeadingRecovery = async (event: ChangeEvent<HTMLInputElement>) => {
+    if (!selected) return;
+    setHeadingRecoverySaving(true);
+    try {
+      await onUpdateHeadingRecovery(selected.id, event.target.checked);
+    } catch {
+      // Keep the controlled checkbox unchanged until the server confirms it.
+    } finally {
+      setHeadingRecoverySaving(false);
+    }
+  };
   const submitName = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!editingItem || nameSaving) return;
@@ -296,7 +323,7 @@ export function KnowledgeBaseView({
           <label className="field detail-vector-model"><span>Embedding 模型</span><select value={selected.embedding_model_id || ""} onChange={(event) => changeEmbeddingModel(event.target.value)}><option value="" disabled>请选择 Embedding 模型</option>{embeddingModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
           <label className="switch-control detail-vector-switch"><input type="checkbox" checked={selected.vector_enabled} disabled={!selected.embedding_model_id} onChange={(event) => void onUpdateVectorEnabled(selected.id, event.target.checked)} /><span>{selected.vector_enabled ? "向量检索已开启" : "向量检索已关闭"}</span></label>
           <button className="outline-button" onClick={() => confirmVectorRebuild(selected)} type="button" disabled={!selected.vector_enabled || !selected.embedding_model_id || selected.vector_status === "pending" || selected.vector_status === "building"}>{hasVectorIndex(selected) ? "重建向量索引" : "构建向量索引"}</button>
-          <button className="quiet-button" onClick={() => onLoadDocuments(selected.id)} type="button">刷新文档</button><label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>{selected.summary_enabled ? "摘要生成已开启" : "摘要生成已关闭"}</span></label>
+          <button className="quiet-button" onClick={() => onLoadDocuments(selected.id)} type="button">刷新文档</button><label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>{selected.summary_enabled ? "摘要生成已开启" : "摘要生成已关闭"}</span></label><label className="switch-control detail-heading-recovery-switch" title="仅影响之后上传的 MinerU PDF，不会重建已有文档"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>{selected.heading_recovery_enabled ? "标题修复已开启" : "标题修复已关闭"}</span></label>
         </div>
         {(selected.vector_status === "pending" || selected.vector_status === "building") && <div className="document-content-state">向量索引进度：{vectorProgressLabel(selected)}</div>}
         {selected.vector_error && <div className="document-content-state is-error">向量索引：{selected.vector_error}</div>}
@@ -307,7 +334,7 @@ export function KnowledgeBaseView({
               <Fragment key={document.id}>
                 <article className="document-row">
                   <div className="document-row-main"><div className="document-file-icon" aria-hidden="true">{document.file_extension === ".pdf" ? "PDF" : document.file_extension === ".doc" || document.file_extension === ".docx" ? "DOC" : "MD"}</div><div className="document-row-copy"><strong title={document.original_filename}>{document.original_filename}</strong><span>{formatBytes(document.size_bytes)} · {document.parser === "mineru" ? "MinerU Precision" : "Markdown"}</span>{document.error_message && <small>{document.error_message}</small>}</div></div>
-                  <div className="document-row-meta"><span className={`tag ${document.status === "ready" ? "ready" : document.status === "failed" ? "error" : "indexing"}`}>{documentStatusLabel(document.status)}</span>{document.latest_task?.extracted_pages && <span>{document.latest_task.extracted_pages}{document.latest_task.total_pages ? `/${document.latest_task.total_pages}` : ""} 页</span>}<button className="outline-button" type="button" disabled={!document.parsed_content_version || document.status === "failed"} onClick={() => void openContent(document.id)}>查看解析内容</button>{document.status === "failed" && <button className="outline-button" type="button" disabled={retryingDocumentId !== null} onClick={async () => { setRetryingDocumentId(document.id); try { await onRetryDocument(selected.id, document.id); } finally { setRetryingDocumentId(null); } }}>{retryingDocumentId === document.id ? "重试中..." : "重试解析"}</button>}<button className="quiet-button danger-button" type="button" onClick={() => void onDeleteDocument(selected.id, document.id)}>删除文档</button></div>
+                  <div className="document-row-meta"><span className={`tag ${document.status === "ready" ? "ready" : document.status === "failed" ? "error" : "indexing"}`}>{documentStageLabel(document)}</span>{documentProgressLabel(document) && <span>{documentProgressLabel(document)}</span>}{document.warnings.length > 0 && <span>{document.warnings.length} 条警告</span>}<button className="outline-button" type="button" disabled={!document.published_content_version || document.status === "failed"} onClick={() => void openContent(document.id)}>查看解析内容</button>{document.status === "failed" && <button className="outline-button" type="button" disabled={retryingDocumentId !== null} onClick={async () => { setRetryingDocumentId(document.id); try { await onRetryDocument(selected.id, document.id); } finally { setRetryingDocumentId(null); } }}>{retryingDocumentId === document.id ? "重试中..." : `重试${document.failed_stage ? ({ parse: "解析", normalize: "规范化", enrich: "增强", index: "索引" }[document.failed_stage]) : "处理"}`}</button>}<button className="quiet-button danger-button" type="button" onClick={() => void onDeleteDocument(selected.id, document.id)}>删除文档</button></div>
                 </article>
                 {contentDocumentId === document.id && (
                   <DocumentReader

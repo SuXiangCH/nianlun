@@ -21,6 +21,7 @@ export interface KnowledgeBase {
   status: KnowledgeBaseStatus;
   document_count: number;
   summary_enabled: boolean;
+  heading_recovery_enabled: boolean;
   workspace_dir: string;
   workspace_relpath: string | null;
   content_version: number;
@@ -53,10 +54,11 @@ export type DocumentParser = "native_markdown" | "mineru";
 export interface DocumentArtifact {
   id: string;
   document_id: string;
-  kind: "original" | "result_zip" | "full_markdown" | "content_list" | "layout" | "model" | "asset";
+  kind: "original" | "result_zip" | "full_markdown" | "content_list" | "layout" | "model" | "asset" | "parse_chunk_source" | "parse_chunk_result" | "normalized_markdown" | "page_map" | "enriched_markdown" | "tree" | "diagnostics";
   relpath: string;
   mime_type: string;
   size_bytes: number;
+  pipeline_generation: number;
   created_at: string;
 }
 
@@ -66,11 +68,19 @@ export interface DocumentParseTask {
   provider: "mineru";
   api_mode: "saas_precision" | "self_hosted";
   attempt: number;
+  pipeline_generation: number;
+  chunk_index: number;
+  chunk_count: number;
+  source_page_start: number | null;
+  source_page_end: number | null;
   data_id: string;
   batch_id: string | null;
   task_id: string | null;
   model_version: "pipeline" | "vlm";
-  state: "created" | "uploading" | "waiting-file" | "pending" | "running" | "converting" | "done" | "failed";
+  state: "created" | "uploading" | "waiting-file" | "pending" | "running" | "converting" | "done" | "failed" | "canceled";
+  dispatch_state: "queued" | "leased" | "waiting" | "succeeded" | "failed" | "canceled";
+  available_at: string | null;
+  next_poll_at: string | null;
   extracted_pages: number | null;
   total_pages: number | null;
   error_code: string | null;
@@ -90,7 +100,18 @@ export interface KnowledgeBaseDocument {
   size_bytes: number;
   parser: DocumentParser;
   status: DocumentStatus;
+  pipeline_generation: number;
+  current_stage: "parse" | "normalize" | "enrich" | "publish" | "index" | "complete";
+  stage_state: "queued" | "running" | "succeeded" | "partial" | "failed" | "skipped";
+  failed_stage: "parse" | "normalize" | "enrich" | "index" | null;
+  progress_completed: number | null;
+  progress_total: number | null;
+  progress_unit: "pages" | "chunks" | "nodes" | "documents" | null;
+  warnings: Array<Record<string, unknown>>;
   parsed_content_version: number | null;
+  published_content_version: number | null;
+  progress: { completed: number | null; total: number | null; unit: "pages" | "chunks" | "nodes" | "documents" | null };
+  parse: { chunks_completed: number; chunks_total: number; pages_completed: number; pages_total: number };
   error_code: string | null;
   error_message: string | null;
   latest_task: DocumentParseTask | null;

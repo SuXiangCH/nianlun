@@ -17,10 +17,12 @@ from nianlun.knowledgebase.config import (
     NODE_MATCH_LIMIT,
     WORKSPACE_DIR,
 )
+from nianlun.knowledgebase.workspace_view import WorkspaceView
 
 if TYPE_CHECKING:
     from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
     from nianlun.knowledgebase.full_text_retriever import FullTextNodeRetriever
+    from nianlun.knowledgebase.local_scan_retriever import LocalScanNodeRetriever
 
 
 MAX_LINE_SPEC_LINES = 500
@@ -61,12 +63,36 @@ class KnowledgeBase:
         self,
         workspace_dir: Path | str = WORKSPACE_DIR,
         *,
-        full_text_retriever: FullTextNodeRetriever | None = None,
+        full_text_retriever: FullTextNodeRetriever
+        | LocalScanNodeRetriever
+        | None = None,
         semantic_document_retriever: SemanticDocumentRetriever | None = None,
+        snapshot_relpath: str | None = None,
+        snapshot_manifest_sha256: str | None = None,
+        knowledge_base_id: str | None = None,
+        content_version: int | None = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
         self.meta_path = self.workspace_dir / "_meta.json"
-        self._meta: dict[str, Any] = self._load_meta()
+        if snapshot_relpath is None:
+            self._workspace_view = WorkspaceView.legacy(self.workspace_dir)
+        else:
+            if (
+                snapshot_manifest_sha256 is None
+                or knowledge_base_id is None
+                or content_version is None
+            ):
+                raise ValueError(
+                    "V2 snapshot 读取缺少 manifest hash、知识库 ID 或 revision"
+                )
+            self._workspace_view = WorkspaceView.revision(
+                self.workspace_dir,
+                snapshot_relpath,
+                snapshot_manifest_sha256,
+                knowledge_base_id=knowledge_base_id,
+                content_version=content_version,
+            )
+        self._meta: dict[str, Any] = self._workspace_view.meta
         self._doc_cache: dict[str, dict] = {}
         self._full_text_retriever = full_text_retriever
         self._semantic_document_retriever = semantic_document_retriever
@@ -85,8 +111,7 @@ class KnowledgeBase:
 
     def _load_meta(self) -> dict[str, Any]:
         """加载知识库注册表 _meta.json。"""
-        with open(self.meta_path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return WorkspaceView.legacy(self.workspace_dir).meta
 
     @property
     def meta(self) -> dict[str, Any]:
@@ -99,9 +124,7 @@ class KnowledgeBase:
             raise KeyError(doc_id)
         if doc_id in self._doc_cache:
             return self._doc_cache[doc_id]
-        path = self.workspace_dir / f"{doc_id}.json"
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = self._workspace_view.load_document(doc_id)
         doc = {
             "doc_id": doc_id,
             "doc_name": data.get("doc_name", "unknown"),

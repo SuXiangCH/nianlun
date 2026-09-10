@@ -5,10 +5,13 @@ from __future__ import annotations
 import logging
 
 
-class _ApiLogFilter(logging.Filter):
+class _ApplicationLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        return record.name == "app.api_server" or record.name.startswith(
-            "app.api_server."
+        return (
+            record.name == "app.api_server"
+            or record.name.startswith("app.api_server.")
+            or record.name == "nianlun"
+            or record.name.startswith("nianlun.")
         )
 
 
@@ -34,7 +37,7 @@ def configure_logging(level: str = "INFO") -> None:
             datefmt="%Y-%m-%dT%H:%M:%S%z",
         )
     )
-    handler.addFilter(_ApiLogFilter())
+    handler.addFilter(_ApplicationLogFilter())
     setattr(handler, "_nianlun_api_handler", True)
     root_logger.addHandler(handler)
 

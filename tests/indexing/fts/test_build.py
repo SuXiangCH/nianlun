@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +137,23 @@ def test_incremental_processes_only_specified_docs_after_records_are_built(
     assert store.loaded is True
 
 
+def test_incremental_deletes_tombstoned_document_not_in_workspace(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path, ["doc-1"])
+    FakeStore.shared_client = FakeClient(collections={"fts-target"})
+
+    build_module.build_node_fts(
+        workspace,
+        collection_name="fts-target",
+        knowledge_base_id="kb-1",
+        doc_ids=["deleted-doc"],
+        force=False,
+    )
+
+    store = _last_store()
+    assert store.deleted_docs == ["deleted-doc"]
+    assert store.inserted == []
+
+
 def test_incremental_record_build_failure_keeps_existing_document_records(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,3 +247,49 @@ def test_doc_ids_none_processes_all(tmp_path: Path) -> None:
     assert store.ensured_existing is True
     assert sorted(store.deleted_docs) == ["doc-1", "doc-2"]
     assert {rec["doc_id"] for rec in store.inserted} == {"doc-1", "doc-2"}
+
+
+def test_v2_snapshot_does_not_read_mutable_root_projection(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path, ["doc-1"])
+    immutable_relpath = "artifacts/doc-1/g1/enriched/tree.json"
+    immutable = workspace / immutable_relpath
+    immutable.parent.mkdir(parents=True)
+    immutable.write_bytes((workspace / "doc-1.json").read_bytes())
+    raw = immutable.read_bytes()
+    manifest = {
+        "schema_version": 2,
+        "knowledge_base_id": "kb-1",
+        "content_version": 7,
+        "documents": [
+            {
+                "document_id": "doc-1",
+                "index_relpath": immutable_relpath,
+                "generation": 1,
+                "doc_name": "doc-1.md",
+            }
+        ],
+        "artifact_files": [
+            {
+                "relpath": immutable_relpath,
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ],
+    }
+    manifest_raw = json.dumps(manifest).encode()
+    snapshot = workspace / "snapshots/r7"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_bytes(manifest_raw)
+    (workspace / "doc-1.json").unlink()
+
+    build_module.build_node_fts(
+        workspace,
+        collection_name="fts-target",
+        knowledge_base_id="kb-1",
+        force=True,
+        snapshot_relpath="snapshots/r7",
+        snapshot_manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+        snapshot_content_version=7,
+    )
+
+    assert {rec["doc_id"] for rec in _last_store().inserted} == {"doc-1"}

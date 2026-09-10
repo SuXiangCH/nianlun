@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import pytest
+import hashlib
+import json
 
 from nianlun.indexing.fts.config import FTS_SCHEMA_CHECK_TIMEOUT_SECONDS
 from nianlun.indexing.fts.store import CollectionSchemaStatus
@@ -21,6 +22,23 @@ class _FullTextStore:
 class _FullTextSearcher:
     def __init__(self, **_kwargs) -> None:
         self.store = _FullTextStore()
+
+
+def _empty_snapshot(tmp_path, *, knowledge_base_id: str = "kb", revision: int = 0):
+    snapshot = tmp_path / "snapshots" / f"r{revision}"
+    snapshot.mkdir(parents=True)
+    payload = json.dumps(
+        {
+            "schema_version": 2,
+            "knowledge_base_id": knowledge_base_id,
+            "content_version": revision,
+            "documents": [],
+            "artifact_files": [],
+        },
+        sort_keys=True,
+    ).encode()
+    (snapshot / "manifest.json").write_bytes(payload)
+    return f"snapshots/r{revision}", hashlib.sha256(payload).hexdigest()
 
 
 def test_vector_backend_failure_degrades_without_semantic_retriever(
@@ -61,31 +79,30 @@ def test_vector_backend_failure_degrades_without_semantic_retriever(
     assert _FullTextStore.schema_probe_timeouts == [FTS_SCHEMA_CHECK_TIMEOUT_SECONDS]
 
 
-@pytest.mark.parametrize(
-    ("schema_status", "error_message"),
-    [
-        (CollectionSchemaStatus.MISSING, "Milvus collection 不存在: fts"),
-        (
-            CollectionSchemaStatus.OUTDATED,
-            "Milvus FTS collection schema 已过期；请等待或触发 FTS 索引重建",
-        ),
-    ],
-)
-def test_fts_schema_probe_preserves_specific_runtime_errors(
-    monkeypatch,
-    tmp_path,
-    schema_status: CollectionSchemaStatus,
-    error_message: str,
+def test_fts_schema_failure_uses_committed_snapshot_local_scan(
+    monkeypatch, tmp_path
 ) -> None:
-    _FullTextStore.schema_status_value = schema_status
+    _FullTextStore.schema_status_value = CollectionSchemaStatus.MISSING
     _FullTextStore.schema_probe_timeouts.clear()
     monkeypatch.setattr(
         "nianlun.knowledgebase.factory.FullTextNodeRetriever",
         _FullTextSearcher,
     )
-    factory = KnowledgeBaseFactory(KnowledgeBaseConfig(workspace_dir=tmp_path))
+    snapshot_relpath, manifest_sha256 = _empty_snapshot(tmp_path)
+    factory = KnowledgeBaseFactory(
+        KnowledgeBaseConfig(
+            workspace_dir=tmp_path,
+            knowledge_base_id="kb",
+            content_version=0,
+            snapshot_relpath=snapshot_relpath,
+            snapshot_manifest_sha256=manifest_sha256,
+        )
+    )
 
-    with pytest.raises(RuntimeError, match=error_message):
-        factory.create(api_key=None, base_url=None, allow_env_fallback=False)
+    runtime_kb = factory.create(api_key=None, base_url=None, allow_env_fallback=False)
 
+    assert runtime_kb.has_fts is True
+    assert runtime_kb.search_document_nodes(
+        "anything"
+    ) == runtime_kb._empty_document_search_result("anything")
     assert _FullTextStore.schema_probe_timeouts == [FTS_SCHEMA_CHECK_TIMEOUT_SECONDS]

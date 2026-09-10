@@ -19,6 +19,7 @@ from typing import Any
 
 from nianlun.models.llm import content_to_text
 from nianlun.agent.contracts import AgentRequestContext, KnowledgeBasePort
+from nianlun.agent.language import prefers_english
 from nianlun.knowledgebase import sanitize_text
 from nianlun.agent.middleware import CONTEXT_SUMMARIZATION_NO_STREAM_TAG
 from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
@@ -708,7 +709,7 @@ def _trace_agent_message(message: str, round_id: int) -> dict[str, Any]:
     return {"kind": "agent_message", "message": message, "round": round_id}
 
 
-_TOOL_PROGRESS_MESSAGES = {
+_TOOL_PROGRESS_MESSAGES_ZH = {
     "search_document_nodes": "正在搜索相关文档。",
     "find_semantic_documents": "正在进行语义检索。",
     "get_structure_outline": "正在查看文档结构。",
@@ -717,15 +718,30 @@ _TOOL_PROGRESS_MESSAGES = {
     "ask_clarification": "正在确认需要补充的信息。",
 }
 
+_TOOL_PROGRESS_MESSAGES_EN = {
+    "search_document_nodes": "Searching relevant documents.",
+    "find_semantic_documents": "Searching semantically related documents.",
+    "get_structure_outline": "Reviewing the document structure.",
+    "get_line_content": "Reading relevant content.",
+    "get_document": "Reading document information.",
+    "ask_clarification": "Identifying the information that needs clarification.",
+}
 
-def _trace_tool_call_started(tool_names: list[str]) -> dict[str, Any]:
+
+def _trace_tool_call_started(
+    tool_names: list[str], *, english: bool = False
+) -> dict[str, Any]:
     """把真实工具调用转换成不泄漏参数的用户可见轨迹。"""
+    progress_messages = (
+        _TOOL_PROGRESS_MESSAGES_EN if english else _TOOL_PROGRESS_MESSAGES_ZH
+    )
+    fallback = "Calling a tool." if english else "正在调用工具。"
     messages = [
-        _TOOL_PROGRESS_MESSAGES.get(name, "正在调用工具。") for name in tool_names
+        progress_messages.get(name, fallback) for name in tool_names
     ]
     unique_messages = list(dict.fromkeys(messages))
     if not unique_messages:
-        message = "正在调用工具。"
+        message = fallback
     elif len(unique_messages) == 1:
         message = unique_messages[0]
     else:
@@ -794,6 +810,7 @@ def _iter_agent_stream_events_impl(
     current_model_tool_trace_emitted = False
     in_tools_node = False
     model_round = 0
+    english = prefers_english(user_query)
 
     def drain_trace() -> list[dict[str, Any]]:
         nonlocal status_trace_index
@@ -824,7 +841,7 @@ def _iter_agent_stream_events_impl(
         trace_event = (
             _trace_agent_message(progress_message, round_id)
             if progress_message
-            else _trace_tool_call_started(tool_names)
+            else _trace_tool_call_started(tool_names, english=english)
         )
         trace.append(trace_event)
         return trace_event
@@ -895,7 +912,9 @@ def _iter_agent_stream_events_impl(
             if has_tool_call:
                 tool_names = _stream_message_tool_names(message)
                 known_tool_names = [
-                    name for name in tool_names if name in _TOOL_PROGRESS_MESSAGES
+                    name
+                    for name in tool_names
+                    if name in _TOOL_PROGRESS_MESSAGES_ZH
                 ]
                 # Natural model text is authoritative for the visible activity.
                 # When it is absent, wait for a complete known tool name before

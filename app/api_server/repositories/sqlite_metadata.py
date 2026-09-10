@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Any, Literal
 
 from sqlalchemy import func, select
@@ -11,6 +12,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import (
     Application,
     KnowledgeBase,
+    KnowledgeBaseWorkspaceRevision,
 )
 from app.api_server.repositories.metadata.indexing import IndexStateRepositoryMixin
 from app.api_server.repositories.metadata.model_profiles import (
@@ -19,6 +21,12 @@ from app.api_server.repositories.metadata.model_profiles import (
 from app.api_server.repositories.metadata.documents import DocumentRepositoryMixin
 from app.api_server.repositories.metadata.parse_tasks import (
     DocumentParseRepositoryMixin,
+)
+from app.api_server.repositories.metadata.pipeline_tasks import (
+    DocumentPipelineRepositoryMixin,
+)
+from app.api_server.repositories.metadata.publishing import (
+    WorkspaceRevisionRepositoryMixin,
 )
 from app.api_server.repositories.metadata.uploads import UploadOperationRepositoryMixin
 
@@ -34,6 +42,7 @@ def _knowledge_base_dict(item: KnowledgeBase) -> dict[str, Any]:
         "workspace_relpath": item.workspace_relpath,
         "document_count": item.document_count,
         "summary_enabled": bool(item.summary_enabled),
+        "heading_recovery_enabled": bool(item.heading_recovery_enabled),
         "content_version": item.content_version,
         "fts_status": item.fts_status,
         "fts_revision": item.fts_revision,
@@ -78,7 +87,9 @@ class SQLiteMetadataRepository(
     ModelProfileRepositoryMixin,
     UploadOperationRepositoryMixin,
     DocumentParseRepositoryMixin,
+    DocumentPipelineRepositoryMixin,
     DocumentRepositoryMixin,
+    WorkspaceRevisionRepositoryMixin,
 ):
     """Persist API metadata with typed ORM entities and short transactions."""
 
@@ -121,6 +132,33 @@ class SQLiteMetadataRepository(
             else:
                 self._put_application(session, item_id, item)
 
+    def create_knowledge_base_with_revision(
+        self,
+        item: dict[str, Any],
+        *,
+        snapshot_relpath: str,
+        manifest_sha256: str,
+    ) -> None:
+        """Insert a knowledge base and its initial committed revision atomically."""
+        knowledge_base_id = str(item["id"])
+        content_version = int(item.get("content_version", 0))
+        with self.factory.session_scope(write=True) as session:
+            if session.get(KnowledgeBase, knowledge_base_id) is not None:
+                raise ValueError(f"knowledge base already exists: {knowledge_base_id}")
+            self._put_knowledge_base(session, knowledge_base_id, item)
+            session.flush()
+            session.add(
+                KnowledgeBaseWorkspaceRevision(
+                    id=str(uuid.uuid4()),
+                    knowledge_base_id=knowledge_base_id,
+                    content_version=content_version,
+                    snapshot_relpath=snapshot_relpath,
+                    manifest_sha256=manifest_sha256,
+                    state="committed",
+                    created_at=str(item["created_at"]),
+                )
+            )
+
     def update_knowledge_base_settings(
         self, knowledge_base_id: str, values: dict[str, Any]
     ) -> dict[str, Any]:
@@ -128,6 +166,7 @@ class SQLiteMetadataRepository(
         allowed_fields = {
             "name",
             "summary_enabled",
+            "heading_recovery_enabled",
             "vector_model_id",
             "vector_status",
             "vector_revision",
@@ -198,6 +237,9 @@ class SQLiteMetadataRepository(
                 workspace_relpath=item.get("workspace_relpath", item_id),
                 document_count=int(item.get("document_count", 0)),
                 summary_enabled=bool(item.get("summary_enabled", True)),
+                heading_recovery_enabled=bool(
+                    item.get("heading_recovery_enabled", True)
+                ),
                 content_version=int(item.get("content_version", 0)),
                 fts_status=item.get("fts_status", "disabled"),
                 fts_revision=item.get("fts_revision"),
@@ -229,6 +271,9 @@ class SQLiteMetadataRepository(
             entity.workspace_relpath = item.get("workspace_relpath", item_id)
             entity.document_count = int(item.get("document_count", 0))
             entity.summary_enabled = bool(item.get("summary_enabled", True))
+            entity.heading_recovery_enabled = bool(
+                item.get("heading_recovery_enabled", True)
+            )
             entity.content_version = int(item.get("content_version", 0))
             entity.fts_status = item.get("fts_status", "disabled")
             entity.fts_revision = item.get("fts_revision")
