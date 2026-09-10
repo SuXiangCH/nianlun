@@ -10,7 +10,8 @@
 ``KnowledgeBaseConfig.knowledge_base_id`` 中使用同一个值。
 
 总是 drop+recreate 全量重建（无追加模式，auto_id 主键下追加会重复）。
-env（.env 或环境变量）：``MILVUS_URI`` / ``MILVUS_TOKEN`` / ``MILVUS_NODE_FTS_COLLECTION``。
+env（.env 或环境变量）：``MILVUS_URI`` / ``MILVUS_TOKEN`` /
+``MILVUS_NODE_FTS_COLLECTION`` / ``MILVUS_LANGUAGE_IDENTIFIER``。
 """
 
 from __future__ import annotations

@@ -25,6 +25,7 @@ class KnowledgeBaseConfig:
 
     workspace_dir: Path = WORKSPACE_DIR
     fts_enabled: bool = True
+    fts_ready: bool = True
     milvus_uri: str | None = None
     fts_collection: str | None = None
     milvus_token: str | None = None
@@ -35,6 +36,9 @@ class KnowledgeBaseConfig:
     embedding_dim: int | None = None
     embedding_base_url: str | None = None
     embedding_api_key: str | None = None
+    snapshot_relpath: str | None = None
+    snapshot_manifest_sha256: str | None = None
+    content_version: int | None = None
 
 
 __all__ = [

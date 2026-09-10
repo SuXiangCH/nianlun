@@ -3,36 +3,82 @@
 from __future__ import annotations
 
 import io
+import os
+import shutil
+import stat
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Any
+from collections.abc import Callable
+from typing import Any, BinaryIO
 
 from app.api_server.integrations.mineru import MineruError
-from app.api_server.services.workspace_store import WorkspaceArtifactStore
 
 
 def extract_result_archive(
-    content: bytes, destination: Path, *, max_member_bytes: int
+    content: bytes | Path,
+    destination: Path,
+    *,
+    max_member_bytes: int,
+    max_entries: int = 10_000,
+    max_compression_ratio: float = 200.0,
+    reserve_extracted_bytes: Callable[[int], bool] | None = None,
 ) -> list[Path]:
-    """Extract a MinerU ZIP while rejecting archive path traversal."""
+    """Stream-extract a bounded MinerU ZIP after validating its central directory."""
     paths: list[Path] = []
     destination_root = destination.resolve()
-    with zipfile.ZipFile(io.BytesIO(content)) as archive:
-        for info in archive.infolist():
+    source: BinaryIO | Path = (
+        io.BytesIO(content) if isinstance(content, bytes) else content
+    )
+    with zipfile.ZipFile(source) as archive:
+        infos = archive.infolist()
+        if len(infos) > max_entries:
+            raise MineruError("MinerU 解析 ZIP 文件项数量超过限制")
+        declared_total = 0
+        names: set[str] = set()
+        for info in infos:
             member = PurePosixPath(info.filename)
             if member.is_absolute() or ".." in member.parts:
                 raise MineruError("MinerU 解析 ZIP 包含非法路径")
             if info.is_dir():
                 continue
+            if info.filename in names:
+                raise MineruError("MinerU 解析 ZIP 包含重复路径")
+            names.add(info.filename)
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == stat.S_IFLNK:
+                raise MineruError("MinerU 解析 ZIP 包含符号链接")
             if info.file_size > max_member_bytes:
                 raise MineruError("MinerU 解析 ZIP 单文件超过大小限制")
+            if info.file_size and (
+                info.compress_size == 0
+                or info.file_size / info.compress_size > max_compression_ratio
+            ):
+                raise MineruError("MinerU 解析 ZIP 压缩比超过限制")
+            declared_total += info.file_size
+        if reserve_extracted_bytes is not None and not reserve_extracted_bytes(
+            declared_total
+        ):
+            raise MineruError("MinerU 解压租约失效或 staging 配额不足")
+        for info in infos:
+            member = PurePosixPath(info.filename)
+            if info.is_dir():
+                continue
             target = (destination / member).resolve()
             try:
                 target.relative_to(destination_root)
             except ValueError as exc:
                 raise MineruError("MinerU 解析 ZIP 路径越界") from exc
             target.parent.mkdir(parents=True, exist_ok=True)
-            WorkspaceArtifactStore.atomic_write(target, archive.read(info))
+            temp = target.parent / f".{target.name}.extracting"
+            try:
+                with archive.open(info) as source_file, temp.open("xb") as output:
+                    shutil.copyfileobj(source_file, output, length=64 * 1024)
+                    output.flush()
+                    os.fsync(output.fileno())
+                temp.replace(target)
+            except Exception:
+                temp.unlink(missing_ok=True)
+                raise
             paths.append(target)
     return paths
 

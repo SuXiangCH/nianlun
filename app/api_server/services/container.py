@@ -15,6 +15,10 @@ from app.api_server.services.fts_index_service import FTSIndexService
 from app.api_server.services.knowledge_base_service import KnowledgeBaseService
 from app.api_server.services.model_config_service import ModelConfigService
 from app.api_server.services.vector_index_service import VectorIndexService
+from app.api_server.services.workspace_snapshot import (
+    reconcile_workspace_revisions,
+    reconcile_workspace_storage,
+)
 
 
 @dataclass
@@ -40,13 +44,29 @@ def build_services(settings: ApiServerSettings) -> ApiServices:
     chat_repository = SQLiteChatRepository(factory)
     chat_repository.fail_pending_messages(datetime.now(timezone.utc))
     models = ModelConfigService(repository)
-    knowledge_bases = KnowledgeBaseService(repository, settings.workspace_root, models)
+    knowledge_bases = KnowledgeBaseService(
+        repository,
+        settings.workspace_root,
+        models,
+        fts_enabled=settings.fts_enabled,
+    )
     fts = FTSIndexService(repository, knowledge_bases.require_record, settings)
     vector = VectorIndexService(
         repository,
         knowledge_bases.require_record,
         models.embedding_runtime_config,
         settings,
+    )
+    reconcile_workspace_revisions(
+        repository,
+        knowledge_bases,
+        orphan_retention_seconds=settings.snapshot_min_retention_seconds,
+    )
+    reconcile_workspace_storage(
+        repository,
+        knowledge_bases,
+        staging_retention_seconds=settings.staging_orphan_retention_seconds,
+        artifact_retention_seconds=settings.snapshot_min_retention_seconds,
     )
     documents = DocumentIngestionService(
         repository,
@@ -69,8 +89,8 @@ def build_services(settings: ApiServerSettings) -> ApiServices:
         embedding_dim=settings.embedding_dim,
         model_config_service=models,
     )
-    knowledge_bases.reconcile()
     documents.recover_workspace_documents()
+    knowledge_bases.reconcile()
     fts.recover_pending()
     vector.recover_pending()
     documents.recover()

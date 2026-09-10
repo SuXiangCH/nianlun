@@ -14,6 +14,7 @@ import asyncio
 import concurrent.futures
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from typing import Any, cast
 
 from nianlun.indexing.tree.llm import (
@@ -21,6 +22,11 @@ from nianlun.indexing.tree.llm import (
     count_tokens,
     describe_document,
     summarize_node,
+)
+from nianlun.indexing.tree.heading_recovery import (
+    HeadingRecoveryMode,
+    recover_heading_levels,
+    recover_heading_levels_with_llm,
 )
 from nianlun.indexing.tree.parser import extract_headings
 from nianlun.indexing.tree.untitled import make_source, plan_untitled
@@ -429,7 +435,13 @@ def _untitled_tree_to_legacy_structure(
     return tree
 
 
-async def _generate_summaries(structure, llm, model, summary_token_threshold: int):
+async def _generate_summaries(
+    structure,
+    llm,
+    model,
+    summary_token_threshold: int,
+    node_progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
+):
     """树展平后逐节点摘要。
 
     token < 阈值直接用原文；否则调 ``summarize_node``。
@@ -437,16 +449,28 @@ async def _generate_summaries(structure, llm, model, summary_token_threshold: in
     """
     nodes = structure_to_list(structure)
     semaphore = asyncio.Semaphore(_SUMMARY_CONCURRENCY)
+    completed = 0
+    progress_lock = asyncio.Lock()
+
+    if node_progress_callback is not None:
+        await node_progress_callback(0, len(nodes))
 
     async def _one(node):
+        nonlocal completed
         text = node.get("text", "")
         if count_tokens(text, model=model) < summary_token_threshold:
-            return text
-        if llm is None:
+            summary = text
+        elif llm is None:
             # 无标题降级路径：LLM 不可用时对齐 summarize_node 的失败回落。
-            return ""
-        async with semaphore:
-            return await summarize_node(llm, text)
+            summary = ""
+        else:
+            async with semaphore:
+                summary = await summarize_node(llm, text)
+        if node_progress_callback is not None:
+            async with progress_lock:
+                completed += 1
+                await node_progress_callback(completed, len(nodes))
+        return summary
 
     summaries = await asyncio.gather(*[_one(n) for n in nodes])
     for node, summary in zip(nodes, summaries):
@@ -471,6 +495,9 @@ async def build_md_index(
     min_node_token=None,
     atx_only: bool = True,
     max_titled_node_tokens: int | None = 8_000,
+    heading_recovery_mode: HeadingRecoveryMode = "off",
+    heading_recovery_llm=None,
+    node_progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> dict:
     """读 md -> 解析标题 -> 切正文 -> (可选 thin) -> 建树 -> (可选 摘要/描述) -> 格式化。
 
@@ -485,8 +512,12 @@ async def build_md_index(
         md_text = f.read()
     line_count = md_text.count("\n") + 1
     lines = md_text.split("\n")
+    if heading_recovery_mode not in {"off", "rules", "rules_then_llm"}:
+        raise ValueError("unsupported heading_recovery_mode")
+
     tree: list[dict] = []
     nodes: list[dict] | None = None
+    heading_recovery: dict[str, str | list[str]] | None = None
 
     # Full CommonMark detection decides whether this is truly an untitled
     # document. The ``atx_only`` option still governs extraction for titled docs.
@@ -520,6 +551,16 @@ async def build_md_index(
         nodes = None
     else:
         headings = extract_headings(md_text, atx_only=atx_only)
+        if heading_recovery_mode == "rules":
+            recovery = recover_heading_levels(headings)
+            headings = recovery.headings
+            heading_recovery = recovery.as_metadata()
+        elif heading_recovery_mode == "rules_then_llm":
+            recovery = await recover_heading_levels_with_llm(
+                headings, cast(Any, heading_recovery_llm)
+            )
+            headings = recovery.headings
+            heading_recovery = recovery.as_metadata()
         nodes = slice_node_text(headings, lines)
 
     if nodes is not None and thin:
@@ -548,7 +589,13 @@ async def build_md_index(
             llm = None
         # 摘要阶段始终带 text（summarize 需要正文参与），之后按 add_node_text 剥离。
         tree = format_structure(tree, order=_WITH_TEXT_ORDER)
-        tree = await _generate_summaries(tree, llm, model, summary_token_threshold)
+        tree = await _generate_summaries(
+            tree,
+            llm,
+            model,
+            summary_token_threshold,
+            node_progress_callback,
+        )
         if not add_node_text:
             tree = format_structure(tree, order=_NO_TEXT_ORDER)
         if add_doc_description:
@@ -560,13 +607,20 @@ async def build_md_index(
         tree = format_structure(
             tree, order=_WITH_TEXT_ORDER if add_node_text else _NO_TEXT_ORDER
         )
+        if node_progress_callback is not None:
+            node_total = len(structure_to_list(tree))
+            await node_progress_callback(0, node_total)
+            await node_progress_callback(node_total, node_total)
 
-    return {
+    result = {
         "doc_name": doc_name,
         "doc_description": doc_description,
         "line_count": line_count,
         "structure": tree,
     }
+    if heading_recovery is not None:
+        result["heading_recovery"] = heading_recovery
+    return result
 
 
 def build_md_index_sync(md_path: str, **kwargs) -> dict:

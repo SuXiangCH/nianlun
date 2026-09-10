@@ -43,7 +43,7 @@ def test_prompt_hides_internal_locations_and_separates_progress_from_final_answe
 
     assert "不要引用“第 N 行”" in prompt
     assert "citation_id 是唯一允许展示的定位字段" in prompt
-    assert "每个新的工具执行阶段开始前，应输出一句简短、自然的进度说明" in prompt
+    assert "每个新的工具执行阶段开始前，应使用已锁定的输出语言" in prompt
     assert "不展示内部推理、判断链条" in prompt
     assert "不要在最终答案中展示用户未要求的检索、分析或推导过程" in prompt
     assert "不要展示内部定位字段、重复来源清单或内部检查过程" in prompt
@@ -59,6 +59,35 @@ def test_prompt_requires_direct_answers_without_unsolicited_additions():
     assert "限制说明、免责声明" in prompt
     assert "不要让结论的适用范围超过证据覆盖范围" in prompt
     assert "立即结束输出" in prompt
+
+
+def test_prompt_requires_scoped_binary_financial_judgments():
+    prompt = build_system_prompt(_NoCatalogKnowledgeBase())
+
+    assert "首句必须明确回答“是”或“否”" in prompt
+    assert "结论只评估该指标" in prompt
+    assert "不得用其他指标、融资能力或背景信息" in prompt
+    assert "首句结论与比较结果一致" in prompt
+    assert "不得仅因“接近”“边际”或“尚可”而给出肯定结论" in prompt
+    assert "输入数据 -> 计算结果 -> 判定规则 -> 结论" in prompt
+    assert "最终结论必须是该推理链的直接结果" in prompt
+    assert "反向核对结论能否由前述步骤推出" in prompt
+    assert "只有该条件成立才解释" in prompt
+
+
+def test_prompt_requires_english_output_for_english_questions():
+    prompt = build_system_prompt(_NoCatalogKnowledgeBase())
+
+    assert "输出语言只由最新一条用户问题决定" in prompt
+    assert "mandatory language gate" in prompt
+    assert "Inspect only the latest user message" in prompt
+    assert "Lock that language for the entire turn" in prompt
+    assert "retrieval and reading progress" in prompt
+    assert "check it for Chinese characters" in prompt
+    assert 'Valid progress: "Searching for 3M' in prompt
+    assert 'Invalid progress: "正在检索 3M' in prompt
+    assert '英文问题使用例如 "Searching relevant documents...' in prompt
+    assert prompt.rstrip().endswith("</输出语言 / OUTPUT LANGUAGE>")
 
 
 def test_prompt_uses_tool_assigned_citation_ids():
@@ -84,6 +113,7 @@ def test_prompt_describes_optional_vector_tool():
     assert "find_semantic_documents" in prompt
     assert "语义相似度检索" in prompt
     assert "概念性表达" in prompt
+    assert prompt.rstrip().endswith("</输出语言 / OUTPUT LANGUAGE>")
 
 
 def test_prompt_describes_deduplicated_retrieval_results():
@@ -101,6 +131,10 @@ def test_prompt_requires_answer_coverage_check_before_stopping():
     assert "当前证据是否直接、完整地覆盖用户问题" in prompt
     assert "不能把相近概念、相邻字段或同类指标当成目标字段" in prompt
     assert "仅部分词语重合但语义不同的字段" in prompt
+    assert "衡量对象、时间、主体、范围及其他限定条件" in prompt
+    assert "仅因关键词重合、对象相关或属于同一类别，不构成直接支持" in prompt
+    assert "将缺失的目标限定条件加入下一次定向 query" in prompt
+    assert "不得以相近信息支撑结论，或用其补充具体数值" in prompt
     assert "概念性问题必须匹配到与用户目标概念直接对应的正文" in prompt
     assert "先扩大相邻章节的读取范围" in prompt
     assert "仍不足时再使用保持原意的 query 扩大搜索范围" in prompt
@@ -112,5 +146,5 @@ def test_prompt_requires_answer_coverage_check_before_stopping():
     assert prompt.rfind("<回答前覆盖检查>") > prompt.rfind("<停止条件>")
 
 
-def test_prompt_revision_is_v10():
-    assert PROMPT_VERSION == 10
+def test_prompt_revision_is_v18():
+    assert PROMPT_VERSION == 18

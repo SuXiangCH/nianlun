@@ -539,6 +539,47 @@ def test_iter_agent_stream_events_reads_tool_name_from_model_state() -> None:
     assert trace_index < answer_index
 
 
+def test_iter_agent_stream_events_preserves_real_english_tool_trace() -> None:
+    chunks = [
+        {
+            "type": "messages",
+            "data": (
+                AIMessageChunk(
+                    content="Searching 3M's FY2018 cash flow statement.",
+                    tool_call_chunks=[
+                        {
+                            "name": "search_document_nodes",
+                            "args": "{}",
+                            "id": "t1",
+                            "index": 0,
+                        }
+                    ],
+                ),
+                {"langgraph_node": "model"},
+            ),
+        },
+        {
+            "type": "values",
+            "data": {
+                "messages": [
+                    HumanMessage(content="Find 3M's cash flow statement"),
+                    AIMessage(content="The answer."),
+                ]
+            },
+        },
+    ]
+
+    events = _collect_events(_runtime(chunks), "Find 3M's cash flow statement")
+
+    assert [event["data"] for event in events if event["type"] == "trace"] == [
+        {
+            "kind": "agent_message",
+            "message": "Searching 3M's FY2018 cash flow statement.",
+            "round": 1,
+        }
+    ]
+
+
 def test_iter_agent_stream_events_emits_one_trace_for_parallel_tool_messages() -> None:
     chunks = [
         {

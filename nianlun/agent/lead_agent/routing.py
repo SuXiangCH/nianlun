@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from nianlun.agent.language import prefers_english
 from nianlun.agent.lead_agent.prompt import DIRECT_HELP_TEXT
 
 
@@ -43,6 +44,7 @@ DIRECT_CAPABILITY_QUERIES = {
 def maybe_handle_non_retrieval_query(user_query: str) -> dict[str, str]:
     """对明显的非知识库对话直接回复，其他情况交给主 agent 自行判断。"""
     query = user_query.strip()
+    english = prefers_english(query)
     if not query:
         return {
             "route": "direct",
@@ -56,22 +58,43 @@ def maybe_handle_non_retrieval_query(user_query: str) -> dict[str, str]:
 
     def build_direct_reply() -> str:
         if normalized in DIRECT_THANKS:
-            return "不客气。"
+            return "You're welcome." if english else "不客气。"
         if normalized in DIRECT_BYES:
-            return "再见。"
+            return "Goodbye." if english else "再见。"
         if normalized in DIRECT_IDENTITY_QUERIES:
+            if english:
+                return (
+                    "I am Nianlun, a multi-document knowledge base assistant. "
+                    "I can search documents, locate relevant sections, and answer "
+                    "questions based on their contents."
+                )
             return (
                 "我是 Nianlun，一个多文档知识库问答助手，"
                 "可以帮你检索文档、定位相关章节，并基于文档内容回答问题。"
             )
         if normalized in DIRECT_CAPABILITY_QUERIES:
+            if english:
+                return (
+                    "I am Nianlun, a multi-document knowledge base assistant. "
+                    "Ask me about document content; use `list` to view documents "
+                    "or `trace` to inspect text retrieved in the previous turn."
+                )
             return DIRECT_HELP_TEXT
         if normalized in DIRECT_GREETINGS or (
             len(query) <= 12
             and re.fullmatch(r"(你好|您好|hello|hi|hey)[!！?？\s]*", lowered)
         ):
-            return "你好。可以直接问我知识库里的文档问题。"
-        return "我主要负责知识库中的文档问答。你可以直接问我文档相关问题。"
+            return (
+                "Hello. You can ask me questions about documents in the knowledge base."
+                if english
+                else "你好。可以直接问我知识库里的文档问题。"
+            )
+        return (
+            "I answer questions about documents in the knowledge base. You can ask "
+            "a document-related question directly."
+            if english
+            else "我主要负责知识库中的文档问答。你可以直接问我文档相关问题。"
+        )
 
     if normalized in DIRECT_GREETINGS:
         return {

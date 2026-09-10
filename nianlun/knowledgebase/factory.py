@@ -14,6 +14,7 @@ from nianlun.knowledgebase.config import KnowledgeBaseConfig
 from nianlun.knowledgebase.core import KnowledgeBase
 from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
 from nianlun.knowledgebase.full_text_retriever import FullTextNodeRetriever
+from nianlun.knowledgebase.local_scan_retriever import LocalScanNodeRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -31,26 +32,7 @@ class KnowledgeBaseFactory:
         base_url: str | None,
         allow_env_fallback: bool,
     ) -> KnowledgeBase:
-        if not self.config.fts_enabled:
-            raise RuntimeError("全文检索未启用。")
-
-        full_text_retriever = FullTextNodeRetriever(
-            uri=self.config.milvus_uri,
-            token=self.config.milvus_token,
-            collection_name=self.config.fts_collection,
-            knowledge_base_id=self.config.knowledge_base_id,
-        )
-        schema_status = full_text_retriever.store.schema_status(
-            timeout=FTS_SCHEMA_CHECK_TIMEOUT_SECONDS
-        )
-        if schema_status is CollectionSchemaStatus.MISSING:
-            raise RuntimeError(
-                f"Milvus collection 不存在: {full_text_retriever.store.collection}"
-            )
-        if schema_status is CollectionSchemaStatus.OUTDATED:
-            raise RuntimeError(
-                "Milvus FTS collection schema 已过期；请等待或触发 FTS 索引重建"
-            )
+        full_text_retriever = self._create_full_text_retriever()
 
         return KnowledgeBase(
             workspace_dir=self.config.workspace_dir,
@@ -60,6 +42,46 @@ class KnowledgeBaseFactory:
                 base_url=base_url,
                 allow_env_fallback=allow_env_fallback,
             ),
+            snapshot_relpath=self.config.snapshot_relpath,
+            snapshot_manifest_sha256=self.config.snapshot_manifest_sha256,
+            knowledge_base_id=self.config.knowledge_base_id,
+            content_version=self.config.content_version,
+        )
+
+    def _create_full_text_retriever(
+        self,
+    ) -> FullTextNodeRetriever | LocalScanNodeRetriever:
+        if self.config.fts_enabled and self.config.fts_ready:
+            try:
+                retriever = FullTextNodeRetriever(
+                    uri=self.config.milvus_uri,
+                    token=self.config.milvus_token,
+                    collection_name=self.config.fts_collection,
+                    knowledge_base_id=self.config.knowledge_base_id,
+                )
+                schema_status = retriever.store.schema_status(
+                    timeout=FTS_SCHEMA_CHECK_TIMEOUT_SECONDS
+                )
+                if schema_status is not CollectionSchemaStatus.CURRENT:
+                    raise RuntimeError(f"FTS schema 状态为 {schema_status.value}")
+                return retriever
+            except Exception as exc:
+                logger.warning(
+                    "FTS 远端索引不可用，切换 committed snapshot 本地扫描: %s", exc
+                )
+        if (
+            self.config.snapshot_relpath is None
+            or self.config.snapshot_manifest_sha256 is None
+            or self.config.knowledge_base_id is None
+            or self.config.content_version is None
+        ):
+            raise RuntimeError("知识库当前没有可用于本地检索的 committed snapshot")
+        return LocalScanNodeRetriever(
+            workspace_dir=self.config.workspace_dir,
+            snapshot_relpath=self.config.snapshot_relpath,
+            snapshot_manifest_sha256=self.config.snapshot_manifest_sha256,
+            knowledge_base_id=self.config.knowledge_base_id,
+            content_version=self.config.content_version,
         )
 
     def _create_semantic_retriever(

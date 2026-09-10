@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -187,6 +188,27 @@ def test_incremental_operates_on_live_collection_without_staging(
     assert "vector-target" in FakeStore.client.collections
 
 
+def test_incremental_deletes_tombstoned_document_not_in_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace_multi(tmp_path, ["doc-1"])
+    FakeStore.client.collections = {"vector-target"}
+    FakeStore.deleted_docs = []
+    monkeypatch.setattr(build_module, "DocVectorStore", FakeStore)
+
+    build_module.build_doc_vectors(
+        workspace,
+        collection_name="vector-target",
+        embedding_model="test-model",
+        embedding_dim=2,
+        embedder=FakeEmbedder(),
+        doc_ids=["deleted-doc"],
+        force=False,
+    )
+
+    assert FakeStore.deleted_docs == ["deleted-doc"]
+
+
 def test_incremental_embedding_failure_keeps_existing_document_vectors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -233,6 +255,59 @@ def test_incremental_creates_collection_when_missing(
     assert FakeStore.published is False
     assert "vector-target" in FakeStore.client.collections  # ensure_collection 建表
     assert sorted(FakeStore.deleted_docs) == ["doc-1", "doc-2"]
+
+
+def test_v2_snapshot_does_not_read_mutable_root_projection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    immutable_relpath = "artifacts/doc-1/g1/enriched/tree.json"
+    immutable = workspace / immutable_relpath
+    immutable.parent.mkdir(parents=True)
+    immutable.write_bytes((workspace / "doc-1.json").read_bytes())
+    raw = immutable.read_bytes()
+    manifest = {
+        "schema_version": 2,
+        "knowledge_base_id": "kb-1",
+        "content_version": 7,
+        "documents": [
+            {
+                "document_id": "doc-1",
+                "index_relpath": immutable_relpath,
+                "generation": 1,
+            }
+        ],
+        "artifact_files": [
+            {
+                "relpath": immutable_relpath,
+                "size_bytes": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        ],
+    }
+    manifest_raw = json.dumps(manifest).encode()
+    snapshot = workspace / "snapshots/r7"
+    snapshot.mkdir(parents=True)
+    (snapshot / "manifest.json").write_bytes(manifest_raw)
+    (workspace / "doc-1.json").unlink()
+    progress: list[tuple[str, int, int, int]] = []
+    monkeypatch.setattr(build_module, "DocVectorStore", FakeStore)
+
+    build_module.build_doc_vectors(
+        workspace,
+        collection_name="vector-target",
+        embedding_model="test-model",
+        embedding_dim=2,
+        embedder=FakeEmbedder(),
+        progress_callback=lambda *args: progress.append(args),
+        force=True,
+        knowledge_base_id="kb-1",
+        snapshot_relpath="snapshots/r7",
+        snapshot_manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+        snapshot_content_version=7,
+    )
+
+    assert any(total == 1 for _stage, _completed, total, _records in progress)
 
 
 def test_force_uses_staging_and_publish(

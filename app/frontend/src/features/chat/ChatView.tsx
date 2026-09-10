@@ -176,6 +176,12 @@ const formatUsage = (usage: TokenUsage, ttftMs?: number | null): string => {
   if (ttftMs != null && ttftMs >= 0) parts.push(`首字 ${(ttftMs / 1000).toFixed(1)}s`);
   return parts.join(" · ");
 };
+
+const prefersEnglish = (text: string): boolean => {
+  const latinLetters = Array.from(text).filter((char) => /[A-Za-z]/.test(char)).length;
+  const cjkCharacters = Array.from(text).filter((char) => /[\u4e00-\u9fff]/.test(char)).length;
+  return Boolean(text.trim()) && latinLetters >= cjkCharacters;
+};
 const writeStoredChat = (storageKey: string, messages: ChatMessage[], sources: SourceSnippet[]): void => {
   if (!storageKey) return;
   const snapshot = {
@@ -258,7 +264,7 @@ const timeAgo = (ts: number): string => {
   }
 };
 
-function AgentTraceDetails({ trace, pending, keepOpen }: { trace?: AgentTraceStep[] | null; pending: boolean; keepOpen?: boolean }) {
+function AgentTraceDetails({ trace, pending, keepOpen, english }: { trace?: AgentTraceStep[] | null; pending: boolean; keepOpen?: boolean; english: boolean }) {
   const steps = trace || [];
   const [open, setOpen] = useState(pending || Boolean(keepOpen));
   // Render as soon as the turn is pending, even before the first step arrives:
@@ -268,7 +274,7 @@ function AgentTraceDetails({ trace, pending, keepOpen }: { trace?: AgentTraceSte
     <details className={`message-details agent-trace ${pending ? "is-pending" : ""}`} open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <span className="agent-trace-mark" aria-hidden="true"><i /><i /><i /></span>
-        <span>{pending ? "正在处理" : "处理过程"}</span>
+        <span>{english ? (pending ? "Processing" : "Activity") : (pending ? "正在处理" : "处理过程")}</span>
       </summary>
       <div className="agent-trace-list" role="list">
         {pending && !steps.length ? <div className="agent-trace-step is-status" role="listitem"><span className="agent-trace-node" aria-hidden="true" /><span className="typing" aria-hidden="true"><i /><i /><i /></span></div> : null}
@@ -795,12 +801,12 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
           </div>
         </div>
         <div ref={scrollRef} className="chat-scroll" aria-live="polite" aria-busy={busy} onScroll={(event) => { const el = event.currentTarget; stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120; }}>
-          {messages.length ? messages.map((message) => (
+          {messages.length ? messages.map((message, index) => (
             <article key={message.id} className={`message ${message.role === "user" ? "user" : ""} ${message.error ? "error" : ""}`}>
               <div className="message-avatar" aria-hidden="true">{message.role === "user" ? "你" : "N"}</div>
               <div className="message-body">
                 <div className="message-label">{message.role === "user" ? "你" : "Nianlun"}</div>
-                {message.role === "assistant" ? <AgentTraceDetails trace={message.trace} pending={Boolean(message.pending)} keepOpen={message.keepTraceOpen} /> : null}
+                {message.role === "assistant" ? <AgentTraceDetails trace={message.trace} pending={Boolean(message.pending)} keepOpen={message.keepTraceOpen} english={prefersEnglish(messages[index - 1]?.text || "")} /> : null}
                 {message.role === "user" || message.text || !message.pending ? <div className={`message-text ${message.streamTransitionName ? "is-stream-candidate" : ""}`} style={message.streamTransitionName ? { viewTransitionName: message.streamTransitionName } : undefined}>{message.role === "assistant" ? <MarkdownContent className="message-markdown" text={message.text} onCitationClick={message.sources?.length ? (citationId) => showCitation(message.sources || [], citationId) : undefined} /> : message.text}</div> : null}
                 {message.role === "assistant" && !message.pending && message.usage ? <div className="message-usage">{formatUsage(message.usage, message.ttft_ms)}</div> : null}
                 {message.role === "assistant" && !message.pending && message.tool_calls?.length ? <ToolCallDetails toolCalls={message.tool_calls} /> : null}

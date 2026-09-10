@@ -75,11 +75,11 @@ def _make_tool_call_message():
 
 
 def test_default_context_summarization_thresholds_are_conservative():
-    assert DEFAULT_SUMMARIZATION_TOKEN_TRIGGER == ("tokens", 64_000)
+    assert DEFAULT_SUMMARIZATION_TOKEN_TRIGGER == ("tokens", 102_400)
     assert DEFAULT_SUMMARIZATION_CONVERSATION_TURN_LIMIT == 16
-    assert DEFAULT_SUMMARIZATION_TRIGGER == [("tokens", 64_000)]
+    assert DEFAULT_SUMMARIZATION_TRIGGER == [("tokens", 102_400)]
     assert DEFAULT_SUMMARIZATION_KEEP_POLICY == ("messages", 16)
-    assert DEFAULT_SUMMARIZATION_HARD_LIMIT == 80_000
+    assert DEFAULT_SUMMARIZATION_HARD_LIMIT == 128_000
 
 
 def test_build_evidence_reference_index_keeps_location_without_body():

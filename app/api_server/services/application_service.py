@@ -115,18 +115,11 @@ class ApplicationService:
         knowledge_base = self.knowledge_base_lookup(request.knowledge_base_id)
         if knowledge_base.get("status") != "ready":
             raise ApiError("知识库当前不可绑定", status.HTTP_409_CONFLICT)
-        if not self.fts_enabled:
-            raise ApiError("API Server 未启用 FTS", status.HTTP_503_SERVICE_UNAVAILABLE)
-        content_version = int(knowledge_base.get("content_version", 0))
-        fts_revision = knowledge_base.get("fts_revision")
-        if (
-            knowledge_base.get("fts_status") != "ready"
-            or fts_revision is None
-            or int(fts_revision) != content_version
-            or not knowledge_base.get("fts_collection")
+        if not knowledge_base.get("snapshot_relpath") or not knowledge_base.get(
+            "snapshot_manifest_sha256"
         ):
             raise ApiError(
-                "知识库 FTS 索引尚未就绪，请先等待或触发索引构建",
+                "知识库 committed snapshot 尚未就绪",
                 status.HTTP_409_CONFLICT,
             )
         try:
@@ -256,7 +249,13 @@ class ApplicationService:
 
             config = KnowledgeBaseConfig(
                 workspace_dir=Path(knowledge_base["workspace_dir"]),
-                fts_enabled=True,
+                fts_enabled=self.fts_enabled,
+                fts_ready=(
+                    knowledge_base.get("fts_status") == "ready"
+                    and knowledge_base.get("fts_revision") is not None
+                    and int(knowledge_base["fts_revision"]) == content_version
+                    and bool(knowledge_base.get("fts_collection"))
+                ),
                 milvus_uri=self.milvus_uri,
                 milvus_token=self.milvus_token,
                 fts_collection=knowledge_base.get("fts_collection"),
@@ -268,6 +267,9 @@ class ApplicationService:
                 embedding_dim=embedding_dim,
                 embedding_base_url=embedding_base_url,
                 embedding_api_key=embedding_api_key,
+                snapshot_relpath=knowledge_base.get("snapshot_relpath"),
+                snapshot_manifest_sha256=knowledge_base.get("snapshot_manifest_sha256"),
+                content_version=content_version,
             )
             runtime = self.runtime_factory(
                 knowledge_base_config=config,

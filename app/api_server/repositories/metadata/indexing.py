@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Document, KnowledgeBase
@@ -16,18 +17,19 @@ class IndexStateRepositoryMixin:
     factory: SQLiteConnectionFactory
 
     def list_fts_dirty_documents(self, knowledge_base_id: str) -> list[str]:
-        """返回需要（重）建 FTS 记录的 ``status='ready'`` 文档 id（脏集）。
+        """返回需要（重）建 FTS 记录或删除远端记录的文档 id（脏集）。
 
         脏 = ``fts_indexed_version IS NULL``（见设计文档 §5.2）。非 ready 文档不参与
-        索引构建（其 ``<doc_id>.json`` 尚未就绪）。
+        索引构建（其 ``<doc_id>.json`` 尚未就绪）。已删除文档也会返回，供
+        增量构建从远端 collection 移除遗留记录。
         """
         with self.factory.session_scope() as session:
             rows = session.scalars(
                 select(Document.id)
                 .where(
                     Document.knowledge_base_id == knowledge_base_id,
-                    Document.status == "ready",
                     Document.fts_indexed_version.is_(None),
+                    Document.status.in_(("indexing", "ready", "deleted")),
                 )
                 .order_by(Document.created_at)
             ).all()
@@ -67,17 +69,18 @@ class IndexStateRepositoryMixin:
             )
 
     def list_vector_dirty_documents(self, knowledge_base_id: str) -> list[str]:
-        """返回需要（重）建向量记录的 ``status='ready'`` 文档 id（脏集）。
+        """返回需要（重）建向量记录或删除远端记录的文档 id（脏集）。
 
-        脏 = ``vector_indexed_version IS NULL``（见设计文档 §5.2）。
+        脏 = ``vector_indexed_version IS NULL``（见设计文档 §5.2）。已删除
+        文档也会返回，供增量构建清理其远端向量。
         """
         with self.factory.session_scope() as session:
             rows = session.scalars(
                 select(Document.id)
                 .where(
                     Document.knowledge_base_id == knowledge_base_id,
-                    Document.status == "ready",
                     Document.vector_indexed_version.is_(None),
+                    Document.status.in_(("indexing", "ready", "deleted")),
                 )
                 .order_by(Document.created_at)
             ).all()
@@ -184,6 +187,8 @@ class IndexStateRepositoryMixin:
         revision: int,
         collection_name: str,
         now: str,
+        *,
+        indexed_document_ids: list[str],
     ) -> bool:
         """Mark a build ready only when its revision is still current."""
         with self.factory.session_scope(write=True) as session:
@@ -193,7 +198,6 @@ class IndexStateRepositoryMixin:
             if knowledge_base.content_version != revision:
                 knowledge_base.fts_status = "pending"
                 knowledge_base.fts_target_revision = knowledge_base.content_version
-                knowledge_base.fts_collection = collection_name
                 knowledge_base.updated_at = now
                 return False
             knowledge_base.fts_status = "ready"
@@ -202,11 +206,32 @@ class IndexStateRepositoryMixin:
             knowledge_base.fts_collection = collection_name
             knowledge_base.fts_error = None
             knowledge_base.updated_at = now
+            session.execute(
+                update(Document)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    or_(
+                        Document.id.in_(indexed_document_ids),
+                        (
+                            Document.parsed_content_version.is_not(None)
+                            & (Document.parsed_content_version <= revision)
+                        ),
+                        (
+                            (Document.status == "deleted")
+                            & (Document.deleted_content_version.is_not(None))
+                            & (Document.deleted_content_version <= revision)
+                        ),
+                    ),
+                )
+                .values(fts_indexed_version=revision, updated_at=now)
+            )
+            self._reconcile_indexing_documents(session, knowledge_base, now)
             return True
 
     def advance_fts_revision_after_surgical_delete(
         self,
         knowledge_base_id: str,
+        document_id: str,
         revision: int,
         collection_name: str,
         now: str,
@@ -230,6 +255,16 @@ class IndexStateRepositoryMixin:
             knowledge_base.fts_collection = collection_name
             knowledge_base.fts_error = None
             knowledge_base.updated_at = now
+            session.execute(
+                update(Document)
+                .where(
+                    Document.id == document_id,
+                    Document.knowledge_base_id == knowledge_base_id,
+                    Document.status == "deleted",
+                    Document.deleted_content_version == revision,
+                )
+                .values(fts_indexed_version=revision, updated_at=now)
+            )
             return True
 
     def fail_fts_build(
@@ -253,6 +288,7 @@ class IndexStateRepositoryMixin:
                 knowledge_base.fts_target_revision = knowledge_base.content_version
                 knowledge_base.fts_error = error_message[:2_000]
                 knowledge_base.updated_at = now
+            self._reconcile_indexing_documents(session, knowledge_base, now)
 
     def disable_fts(self, knowledge_base_id: str, now: str) -> None:
         """Keep FTS metadata disabled when the server capability is off."""
@@ -383,6 +419,8 @@ class IndexStateRepositoryMixin:
         model_updated_at: str,
         dimension: int,
         now: str,
+        *,
+        indexed_document_ids: list[str],
     ) -> bool:
         with self.factory.session_scope(write=True) as session:
             knowledge_base = session.get(KnowledgeBase, knowledge_base_id)
@@ -416,11 +454,32 @@ class IndexStateRepositoryMixin:
                     knowledge_base.vector_documents_total
                 )
             knowledge_base.updated_at = now
+            session.execute(
+                update(Document)
+                .where(
+                    Document.knowledge_base_id == knowledge_base_id,
+                    or_(
+                        Document.id.in_(indexed_document_ids),
+                        (
+                            Document.parsed_content_version.is_not(None)
+                            & (Document.parsed_content_version <= revision)
+                        ),
+                        (
+                            (Document.status == "deleted")
+                            & (Document.deleted_content_version.is_not(None))
+                            & (Document.deleted_content_version <= revision)
+                        ),
+                    ),
+                )
+                .values(vector_indexed_version=revision, updated_at=now)
+            )
+            self._reconcile_indexing_documents(session, knowledge_base, now)
             return True
 
     def advance_vector_revision_after_surgical_delete(
         self,
         knowledge_base_id: str,
+        document_id: str,
         revision: int,
         collection_name: str,
         model_id: str,
@@ -455,6 +514,16 @@ class IndexStateRepositoryMixin:
             knowledge_base.vector_collection = collection_name
             knowledge_base.vector_error = None
             knowledge_base.updated_at = now
+            session.execute(
+                update(Document)
+                .where(
+                    Document.id == document_id,
+                    Document.knowledge_base_id == knowledge_base_id,
+                    Document.status == "deleted",
+                    Document.deleted_content_version == revision,
+                )
+                .values(vector_indexed_version=revision, updated_at=now)
+            )
             return True
 
     def fail_vector_build(
@@ -492,6 +561,51 @@ class IndexStateRepositoryMixin:
                 knowledge_base.vector_error = error_message[:2_000]
                 knowledge_base.vector_progress_stage = "queued"
             knowledge_base.updated_at = now
+            self._reconcile_indexing_documents(session, knowledge_base, now)
+
+    @staticmethod
+    def _reconcile_indexing_documents(
+        session: Any, knowledge_base: KnowledgeBase, now: str
+    ) -> None:
+        terminal = {"ready", "failed", "disabled"}
+        if (
+            knowledge_base.fts_status not in terminal
+            or knowledge_base.vector_status not in terminal
+        ):
+            return
+        warning_codes: list[str] = []
+        if knowledge_base.fts_status == "failed":
+            warning_codes.append("FTS_LOCAL_SCAN_FALLBACK")
+        if knowledge_base.vector_status == "failed":
+            warning_codes.append("VECTOR_INDEX_UNAVAILABLE")
+        documents = session.scalars(
+            select(Document).where(
+                Document.knowledge_base_id == knowledge_base.id,
+                Document.status == "indexing",
+                Document.parsed_content_version.is_not(None),
+                Document.parsed_content_version <= knowledge_base.content_version,
+            )
+        ).all()
+        for document in documents:
+            try:
+                warnings = json.loads(document.warning_json or "[]")
+            except (TypeError, ValueError):
+                warnings = []
+            if not isinstance(warnings, list):
+                warnings = []
+            existing_codes = {
+                item.get("warning_code") for item in warnings if isinstance(item, dict)
+            }
+            for code in warning_codes:
+                if code not in existing_codes:
+                    warnings.append({"warning_code": code})
+            document.warning_json = json.dumps(warnings, ensure_ascii=False)
+            document.status = "ready"
+            document.current_stage = "complete"
+            document.stage_state = "partial" if warnings else "succeeded"
+            document.progress_completed = document.progress_total
+            document.updated_at = now
+            document.completed_at = now
 
     def disable_vector(self, knowledge_base_id: str, now: str) -> None:
         self._update_vector(

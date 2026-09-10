@@ -82,7 +82,7 @@ export const api = {
   createApp: (body: { name: string; description: string; knowledge_base_id: string; llm_model_id: string }) => request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(body) }),
   deleteApp: (id: string) => request<null>(`/api/v1/apps/${encodeURIComponent(id)}`, { method: "DELETE" }),
   listKnowledgeBases: () => request<KnowledgeBase[]>("/api/v1/knowledge-bases"),
-  updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; heading_recovery_enabled?: boolean; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteKnowledgeBase: (id: string) => request<null>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "DELETE" }),
   listModels: (kind?: ModelKind) => request<ModelProfile[]>(`/api/v1/models${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`),
   createModel: (body: ModelProfileRequest) => request<ModelProfile>("/api/v1/models", { method: "POST", body: JSON.stringify(body) }),

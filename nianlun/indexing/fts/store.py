@@ -10,6 +10,7 @@ schema 为多记录单字段：``text``（BM25 输入，混合语言 analyzer）
 
 from __future__ import annotations
 
+import json
 import logging
 from enum import StrEnum
 from typing import Any, cast
@@ -179,11 +180,12 @@ class NodeFtsStore:
             dict[str, Any],
             self.client.describe_collection(self.collection, **call_options),
         )
-        fields = {
-            str(field.get("name"))
+        fields_by_name = {
+            str(field.get("name")): field
             for field in description.get("fields", [])
             if isinstance(field, dict)
         }
+        fields = set(fields_by_name)
         is_current = {
             "doc_id",
             "doc_name",
@@ -196,7 +198,21 @@ class NodeFtsStore:
             "node_summary",
             "node_summary_truncated",
         }.issubset(fields)
-        if is_current:
+        text_field = fields_by_name.get("text")
+        analyzer_params = (
+            text_field.get("params", {}).get("analyzer_params")
+            if isinstance(text_field, dict)
+            and isinstance(text_field.get("params"), dict)
+            else None
+        )
+        try:
+            has_current_analyzer = (
+                isinstance(analyzer_params, str)
+                and json.loads(analyzer_params) == get_fts_analyzer_params()
+            )
+        except json.JSONDecodeError:
+            has_current_analyzer = False
+        if is_current and has_current_analyzer:
             return CollectionSchemaStatus.CURRENT
         return CollectionSchemaStatus.OUTDATED
 

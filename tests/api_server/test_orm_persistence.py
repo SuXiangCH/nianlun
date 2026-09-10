@@ -12,7 +12,12 @@ from app.api_server.database import (
     initialize_database,
 )
 from app.api_server.database import migrations
-from app.api_server.database.models import Application, Conversation, KnowledgeBase
+from app.api_server.database.models import (
+    Application,
+    Conversation,
+    Document,
+    KnowledgeBase,
+)
 from app.api_server.repositories import SQLiteChatRepository, SQLiteMetadataRepository
 
 
@@ -64,6 +69,12 @@ def test_orm_models_cover_all_business_tables():
         "documents",
         "document_parse_tasks",
         "document_artifacts",
+        "knowledge_base_workspace_revisions",
+        "document_normalization_tasks",
+        "document_enrichment_tasks",
+        "document_enrichment_call_results",
+        "document_pipeline_events",
+        "document_staging_allocations",
     }
 
 
@@ -83,8 +94,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 2
-    assert versions == {2}
+    assert migrations.SCHEMA_VERSION == 7
+    assert versions == {7}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -96,8 +107,19 @@ def test_schema_initialization_records_current_version(tmp_path):
     finally:
         connection.close()
     assert "summary_enabled" in columns
+    assert "heading_recovery_enabled" in columns
     assert "vector_status" in columns
     assert "vector_progress_stage" in columns
+
+    connection = factory.connect()
+    try:
+        document_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(documents)")
+        }
+    finally:
+        connection.close()
+    assert "current_stage" in document_columns
+    assert "warning_json" in document_columns
 
     connection = factory.connect()
     try:
@@ -146,7 +168,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {2}
+    assert versions == {7}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -176,6 +198,9 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
     try:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute("ALTER TABLE messages DROP COLUMN trace_json")
+        connection.execute(
+            "ALTER TABLE knowledge_bases DROP COLUMN heading_recovery_enabled"
+        )
         connection.execute("DELETE FROM schema_migrations")
         connection.execute(
             "INSERT INTO schema_migrations(version, name, applied_at) "
@@ -191,6 +216,12 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
     assert messages is not None
     assert messages[1]["content"] == "旧数据库回答"
     assert messages[1]["trace"] == []
+    assert (
+        SQLiteMetadataRepository(factory).get("knowledge_bases", "kb-1")[
+            "heading_recovery_enabled"
+        ]
+        is True
+    )
     connection = factory.connect()
     try:
         versions = {
@@ -199,7 +230,282 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {2}
+    assert versions == {7}
+
+
+def test_schema_migration_replaces_document_hash_constraint_with_partial_index(
+    tmp_path,
+):
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    repository = SQLiteMetadataRepository(factory)
+    now = "2026-09-05T00:00:00+00:00"
+    repository.create_document(
+        {
+            "id": "doc-v5",
+            "knowledge_base_id": "kb-1",
+            "original_filename": "legacy.md",
+            "file_extension": ".md",
+            "mime_type": "text/markdown",
+            "size_bytes": 8,
+            "source_relpath": "sources/legacy.md",
+            "source_sha256": "same-hash",
+            "parser": "native_markdown",
+            "status": "ready",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    connection = factory.connect()
+    try:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("CREATE TABLE documents_v5 AS SELECT * FROM documents")
+        connection.execute("DROP TABLE documents")
+        connection.execute("ALTER TABLE documents_v5 RENAME TO documents")
+        connection.execute(
+            "CREATE UNIQUE INDEX uq_documents_kb_source_hash "
+            "ON documents(knowledge_base_id, source_sha256)"
+        )
+        connection.execute("DELETE FROM schema_migrations")
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) "
+            "VALUES (5, 'document_pipeline_v2', CURRENT_TIMESTAMP)"
+        )
+        connection.execute("COMMIT")
+        connection.execute("PRAGMA foreign_keys = ON")
+    finally:
+        connection.close()
+
+    initialize_database(factory)
+
+    connection = factory.connect()
+    try:
+        indexes = {
+            str(row[1]): bool(row[4])
+            for row in connection.execute('PRAGMA index_list("documents")')
+        }
+        foreign_key_violations = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    finally:
+        connection.close()
+    assert indexes["uq_documents_kb_source_hash"] is True
+    assert foreign_key_violations == []
+
+    with factory.session_scope(write=True) as session:
+        document = session.get(Document, "doc-v5")
+        assert document is not None
+        document.status = "deleted"
+        document.deleted_content_version = 1
+    created = repository.create_document(
+        {
+            "id": "doc-v6",
+            "knowledge_base_id": "kb-1",
+            "original_filename": "replacement.md",
+            "file_extension": ".md",
+            "mime_type": "text/markdown",
+            "size_bytes": 8,
+            "source_relpath": "sources/replacement.md",
+            "source_sha256": "same-hash",
+            "parser": "native_markdown",
+            "status": "uploaded",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    assert created["id"] == "doc-v6"
+
+
+def test_schema_migration_rebuilds_legacy_artifact_kind_constraint(tmp_path):
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    repository = SQLiteMetadataRepository(factory)
+    now = datetime.now(timezone.utc).isoformat()
+    repository.create_document(
+        {
+            "id": "doc-1",
+            "knowledge_base_id": "kb-1",
+            "original_filename": "doc.md",
+            "file_extension": ".md",
+            "mime_type": "text/markdown",
+            "size_bytes": 4,
+            "source_relpath": "sources/doc.md",
+            "source_sha256": "hash",
+            "parser": "native_markdown",
+            "status": "ready",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    connection = factory.connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DROP TABLE document_artifacts")
+        connection.execute(
+            """
+            CREATE TABLE document_artifacts (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                document_id VARCHAR NOT NULL,
+                kind VARCHAR NOT NULL,
+                relpath VARCHAR NOT NULL,
+                mime_type VARCHAR(256) NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                sha256 VARCHAR(64) NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                UNIQUE (document_id, kind, relpath),
+                CHECK (kind IN (
+                    'original', 'result_zip', 'full_markdown', 'content_list',
+                    'layout', 'model', 'asset'
+                )),
+                CHECK (size_bytes >= 0),
+                FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO document_artifacts (
+                id, document_id, kind, relpath, mime_type, size_bytes, sha256,
+                created_at
+            ) VALUES ('artifact-old', 'doc-1', 'original', 'sources/doc.md',
+                      'text/markdown', 4, 'old-hash', ?)
+            """,
+            (now,),
+        )
+        connection.execute("DELETE FROM schema_migrations")
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) "
+            "VALUES (3, 'legacy_artifact_constraint', CURRENT_TIMESTAMP)"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(factory)
+
+    migrated = SQLiteMetadataRepository(factory)
+    assert migrated.list_document_artifacts("doc-1")[0]["kind"] == "original"
+    created = migrated.put_document_artifact(
+        {
+            "document_id": "doc-1",
+            "kind": "tree",
+            "relpath": "artifacts/doc-1/g1/enriched/tree.json",
+            "mime_type": "application/json",
+            "size_bytes": 2,
+            "sha256": "new-hash",
+            "pipeline_generation": 1,
+            "created_at": now,
+        }
+    )
+    assert created["kind"] == "tree"
+
+
+def test_schema_migration_preserves_v4_parse_tasks(tmp_path):
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    repository = SQLiteMetadataRepository(factory)
+    now = "2026-09-05T00:00:00+00:00"
+    repository.create_document(
+        {
+            "id": "doc-v4",
+            "knowledge_base_id": "kb-1",
+            "original_filename": "legacy.pdf",
+            "file_extension": ".pdf",
+            "mime_type": "application/pdf",
+            "size_bytes": 8,
+            "source_relpath": "sources/legacy.pdf",
+            "source_sha256": "source-hash",
+            "parser": "mineru",
+            "status": "parsing",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    repository.create_parse_task(
+        {
+            "id": "task-v4",
+            "document_id": "doc-v4",
+            "attempt": 2,
+            "data_id": "doc-v4",
+            "batch_id": "batch-v4",
+            "api_mode": "saas_precision",
+            "model_version": "vlm",
+            "request_json": "{}",
+            "state": "running",
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    connection = factory.connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("DROP INDEX idx_document_parse_tasks_polling")
+        connection.execute("DROP INDEX idx_document_parse_tasks_batch")
+        connection.execute(
+            "ALTER TABLE document_parse_tasks RENAME TO document_parse_tasks_v5"
+        )
+        connection.execute(
+            """
+            CREATE TABLE document_parse_tasks (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                document_id VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                api_mode VARCHAR NOT NULL,
+                attempt INTEGER NOT NULL,
+                data_id VARCHAR NOT NULL,
+                batch_id VARCHAR NULL,
+                task_id VARCHAR NULL,
+                model_version VARCHAR NOT NULL,
+                request_json TEXT NOT NULL,
+                state VARCHAR NOT NULL,
+                extracted_pages INTEGER NULL,
+                total_pages INTEGER NULL,
+                result_zip_url VARCHAR NULL,
+                error_code VARCHAR NULL,
+                error_message TEXT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
+                started_at VARCHAR(64) NULL,
+                completed_at VARCHAR(64) NULL,
+                UNIQUE (document_id, attempt),
+                UNIQUE (provider, data_id, attempt),
+                FOREIGN KEY(document_id) REFERENCES documents (id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO document_parse_tasks
+            SELECT id, document_id, provider, api_mode, attempt, data_id,
+                   batch_id, task_id, model_version, request_json, state,
+                   extracted_pages, total_pages, result_zip_url, error_code,
+                   error_message, created_at, updated_at, started_at, completed_at
+            FROM document_parse_tasks_v5
+            """
+        )
+        connection.execute("DROP TABLE document_parse_tasks_v5")
+        connection.execute("DELETE FROM schema_migrations")
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) "
+            "VALUES (4, 'workspace_revisions', CURRENT_TIMESTAMP)"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(factory)
+
+    task = repository.get_parse_task("task-v4")
+    assert task is not None
+    assert task["attempt"] == 2
+    assert task["batch_id"] == "batch-v4"
+    assert task["state"] == "running"
+    assert task["pipeline_generation"] == 1
+    assert task["chunk_index"] == 0
+    assert task["chunk_count"] == 1
+    assert task["input_sha256"] == "source-hash"
+    assert task["dispatch_state"] == "waiting"
 
 
 def test_knowledge_base_settings_update_preserves_concurrent_index_state(tmp_path):

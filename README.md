@@ -37,7 +37,7 @@ cp .env.example .env   # CLI 问答需填 OPENAI_API_KEY；纯 Web 端可跳过�
 - Agent 默认模型：`deepseek-v4-flash-0731`（`OPENAI_MODEL` 可覆盖）
 - 默认搜索模式：Milvus FTS；Milvus 不可用时自动降级为本地扫描
 - 索引产物写入 `data/workspaces/default/`（运行时生成，`data/` 不提交）
-- Milvus FTS 默认 collection：读取 `MILVUS_NODE_FTS_COLLECTION`；API Server 以 SQLite 中记录的 collection 为准
+- Milvus FTS 默认 collection：读取 `MILVUS_NODE_FTS_COLLECTION`；API Server 以 SQLite 中记录的 collection 为准。中英文文本通过 `MILVUS_LANGUAGE_IDENTIFIER=lingua` 分析；可显式切换为 `whatlang`。
 
 ## 使用方法
 

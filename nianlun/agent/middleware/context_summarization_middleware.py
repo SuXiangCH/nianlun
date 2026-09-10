@@ -26,8 +26,8 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from nianlun.agent.token_estimation import estimate_tokens
 
-DEFAULT_SUMMARIZATION_TOKEN_TRIGGER = ("tokens", 64_000)
-"""默认在会话历史达到约 64K token 时触发摘要。"""
+DEFAULT_SUMMARIZATION_TOKEN_TRIGGER = ("tokens", 102_400)
+"""默认在会话历史达到约 102.4K token 时触发摘要。"""
 
 DEFAULT_SUMMARIZATION_CONVERSATION_TURN_LIMIT = 16
 """默认在累计 16 轮用户-Agent 对话时触发摘要。"""
@@ -35,9 +35,9 @@ DEFAULT_SUMMARIZATION_CONVERSATION_TURN_LIMIT = 16
 DEFAULT_SUMMARIZATION_TRIGGER = [
     DEFAULT_SUMMARIZATION_TOKEN_TRIGGER,
 ]
-"""默认按 64K token 触发；真实用户轮次由 middleware 单独统计。"""
+"""默认按 102.4K token 触发；真实用户轮次由 middleware 单独统计。"""
 
-DEFAULT_SUMMARIZATION_HARD_LIMIT = 80_000
+DEFAULT_SUMMARIZATION_HARD_LIMIT = 128_000
 """达到该 token 数时跳过摘要模型，直接使用确定性来源索引兜底。"""
 
 DEFAULT_SUMMARIZATION_KEEP_POLICY = ("messages", 16)

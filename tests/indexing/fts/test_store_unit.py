@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
+from nianlun.indexing.fts.config import get_fts_analyzer_params
 from nianlun.indexing.fts.store import CollectionSchemaStatus, NodeFtsStore
 
 
@@ -20,9 +22,16 @@ CURRENT_FIELDS = [
 
 
 class _SchemaClient:
-    def __init__(self, fields: list[str], *, exists: bool = True) -> None:
+    def __init__(
+        self,
+        fields: list[str],
+        *,
+        exists: bool = True,
+        analyzer_params: dict[str, object] | None = None,
+    ) -> None:
         self.fields = fields
         self.exists = exists
+        self.analyzer_params = analyzer_params or get_fts_analyzer_params()
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def has_collection(self, collection: str, **kwargs: Any) -> bool:
@@ -31,7 +40,23 @@ class _SchemaClient:
 
     def describe_collection(self, collection: str, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("describe_collection", collection, kwargs))
-        return {"fields": [{"name": field} for field in self.fields]}
+        return {
+            "fields": [
+                {
+                    "name": field,
+                    **(
+                        {
+                            "params": {
+                                "analyzer_params": json.dumps(self.analyzer_params)
+                            }
+                        }
+                        if field == "text"
+                        else {}
+                    ),
+                }
+                for field in self.fields
+            ]
+        }
 
 
 def _store(client: _SchemaClient) -> NodeFtsStore:
@@ -66,3 +91,12 @@ def test_has_current_schema_rejects_collection_without_summary_metadata() -> Non
     store = _store(client)
     assert store.schema_status() is CollectionSchemaStatus.OUTDATED
     assert store.has_current_schema() is False
+
+
+def test_has_current_schema_rejects_collection_with_an_old_analyzer() -> None:
+    client = _SchemaClient(
+        CURRENT_FIELDS,
+        analyzer_params={"tokenizer": {"type": "jieba", "mode": "search"}},
+    )
+
+    assert _store(client).schema_status() is CollectionSchemaStatus.OUTDATED

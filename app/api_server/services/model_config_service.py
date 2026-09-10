@@ -22,6 +22,10 @@ from nianlun.models.embedding import build_embeddings_model
 from nianlun.models.llm import build_chat_model
 
 
+DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 128_000
+"""Fallback input window for catalog LLM profiles without an explicit value."""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -470,7 +474,7 @@ class ModelConfigService:
             False,
             None,
             None,
-            llm.get("context_window_tokens"),
+            llm.get("context_window_tokens") or DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
         )
 
 

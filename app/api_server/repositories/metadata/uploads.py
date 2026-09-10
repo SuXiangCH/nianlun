@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import select
+
 from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Document, KnowledgeBase, UploadOperation
 
@@ -24,6 +26,21 @@ class UploadOperationRepositoryMixin:
                     "idempotency_key": idempotency_key,
                 },
             )
+            return _upload_dict(item) if item is not None else None
+
+    def get_upload_by_document(
+        self, knowledge_base_id: str, document_id: str
+    ) -> dict[str, Any] | None:
+        with self.factory.session_scope() as session:
+            item = session.scalars(
+                select(UploadOperation)
+                .where(
+                    UploadOperation.knowledge_base_id == knowledge_base_id,
+                    UploadOperation.document_id == document_id,
+                )
+                .order_by(UploadOperation.created_at.desc())
+                .limit(1)
+            ).first()
             return _upload_dict(item) if item is not None else None
 
     def start_upload(

@@ -241,9 +241,18 @@ def _seed_vector_doc(
 class _FakeVecClient:
     def __init__(self, *, exists: bool) -> None:
         self.exists = exists
+        self.collections = {"vec-coll"} if exists else set()
+        self.dropped: list[str] = []
 
-    def has_collection(self, _name: str) -> bool:
-        return self.exists
+    def has_collection(self, name: str) -> bool:
+        return name in self.collections
+
+    def drop_collection(self, name: str) -> None:
+        self.dropped.append(name)
+        self.collections.discard(name)
+
+    def list_collections(self) -> list[str]:
+        return sorted(self.collections)
 
 
 class _FakeVecStore:
@@ -301,12 +310,14 @@ def _run_vector_service(
 
     def fake_build(_workspace, **kwargs: object) -> object:
         captured["kwargs"] = kwargs
+        _FakeVecStore._client.collections.add(str(kwargs["collection_name"]))
         return object()
 
     monkeypatch.setattr(
         "app.api_server.services.vector_index_service.build_doc_vectors", fake_build
     )
     _FakeVecStore._client = _FakeVecClient(exists=collection_exists)
+    captured["client"] = _FakeVecStore._client
     monkeypatch.setattr(
         "app.api_server.services.vector_index_service.DocVectorStore", _FakeVecStore
     )
@@ -382,12 +393,31 @@ def test_vector_model_change_triggers_full_rebuild(tmp_path: Path, monkeypatch) 
     )
 
     assert captured["kwargs"]["force"] is True
+    assert str(captured["kwargs"]["collection_name"]).startswith("vec-coll__build_r5_")
+    assert captured["client"].dropped == []
     # 模型变更全量后两篇都重写并置干净。
     assert repository.get_document("kb-1", "doc-1")["vector_indexed_version"] == 5
     assert repository.get_document("kb-1", "doc-2")["vector_indexed_version"] == 5
     item = repository.get("knowledge_bases", "kb-1")
     assert item["vector_status"] == "ready"
     assert item["vector_revision"] == 5
+    assert item["vector_collection"] == captured["kwargs"]["collection_name"]
+
+    cleanup_service = VectorIndexService(
+        repository,
+        lambda _id: {
+            **(repository.get("knowledge_bases", "kb-1") or {}),
+            "workspace_dir": str(workspace),
+        },
+        lambda _profile_id: changed_config,
+        _make_vec_settings(tmp_path),
+    )
+    try:
+        cleanup_service._cleanup_orphan_collections()  # pyright: ignore[reportPrivateUsage]
+    finally:
+        cleanup_service.shutdown()
+    assert captured["client"].dropped == ["vec-coll"]
+    assert item["vector_collection"] in captured["client"].collections
 
 
 def test_vector_empty_dirty_set_finishes_without_build(
