@@ -42,6 +42,11 @@ from nianlun.agent.middleware.retrieval_deduplication_middleware import (
     RetrievalDeduplicationMiddleware,
     deduplicate_retrieval_result,
 )
+from nianlun.agent.middleware.request_cancellation_middleware import (
+    AgentRequestCancelled,
+    RequestCancellationMiddleware,
+    raise_if_cancelled,
+)
 from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
     AgentLoopGuardConfig,
     DEFAULT_PER_TOOL_HARD_LIMITS,
@@ -58,6 +63,7 @@ from nianlun.agent.middleware.tool_error_handling_middleware import (
 )
 
 __all__ = [
+    "AgentRequestCancelled",
     "CLARIFICATION_EVENT_DUPLICATE",
     "CLARIFICATION_EVENT_REQUESTED",
     "CLARIFICATION_STATUS_WAITING",
@@ -89,12 +95,14 @@ __all__ = [
     "RETRIEVAL_DEDUPLICATION_TOOL_NAMES",
     "RetrievalDeduplicationMiddleware",
     "RetrievalLoopGuardMiddleware",
+    "RequestCancellationMiddleware",
     "ToolErrorHandlingMiddleware",
     "build_evidence_reference_index",
     "classify_tool_execution_exception",
     "deduplicate_retrieval_result",
     "find_missing_tool_results_for_model_tool_calls",
     "repair_missing_tool_results_for_model_tool_calls",
+    "raise_if_cancelled",
     "snapshot_loop_guard",
     "tool_call_fingerprint",
 ]

@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+import threading
 from typing import Any
 
-from nianlun.agent.contracts import AgentRequestContext, KnowledgeBasePort
+from nianlun.agent.contracts import AgentRequestContext, AgentVersion, KnowledgeBasePort
 from nianlun.agent.lead_agent.runner import (
     AgentRequestContextFactory,
     AgentRunner,
@@ -27,6 +28,7 @@ class AgentRuntime:
     runner: AgentRunner
     model: str
     effective_url: str
+    agent_version: AgentVersion
 
     def __init__(
         self,
@@ -37,6 +39,7 @@ class AgentRuntime:
         tool_logging: bool,
         kb: KnowledgeBasePort,
         recursion_limit: int = 192,
+        agent_version: AgentVersion = "v0",
     ) -> None:
         self.runner = AgentRunner(
             agent=agent,
@@ -45,9 +48,11 @@ class AgentRuntime:
                 tool_logging=tool_logging,
             ),
             recursion_limit=recursion_limit,
+            agent_version=agent_version,
         )
         self.model = model
         self.effective_url = effective_url
+        self.agent_version = agent_version
 
     @property
     def agent(self) -> Any:
@@ -96,11 +101,13 @@ class AgentRuntime:
         thread_id: str = "default",
         *,
         clarification_enabled: bool = False,
+        cancellation_event: threading.Event | None = None,
     ) -> Iterator[dict[str, Any]]:
         return self.runner.iter_events(
             user_query,
             thread_id=thread_id,
             clarification_enabled=clarification_enabled,
+            cancellation_event=cancellation_event,
         )
 
 
@@ -132,11 +139,13 @@ def iter_agent_stream_events(
     thread_id: str = "default",
     *,
     clarification_enabled: bool = False,
+    cancellation_event: threading.Event | None = None,
 ) -> Iterator[dict[str, Any]]:
     yield from runtime.iter_events(
         user_query,
         thread_id=thread_id,
         clarification_enabled=clarification_enabled,
+        cancellation_event=cancellation_event,
     )
 
 

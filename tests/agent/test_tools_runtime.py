@@ -374,6 +374,11 @@ def test_runtime_factory_rejects_ambiguous_knowledge_base_sources():
         )
 
 
+def test_runtime_factory_rejects_unknown_agent_version():
+    with pytest.raises(ValueError, match="不支持的 Agent 版本"):
+        AgentRuntimeFactory(agent_version="v2")  # type: ignore[arg-type]
+
+
 def test_retrieval_collector_copies_doc_name_into_snippets():
     collector = RetrievalCollector()
     result = json.dumps(

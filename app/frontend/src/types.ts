@@ -1,5 +1,6 @@
 export type View = "chat" | "knowledge" | "applications" | "models";
 export type KnowledgeBaseStatus = "creating" | "ready" | "indexing" | "error";
+export type AgentVersion = "v0" | "v1";
 
 export interface Application {
   id: string;
@@ -8,6 +9,7 @@ export interface Application {
   knowledge_base_id: string;
   llm_model_id: string | null;
   provider: string;
+  agent_version: AgentVersion;
   /** Legacy API field retained for reading existing applications. */
   search_mode: "scan" | "fts";
   created_at: string;

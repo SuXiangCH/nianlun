@@ -114,6 +114,9 @@ class Application(Base):
             "length(trim(name)) > 0", name="ck_applications_name_not_blank"
         ),
         CheckConstraint("search_mode = 'fts'", name="ck_applications_search_mode"),
+        CheckConstraint(
+            "agent_version IN ('v0', 'v1')", name="ck_applications_agent_version"
+        ),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -127,6 +130,7 @@ class Application(Base):
     provider: Mapped[str] = mapped_column(String, nullable=False, default="default")
     search_mode: Mapped[str] = mapped_column(String, nullable=False, default="fts")
     config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    agent_version: Mapped[str] = mapped_column(String(8), nullable=False, default="v0")
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
 

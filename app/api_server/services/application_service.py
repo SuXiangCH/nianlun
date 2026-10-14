@@ -94,6 +94,7 @@ class ApplicationService:
         fields = ApplicationResponse.model_fields
         payload = {key: item[key] for key in fields if key in item}
         payload["llm_model_id"] = item.get("model")
+        payload["agent_version"] = item.get("agent_version", "v0")
         return ApplicationResponse.model_validate(payload)
 
     def list(self) -> list[ApplicationResponse]:
@@ -151,6 +152,7 @@ class ApplicationService:
             "provider": request.provider,
             "search_mode": "fts",
             "config_version": 1,
+            "agent_version": request.agent_version,
             "created_at": timestamp.isoformat(),
             "updated_at": timestamp.isoformat(),
         }
@@ -279,6 +281,7 @@ class ApplicationService:
                 context_window_tokens=context_window_tokens,
                 allow_env_fallback=False,
                 tool_logging=False,
+                agent_version=item.get("agent_version", "v0"),
             )
             runtime_kb = getattr(runtime, "kb", None)
             if vector_enabled and runtime_kb is not None and not runtime_kb.has_vector:
@@ -312,6 +315,7 @@ class ApplicationService:
             application.get("provider"),
             application.get("model"),
             application.get("config_version"),
+            application.get("agent_version", "v0"),
             knowledge_base.get("content_version"),
             knowledge_base.get("fts_status"),
             knowledge_base.get("fts_revision"),

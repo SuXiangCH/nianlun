@@ -14,6 +14,7 @@ const application: Application = {
   knowledge_base_id: "kb-1",
   llm_model_id: "llm-1",
   provider: "default",
+  agent_version: "v0",
   search_mode: "scan",
   created_at: "",
   updated_at: "",
