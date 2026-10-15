@@ -89,6 +89,98 @@ def test_slice_empty_untitled_document():
     assert slice_node_text([], ["", "  "]) == []
 
 
+def test_slice_titled_document_preserves_preamble_and_heading_boundaries():
+    lines = [
+        "<table><tr><td>版本记录</td></tr></table>",
+        "编制：张三",
+        "",
+        "# 目录",
+        "目录正文",
+        "## 第一章",
+        "章节正文",
+    ]
+    headings = [
+        {"title": "目录", "level": 1, "line_num": 4},
+        {"title": "第一章", "level": 2, "line_num": 6},
+    ]
+
+    nodes = slice_node_text(headings, lines)
+
+    assert [(node["title"], node["line_num"], node["text"]) for node in nodes] == [
+        ("无标题", 1, "<table><tr><td>版本记录</td></tr></table>\n编制：张三"),
+        ("目录", 4, "# 目录\n目录正文"),
+        ("第一章", 6, "## 第一章\n章节正文"),
+    ]
+    tree = build_tree(nodes)
+    assert [node["title"] for node in tree] == ["无标题", "目录"]
+    assert tree[1]["nodes"][0]["title"] == "第一章"
+
+
+def test_slice_titled_document_ignores_whitespace_only_preamble():
+    nodes = slice_node_text(
+        [{"title": "标题", "level": 1, "line_num": 3}],
+        ["", "  ", "# 标题", "正文"],
+    )
+
+    assert [(node["title"], node["line_num"], node["text"]) for node in nodes] == [
+        ("标题", 3, "# 标题\n正文")
+    ]
+
+
+def test_slice_titled_document_preamble_starts_at_first_content_line():
+    nodes = slice_node_text(
+        [{"title": "标题", "level": 1, "line_num": 4}],
+        ["", "", "封面信息", "# 标题"],
+    )
+
+    assert nodes[0]["line_num"] == 3
+    assert nodes[0]["text"] == "封面信息"
+    assert nodes[1]["line_num"] == 4
+
+
+def test_preamble_does_not_parent_first_level_two_heading():
+    nodes = slice_node_text(
+        [{"title": "章节", "level": 2, "line_num": 2}],
+        ["封面信息", "## 章节", "正文"],
+    )
+
+    assert [node["title"] for node in build_tree(nodes)] == ["无标题", "章节"]
+
+
+def test_titled_preamble_chunks_are_kept_by_search_indexes():
+    preamble = "封面与版本记录。" * 1_100
+    content = f"{preamble}\n# 正文\n章节内容。"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        md_path = Path(temp_dir) / "titled.md"
+        md_path.write_text(content, encoding="utf-8")
+        result = build_md_index_sync(
+            str(md_path),
+            add_node_summary=False,
+            add_node_text=True,
+            max_titled_node_tokens=None,
+        )
+
+    tree = result["structure"]
+    assert len(tree) > 2
+    assert all(node["title"] == "无标题" for node in tree[:-1])
+    assert all(len(node["text"]) <= 4_000 for node in tree[:-1])
+    assert "".join(node["text"] for node in tree[:-1]) == preamble
+    assert tree[-1]["text"] == "# 正文\n章节内容。"
+    doc = {"id": "titled", "doc_name": "titled.md", "structure": tree}
+    fts_texts = [
+        record["text"]
+        for record in build_fts_records(doc)
+        if record["source_type"] == FTS_NODE_TEXT
+    ]
+    vector_texts = [
+        record["embed_text"]
+        for record in build_vector_records(doc)
+        if record["source_type"] == VECTOR_NODE_TEXT
+    ]
+    assert fts_texts == [node["text"] for node in tree]
+    assert vector_texts == fts_texts
+
+
 class _StubPlannerLLM:
     """无标题规划器 mock：classify 恒 single_topic；bridge 按 ``merge`` 决定合并或保留边界。"""
 
