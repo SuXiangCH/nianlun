@@ -47,7 +47,7 @@ def slice_node_text(headings: list[dict], lines: list[str]) -> list[dict]:
     """按 ``line_num`` 切原始源码行，附 ``text``。
 
     ``level`` 已在 parser 算好，无需二次正则。切片规则 ``[本标题行, 下一标题行)``
-    （文档顺序，不看层级）。
+    （文档顺序，不看层级）。首个标题前的正文生成顶层无标题节点。
 
     无标题文档按源码行切成有限大小的顶层兜底节点，避免整篇长文只产生一个超大
     节点，导致向量/全文索引截断正文。每个兜底节点仍从真实源码行开始定位。
@@ -55,18 +55,27 @@ def slice_node_text(headings: list[dict], lines: list[str]) -> list[dict]:
     if not headings:
         return _slice_untitled_text(lines)
 
-    all_nodes = [
+    preamble_lines = lines[: headings[0]["line_num"] - 1]
+    first_content_line = next(
+        (i for i, line in enumerate(preamble_lines) if line.strip()),
+        len(preamble_lines),
+    )
+    preamble_nodes = _slice_untitled_text(preamble_lines[first_content_line:])
+    for node in preamble_nodes:
+        node["line_num"] += first_content_line
+        node["level"] = headings[0]["level"]
+    heading_nodes = [
         {"title": h["title"], "line_num": h["line_num"], "level": h["level"]}
         for h in headings
     ]
-    for i, node in enumerate(all_nodes):
+    for i, node in enumerate(heading_nodes):
         start_line = node["line_num"] - 1
-        if i + 1 < len(all_nodes):
-            end_line = all_nodes[i + 1]["line_num"] - 1
+        if i + 1 < len(heading_nodes):
+            end_line = heading_nodes[i + 1]["line_num"] - 1
         else:
             end_line = len(lines)
         node["text"] = "\n".join(lines[start_line:end_line]).strip()
-    return all_nodes
+    return preamble_nodes + heading_nodes
 
 
 def _slice_untitled_text(lines: list[str]) -> list[dict]:
