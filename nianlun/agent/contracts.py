@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any, NotRequired, Protocol, TypedDict
+from typing import Any, Literal, NotRequired, Protocol, TypedDict
 
 AGENT_TOOL_SCHEMA_VERSION = 4
+AgentVersion = Literal["v0", "v1"]
+
+
+class RetrievedSnippet(TypedDict):
+    """现有 collector、运行结果与回答节点共享的检索片段格式。"""
+
+    citation_id: int
+    doc_id: Any
+    doc_name: Any
+    line_spec: Any
+    node_id: Any
+    title: str
+    line_num: Any
+    text: str
+    char_offset: Any
+    char_limit: Any
+    total_chars: Any
+    text_truncated: bool
 
 
 class KnowledgeBasePort(Protocol):
@@ -69,12 +87,15 @@ class AgentRequestContext(TypedDict):
     retrieval_deduplication_state: Any
     loop_guard_state: NotRequired[Any]
     status_sink: NotRequired[Any]
+    cancellation_event: NotRequired[Any]
 
 
 __all__ = [
     "AGENT_TOOL_SCHEMA_VERSION",
+    "AgentVersion",
     "AgentRequestContext",
     "AgentStatusSinkPort",
     "KnowledgeBasePort",
+    "RetrievedSnippet",
     "RetrievalCollectorPort",
 ]

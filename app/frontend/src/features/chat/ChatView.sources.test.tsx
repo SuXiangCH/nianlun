@@ -13,6 +13,7 @@ const application: Application = {
   knowledge_base_id: "kb-1",
   llm_model_id: "llm-1",
   provider: "default",
+  agent_version: "v0",
   search_mode: "scan",
   created_at: "",
   updated_at: "",
@@ -91,6 +92,69 @@ describe("ChatView retrieval snippets", () => {
 
     expect(container.querySelector("#citation-4")?.classList.contains("is-citation-active")).toBe(true);
     expect(container.querySelector("#citation-4 .source-toggle")?.textContent).toBe("收起片段");
+  });
+
+  it("matches citation semantics for tables, code, and math", () => {
+    const source = { id: "source-1", message_id: "assistant-1", citation_id: 4, title: "产品文档", text: "引用正文" };
+    localStorage.setItem(`nianlun.chat.${application.id}.conversation-1`, JSON.stringify({
+      messages: [{
+        id: "assistant-1",
+        role: "assistant",
+        text: "```html\n<table><tr><td>values[0]</td></tr></table>\n```\n\n$$\nx[0]\n\ny[2]\n$$\n\n未闭合公式 $$x[999]$。<table><tr><td>结论 [4]</td></tr></table>",
+        sources: [source],
+      }],
+      sources: [source],
+    }));
+    act(() => {
+      root.render(
+        <ChatView
+          apps={[application]}
+          selectedAppId={application.id}
+          onSelectApp={() => undefined}
+          onNewConversation={() => undefined}
+          resetToken={0}
+          conversationId="conversation-1"
+          onConversationId={() => undefined}
+          toast={() => undefined}
+        />,
+      );
+    });
+
+    const citations = container.querySelectorAll("a.citation-link");
+    expect(Array.from(citations, (citation) => citation.textContent)).toEqual(["[999]", "[4]"]);
+    expect(container.querySelectorAll(".katex")).toHaveLength(1);
+    expect(container.querySelector(".katex")?.textContent).toContain("x[0]");
+    expect(container.querySelector(".katex")?.textContent).toContain("y[2]");
+  });
+
+  it("keeps math within GFM cells and repairs omitted HTML cell tags", () => {
+    const source = { id: "source-1", message_id: "assistant-1", citation_id: 4, title: "产品文档", text: "引用正文" };
+    localStorage.setItem(`nianlun.chat.${application.id}.conversation-1`, JSON.stringify({
+      messages: [{
+        id: "assistant-1",
+        role: "assistant",
+        text: "| 价格 | 说明 |\n| --- | --- |\n| $100 | 未支持 [998] $200 |\n\n<table><tr><td>营收<td>100 [997]</table>\n\n说明见 [4]。",
+        sources: [source],
+      }],
+      sources: [source],
+    }));
+    act(() => {
+      root.render(
+        <ChatView
+          apps={[application]}
+          selectedAppId={application.id}
+          onSelectApp={() => undefined}
+          onNewConversation={() => undefined}
+          resetToken={0}
+          conversationId="conversation-1"
+          onConversationId={() => undefined}
+          toast={() => undefined}
+        />,
+      );
+    });
+
+    const citations = container.querySelectorAll("a.citation-link");
+    expect(Array.from(citations, (citation) => citation.textContent)).toEqual(["[998]", "[997]", "[4]"]);
   });
 
   it("renders HTML tables as Markdown tables", () => {

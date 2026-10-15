@@ -23,16 +23,17 @@ const application: Application = {
   knowledge_base_id: "kb-1",
   llm_model_id: "llm-1",
   provider: "default",
+  agent_version: "v0",
   search_mode: "scan",
   created_at: "",
   updated_at: "",
 };
 
-function ChatHarness({ initialConversationId }: { initialConversationId: string }) {
+function ChatHarness({ initialConversationId, agentVersion = "v0" }: { initialConversationId: string; agentVersion?: Application["agent_version"] }) {
   const [conversationId, setConversationId] = useState(initialConversationId);
   return (
     <ChatView
-      apps={[application]}
+      apps={[{ ...application, agent_version: agentVersion }]}
       selectedAppId={application.id}
       onSelectApp={() => undefined}
       onNewConversation={() => undefined}
@@ -235,6 +236,46 @@ describe("ChatView tool-call details", () => {
     expect(completedTrace?.open).toBe(true);
     expect(completedTrace?.classList.contains("is-pending")).toBe(false);
     expect(completedAnswer?.textContent).toBe("最终答案");
+  });
+
+  it("accumulates v1 answer chunks before done and accepts a final replacement", async () => {
+    const { parseSse } = await import("../../api/sse");
+    const { api } = await import("../../api/client");
+    let releaseSecond!: () => void;
+    let releaseDone!: () => void;
+    const second = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const done = new Promise<void>((resolve) => { releaseDone = resolve; });
+    vi.mocked(api.chat).mockResolvedValue({ ok: true } as Response);
+    vi.mocked(parseSse).mockImplementation(async function* () {
+      yield { event: "message", data: { delta: "营收", phase: "candidate", round: 1 } };
+      await second;
+      yield { event: "message", data: { delta: "为100亿元", phase: "candidate", round: 1 } };
+      await done;
+      yield { event: "message", data: { delta: "营收为100亿元。", phase: "answer" } };
+      yield { event: "done", data: { answer: "营收为100亿元。", route: "retrieval", retrieved_snippets: [], trace: [], tool_calls: [] } };
+    });
+    act(() => root.render(<ChatHarness initialConversationId="v1-live" agentVersion="v1" />));
+    const answer = () => container.querySelector(".message:not(.user) .message-text")?.textContent;
+    try {
+      await act(async () => {
+        container.querySelector<HTMLTextAreaElement>('textarea[name="message"]')!.value = "查营收";
+        container.querySelector<HTMLFormElement>("form.composer")!.requestSubmit();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(answer()).toBe("营收");
+      await act(async () => {
+        releaseSecond();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(answer()).toBe("营收为100亿元");
+    } finally {
+      await act(async () => {
+        releaseSecond();
+        releaseDone();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+    }
+    expect(answer()).toBe("营收为100亿元。");
   });
 
   it("renders details from server-persisted history without localStorage", async () => {

@@ -8,7 +8,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -20,7 +20,7 @@ def _record_current_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO schema_migrations(version, name, applied_at)
-        VALUES (?, 'parse_chunk_plan', CURRENT_TIMESTAMP)
+        VALUES (?, 'application_agent_version', CURRENT_TIMESTAMP)
         """,
         (SCHEMA_VERSION,),
     )
@@ -368,6 +368,18 @@ def _migrate_parse_chunk_plan(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE documents ADD COLUMN parse_plan_json TEXT NULL")
 
 
+def _migrate_application_agent_version(connection: sqlite3.Connection) -> None:
+    """v7 -> v8: persist the runtime architecture selected at app creation."""
+    columns = {
+        str(row[1]) for row in connection.execute('PRAGMA table_info("applications")')
+    }
+    if "agent_version" not in columns:
+        connection.execute(
+            "ALTER TABLE applications "
+            "ADD COLUMN agent_version VARCHAR(8) NOT NULL DEFAULT 'v0'"
+        )
+
+
 def _rebuild_document_artifacts_for_v2_kinds(
     connection: sqlite3.Connection,
 ) -> None:
@@ -485,6 +497,7 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
         _migrate_document_pipeline(connection)
         _migrate_document_tombstones(connection)
         _migrate_parse_chunk_plan(connection)
+        _migrate_application_agent_version(connection)
         _require_current_schema(connection)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:

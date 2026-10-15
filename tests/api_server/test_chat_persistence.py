@@ -490,6 +490,59 @@ def test_chat_service_marks_disconnected_stream_as_failed(monkeypatch, tmp_path)
     assert messages[1]["error_message"] == "流式请求未正常结束"
 
 
+def test_chat_http_disconnect_cancels_blocked_agent_stream(monkeypatch, tmp_path):
+    factory = SQLiteConnectionFactory(tmp_path / "chat.sqlite3")
+    initialize_database(factory)
+    _seed_application(factory)
+    repository = SQLiteChatRepository(factory)
+    tool_started = threading.Event()
+    release_tool = threading.Event()
+    worker_finished = threading.Event()
+    calls = {"retrieval_model": 1, "answer_model": 0}
+
+    def blocked_events(*_args, cancellation_event, **_kwargs):
+        try:
+            yield {"type": "trace", "data": {"kind": "status"}}
+            tool_started.set()
+            assert release_tool.wait(timeout=2)
+            if cancellation_event.is_set():
+                return
+            calls["retrieval_model"] += 1
+            calls["answer_model"] += 1
+            yield {"type": "done", "data": {"answer": "不应生成"}}
+        finally:
+            worker_finished.set()
+
+    monkeypatch.setattr(
+        "app.api_server.services.chat_service.iter_agent_stream_events",
+        blocked_events,
+    )
+    service = ChatService(_FakeApplications(), repository)
+    _conversation_id, _message_id, events = service.stream(
+        "app-1", "问题", "conversation-1"
+    )
+
+    async def disconnect() -> None:
+        stream = service.iterate_stream_async(events)
+        first = await anext(stream)
+        assert first["type"] == "trace"
+        assert await asyncio.to_thread(tool_started.wait, 2)
+        await stream.aclose()
+        release_tool.set()
+        assert await asyncio.to_thread(worker_finished.wait, 2)
+
+    try:
+        asyncio.run(disconnect())
+    finally:
+        release_tool.set()
+        service.shutdown()
+
+    assert calls == {"retrieval_model": 1, "answer_model": 0}
+    messages = repository.get_messages("app-1", "conversation-1")
+    assert messages is not None
+    assert messages[1]["status"] == "failed"
+
+
 def test_doc_name_round_trips_through_message_sources(monkeypatch, tmp_path):
     factory = SQLiteConnectionFactory(tmp_path / "chat.sqlite3")
     initialize_database(factory)

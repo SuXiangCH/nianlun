@@ -170,6 +170,7 @@ def process_batch_case(
     """执行单条批量任务。"""
     started = time.perf_counter()
     attempt_count = 0
+    active_runtime = runtime
 
     try:
         question = extract_question(record)
@@ -179,15 +180,13 @@ def process_batch_case(
             attempt_count += 1
 
             try:
-                if runtime is not None:
-                    active_runtime = runtime
-                elif runtime_factory is not None:
+                if active_runtime is None:
+                    if runtime_factory is None:
+                        raise RuntimeError("批量 worker 缺少 runtime_factory。")
                     active_runtime = get_batch_worker_runtime(
                         tool_logging=tool_logging,
                         runtime_factory=runtime_factory,
                     )
-                else:
-                    raise RuntimeError("批量 worker 缺少 runtime_factory。")
 
                 run_result = active_runtime.invoke(
                     question,
@@ -214,6 +213,10 @@ def process_batch_case(
                     "retrieved_texts": run_result["retrieved_texts"],
                     "retrieved_snippets": retrieved_snippets,
                     "retrieved_count": len(retrieved_snippets),
+                    "agent_version": getattr(active_runtime, "agent_version", "v0"),
+                    "answer_input_citation_ids": run_result.get(
+                        "answer_input_citation_ids", []
+                    ),
                     "guard": run_result.get("guard"),
                     "duration_sec": duration_sec,
                     "attempt_count": attempt_count,
@@ -255,6 +258,8 @@ def process_batch_case(
             "retrieved_texts": [],
             "retrieved_snippets": [],
             "retrieved_count": 0,
+            "agent_version": getattr(active_runtime, "agent_version", "v0"),
+            "answer_input_citation_ids": [],
             "guard": getattr(exc, "guard", None),
             "duration_sec": duration_sec,
             "attempt_count": attempt_count,

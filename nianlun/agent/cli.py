@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import TextIO, cast
 
+from nianlun.agent.contracts import AgentVersion
 from nianlun.agent.batch import (
     default_batch_output_path,
     run_batch,
@@ -74,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="交互模式下关闭流式输出，回退为整轮完成后一次性输出。",
     )
+    parser.add_argument(
+        "--agent-version",
+        choices=("v0", "v1"),
+        default="v0",
+        help="Agent 架构版本，默认 v0。",
+    )
     return parser.parse_args()
 
 
@@ -105,12 +112,15 @@ def configure_tool_log_output() -> None:
     tools_logger.propagate = False
 
 
-def setup(tool_logging: bool = True) -> AgentRuntime:
+def setup(tool_logging: bool = True, *, agent_version: str = "v0") -> AgentRuntime:
     """初始化运行时，失败时打印提示并退出。"""
     if tool_logging:
         configure_tool_log_output()
     try:
-        runtime = AgentRuntimeFactory(tool_logging=tool_logging).create()
+        runtime = AgentRuntimeFactory(
+            tool_logging=tool_logging,
+            agent_version=cast(AgentVersion, agent_version),
+        ).create()
     except RuntimeError as exc:
         print(f"错误: {exc}")
         print("请运行: export OPENAI_API_KEY='你的API Key'")
@@ -122,8 +132,8 @@ def setup(tool_logging: bool = True) -> AgentRuntime:
     return runtime
 
 
-def interactive_main(stream: bool = True) -> None:
-    runtime = setup(tool_logging=True)
+def interactive_main(stream: bool = True, *, agent_version: str = "v0") -> None:
+    runtime = setup(tool_logging=True, agent_version=agent_version)
     kb = runtime.kb
     last_retrieved_texts: list[str] = []
     # 多轮上下文由 agent 内置 checkpointer 按 thread_id 维护：一个交互会话用一个
@@ -214,7 +224,10 @@ def batch_main(args: argparse.Namespace) -> None:
     tool_logging = not args.quiet_tools
     if tool_logging:
         configure_tool_log_output()
-    runtime_factory = AgentRuntimeFactory(tool_logging=tool_logging)
+    runtime_factory = AgentRuntimeFactory(
+        tool_logging=tool_logging,
+        agent_version=cast(AgentVersion, args.agent_version),
+    )
     try:
         runtime = runtime_factory.create()
     except RuntimeError as exc:
@@ -250,7 +263,7 @@ def main() -> None:
     if args.batch_file:
         batch_main(args)
         return
-    interactive_main(stream=not args.no_stream)
+    interactive_main(stream=not args.no_stream, agent_version=args.agent_version)
 
 
 if __name__ == "__main__":

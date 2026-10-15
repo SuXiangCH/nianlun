@@ -53,6 +53,7 @@ def test_runtime_cache_is_invalidated_when_vector_capability_changes(tmp_path):
     assert len(created) == 1
     assert "knowledge_base_config" in created[0]
     assert "kb_config" not in created[0]
+    assert created[0]["agent_version"] == "v0"
 
     knowledge_base["vector_status"] = "ready"
     knowledge_base["vector_revision"] = 7
@@ -60,6 +61,41 @@ def test_runtime_cache_is_invalidated_when_vector_capability_changes(tmp_path):
 
     assert second is not first
     assert len(created) == 2
+
+
+def test_runtime_factory_receives_persisted_agent_version(tmp_path):
+    application = {
+        "id": "app-1",
+        "knowledge_base_id": "kb-1",
+        "provider": "default",
+        "model": "chat-model",
+        "config_version": 1,
+        "agent_version": "v1",
+    }
+    knowledge_base = {
+        "workspace_dir": str(tmp_path),
+        "content_version": 1,
+        "fts_status": "ready",
+        "fts_revision": 1,
+        "fts_collection": "fts-v1",
+        "vector_status": "disabled",
+    }
+    created = []
+
+    def runtime_factory(**kwargs):
+        created.append(kwargs)
+        return SimpleNamespace(model="chat-model", effective_url="test")
+
+    service = ApplicationService(
+        _ApplicationRepository(application),  # type: ignore[arg-type]
+        lambda _knowledge_base_id: knowledge_base,
+        runtime_factory=runtime_factory,
+        provider_resolver=lambda _provider: ProviderConfig(model="chat-model"),
+    )
+
+    service.runtime("app-1")
+
+    assert created[0]["agent_version"] == "v1"
 
 
 def test_degraded_vector_runtime_is_retried_instead_of_cached(tmp_path):

@@ -179,6 +179,19 @@ def test_knowledge_base_upload_and_app_creation(
     assert response.status_code == 200
     assert response.json()["data"]["knowledge_base_id"] == knowledge_base_id
     assert response.json()["data"]["llm_model_id"] == llm["id"]
+    assert response.json()["data"]["agent_version"] == "v0"
+
+    versioned = client.post(
+        "/api/v1/apps",
+        json={
+            "name": "分离式应用",
+            "knowledge_base_id": knowledge_base_id,
+            "llm_model_id": llm["id"],
+            "agent_version": "v1",
+        },
+    )
+    assert versioned.status_code == 200
+    assert versioned.json()["data"]["agent_version"] == "v1"
 
 
 def test_knowledge_base_processing_switches_default_on_and_can_be_disabled(

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 from langgraph.checkpoint.memory import MemorySaver
 
-from nianlun.agent.contracts import AgentRequestContext, KnowledgeBasePort
+from nianlun.agent.contracts import AgentRequestContext, AgentVersion, KnowledgeBasePort
 from nianlun.agent.lead_agent.agent import build_agent, estimate_agent_context_overhead
 from nianlun.agent.lead_agent.prompt import build_system_prompt
 from nianlun.agent.lead_agent.runtime import AgentRuntime
@@ -14,6 +14,7 @@ from nianlun.agent.middleware import (
     ClarificationMiddleware,
     ContextSummarizationMiddleware,
     DanglingToolCallMiddleware,
+    RequestCancellationMiddleware,
     RetrievalDeduplicationMiddleware,
     RetrievalLoopGuardMiddleware,
     ToolErrorHandlingMiddleware,
@@ -22,6 +23,8 @@ from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
     AgentLoopGuardConfig,
 )
 from nianlun.agent.tools import build_tools
+from nianlun.agent.retrieval_answer import build_retrieval_answer_graph
+from nianlun.agent.retrieval_answer.prompt import build_retrieval_system_prompt
 from nianlun.config import (
     get_enable_thinking,
     get_openai_api_key,
@@ -48,12 +51,15 @@ class AgentRuntimeFactory:
     context_window_tokens: int | None = None
     allow_env_fallback: bool = True
     loop_guard_config: AgentLoopGuardConfig | None = None
+    agent_version: AgentVersion = "v0"
 
     def __post_init__(self) -> None:
         if self.knowledge_base is not None and self.knowledge_base_config is not None:
             raise ValueError(
                 "knowledge_base 与 knowledge_base_config 不能同时传入，请选择一种方式。"
             )
+        if self.agent_version not in ("v0", "v1"):
+            raise ValueError(f"不支持的 Agent 版本: {self.agent_version}")
 
     def create(self) -> AgentRuntime:
         api_key = self.api_key
@@ -93,13 +99,18 @@ class AgentRuntimeFactory:
             include_vector=knowledge_base.has_vector,
             include_clarification=True,
         )
-        system_prompt = build_system_prompt(knowledge_base)
+        effective_system_prompt = (
+            build_system_prompt(knowledge_base)
+            if self.agent_version == "v0"
+            else build_retrieval_system_prompt(knowledge_base)
+        )
         loop_guard_config = self.loop_guard_config or AgentLoopGuardConfig()
         middleware = [
+            *([RequestCancellationMiddleware()] if self.agent_version == "v1" else []),
             ContextSummarizationMiddleware(
                 llm,
                 context_overhead_tokens=estimate_agent_context_overhead(
-                    system_prompt, tools
+                    effective_system_prompt, tools
                 ),
                 model_context_limit=self.context_window_tokens,
             ),
@@ -112,12 +123,19 @@ class AgentRuntimeFactory:
         graph = build_agent(
             llm,
             tools=tools,
-            system_prompt=system_prompt,
+            system_prompt=effective_system_prompt,
             checkpointer=MemorySaver(),
             context_schema=AgentRequestContext,
             name="pageindex-multi-doc-rag",
             middleware=middleware,
         )
+        if self.agent_version == "v1":
+            graph = build_retrieval_answer_graph(
+                retrieval_agent=graph,
+                answer_model=llm,
+                recursion_limit=loop_guard_config.recursion_limit,
+                context_window_tokens=self.context_window_tokens,
+            )
         return AgentRuntime(
             agent=graph,
             model=model,
@@ -125,6 +143,7 @@ class AgentRuntimeFactory:
             tool_logging=self.tool_logging,
             kb=knowledge_base,
             recursion_limit=loop_guard_config.recursion_limit,
+            agent_version=self.agent_version,
         )
 
 

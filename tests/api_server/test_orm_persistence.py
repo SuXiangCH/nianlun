@@ -94,8 +94,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 7
-    assert versions == {7}
+    assert migrations.SCHEMA_VERSION == 8
+    assert versions == {8}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -110,6 +110,51 @@ def test_schema_initialization_records_current_version(tmp_path):
     assert "heading_recovery_enabled" in columns
     assert "vector_status" in columns
     assert "vector_progress_stage" in columns
+
+    connection = factory.connect()
+    try:
+        application_columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(applications)")
+        }
+    finally:
+        connection.close()
+    assert "agent_version" in application_columns
+
+
+def test_schema_migration_defaults_legacy_applications_to_v0(tmp_path):
+    factory = SQLiteConnectionFactory(tmp_path / "legacy-app.sqlite3")
+    connection = factory.connect()
+    try:
+        connection.execute(
+            """
+            CREATE TABLE applications (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                knowledge_base_id VARCHAR NOT NULL,
+                model VARCHAR NULL,
+                provider VARCHAR NOT NULL DEFAULT 'default',
+                search_mode VARCHAR NOT NULL DEFAULT 'fts',
+                config_version INTEGER NOT NULL DEFAULT 1,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO applications "
+            "(id, name, knowledge_base_id, created_at, updated_at) "
+            "VALUES ('legacy-app', '旧应用', 'kb-1', '2026-01-01', '2026-01-01')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    initialize_database(factory)
+
+    item = SQLiteMetadataRepository(factory).get("applications", "legacy-app")
+    assert item is not None
+    assert item["agent_version"] == "v0"
 
     connection = factory.connect()
     try:
@@ -168,7 +213,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {7}
+    assert versions == {8}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -230,7 +275,7 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {7}
+    assert versions == {8}
 
 
 def test_schema_migration_replaces_document_hash_constraint_with_partial_index(

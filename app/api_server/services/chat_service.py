@@ -28,6 +28,31 @@ logger = logging.getLogger(__name__)
 _STREAM_END = object()
 
 
+class _CancellableEventStream:
+    def __init__(
+        self,
+        events: Iterator[dict[str, Any]],
+        cancellation_event: threading.Event,
+    ) -> None:
+        self._events = events
+        self._cancellation_event = cancellation_event
+
+    def __iter__(self) -> _CancellableEventStream:
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        return next(self._events)
+
+    def cancel(self) -> None:
+        self._cancellation_event.set()
+
+    def close(self) -> None:
+        self.cancel()
+        close = getattr(self._events, "close", None)
+        if callable(close):
+            close()
+
+
 def _log_runtime(application_id: str, runtime: Any) -> None:
     """Log the effective chat endpoint without exposing credentials."""
     logger.info(
@@ -158,6 +183,7 @@ class ChatService:
     ) -> tuple[str, str, Iterator[dict[str, Any]]]:
         active_conversation_id = self._conversation_id(conversation_id)
         message_id = str(uuid.uuid4())
+        cancellation_event = threading.Event()
 
         lock = self._conversation_lock(f"{application_id}:{active_conversation_id}")
 
@@ -188,6 +214,7 @@ class ChatService:
                         message,
                         thread_id=f"{application_id}:{active_conversation_id}",
                         clarification_enabled=clarification_enabled,
+                        cancellation_event=cancellation_event,
                     ):
                         if event.get("type") == "done":
                             payload = event["data"]
@@ -237,7 +264,7 @@ class ChatService:
                             RuntimeError("流式请求未正常结束"),
                         )
 
-        events = locked_events()
+        events = _CancellableEventStream(locked_events(), cancellation_event)
         return active_conversation_id, message_id, events
 
     async def iterate_stream_async(
@@ -284,6 +311,9 @@ class ChatService:
                     raise item
                 yield item  # type: ignore[misc]
         finally:
+            cancel = getattr(events, "cancel", None)
+            if callable(cancel):
+                cancel()
             stop.set()
             if worker.done():
                 worker.result()

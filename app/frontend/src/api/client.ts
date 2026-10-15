@@ -1,4 +1,4 @@
-import type { Application, BatchUploadResult, ConversationMessageRecord, ConversationRecord, DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelConfigTestRequest, ModelConfigTestResult, ModelKind, ModelProfile, ModelProfileRequest, SourceSnippet } from "../types";
+import type { AgentVersion, Application, BatchUploadResult, ConversationMessageRecord, ConversationRecord, DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelConfigTestRequest, ModelConfigTestResult, ModelKind, ModelProfile, ModelProfileRequest, SourceSnippet } from "../types";
 
 const configuredBase = window.NIANLUN_API_BASE || import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 export const API_BASE = configuredBase.replace(/\/$/, "");
@@ -79,7 +79,7 @@ function uploadRequest<T>(
 
 export const api = {
   listApps: () => request<Application[]>("/api/v1/apps"),
-  createApp: (body: { name: string; description: string; knowledge_base_id: string; llm_model_id: string }) => request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(body) }),
+  createApp: (body: { name: string; description: string; knowledge_base_id: string; llm_model_id: string; agent_version: AgentVersion }) => request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(body) }),
   deleteApp: (id: string) => request<null>(`/api/v1/apps/${encodeURIComponent(id)}`, { method: "DELETE" }),
   listKnowledgeBases: () => request<KnowledgeBase[]>("/api/v1/knowledge-bases"),
   updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; heading_recovery_enabled?: boolean; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),

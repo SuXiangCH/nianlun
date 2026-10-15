@@ -18,7 +18,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from nianlun.models.llm import content_to_text
-from nianlun.agent.contracts import AgentRequestContext, KnowledgeBasePort
+from nianlun.agent.contracts import AgentRequestContext, AgentVersion, KnowledgeBasePort
 from nianlun.agent.language import prefers_english
 from nianlun.knowledgebase import sanitize_text
 from nianlun.agent.middleware import CONTEXT_SUMMARIZATION_NO_STREAM_TAG
@@ -28,6 +28,10 @@ from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
     snapshot_loop_guard,
 )
 from nianlun.agent.lead_agent.routing import maybe_handle_non_retrieval_query
+from nianlun.agent.tool_call_batches import (
+    annotate_tool_call_batches as _annotate_tool_call_batches,
+)
+from nianlun.agent.usage import message_usage as _message_usage
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +186,7 @@ class AgentRunner:
     agent: Any
     context_factory: AgentRequestContextFactory
     recursion_limit: int = 192
+    agent_version: AgentVersion = "v0"
 
     def new_request_context(
         self,
@@ -201,6 +206,13 @@ class AgentRunner:
         *,
         clarification_enabled: bool = False,
     ) -> dict[str, Any]:
+        if self.agent_version == "v1":
+            return _run_retrieval_answer_impl(
+                self,
+                user_query,
+                thread_id=thread_id,
+                clarification_enabled=clarification_enabled,
+            )
         return _run_agent_impl(
             self,
             user_query,
@@ -211,6 +223,19 @@ class AgentRunner:
     def stream_to_stdout(
         self, user_query: str, thread_id: str = "default"
     ) -> dict[str, Any]:
+        if self.agent_version == "v1":
+            result: dict[str, Any] | None = None
+            for event in _iter_retrieval_answer_events_impl(
+                self, user_query, thread_id=thread_id
+            ):
+                if event["type"] == "message":
+                    print(event["data"]["delta"], end="", flush=True)
+                elif event["type"] == "done":
+                    result = event["data"]
+            print()
+            if result is None:
+                raise RuntimeError("v1 Agent 未返回完成事件。")
+            return result
         return _run_agent_streaming_impl(self, user_query, thread_id=thread_id)
 
     def iter_events(
@@ -219,7 +244,16 @@ class AgentRunner:
         thread_id: str = "default",
         *,
         clarification_enabled: bool = False,
+        cancellation_event: threading.Event | None = None,
     ) -> Iterator[dict[str, Any]]:
+        if self.agent_version == "v1":
+            return _iter_retrieval_answer_events_impl(
+                self,
+                user_query,
+                thread_id=thread_id,
+                clarification_enabled=clarification_enabled,
+                cancellation_event=cancellation_event,
+            )
         return _iter_agent_stream_events_impl(
             self,
             user_query,
@@ -357,44 +391,6 @@ def _stream_message_tool_names(message: Any) -> list[str]:
             if isinstance(name, str) and name.strip() and name.strip() not in names:
                 names.append(name.strip())
     return names
-
-
-# ============ token usage 提取 ============
-#
-# LangChain 把各提供商的 ``usage`` 归一成 ``AIMessage.usage_metadata``：
-# ``input_tokens`` / ``output_tokens`` / ``total_tokens``，缓存命中在
-# ``input_token_details.cache_read``（对应 OpenAI/GLM 的
-# ``prompt_tokens_details.cached_tokens``）。DeepSeek 把缓存命中放在非标准的
-# ``token_usage.prompt_cache_hit_tokens``，归一层不映射，这里从
-# ``response_metadata.token_usage`` 兜底。流式聚合时每轮模型生成的最终 chunk
-# 携带完整 usage，逐条累加即得本轮用量。
-
-
-def _message_usage(message: Any) -> dict[str, int] | None:
-    """单条 AI 消息的归一 token 用量；无 ``usage_metadata`` 时返回 ``None``。"""
-    um = getattr(message, "usage_metadata", None)
-    if not isinstance(um, dict):
-        return None
-    cached = 0
-    details = um.get("input_token_details") or {}
-    if isinstance(details, dict):
-        cached = int(details.get("cache_read") or 0)
-    if not cached:
-        response_metadata = getattr(message, "response_metadata", None) or {}
-        token_usage = response_metadata.get("token_usage") or {}
-        if isinstance(token_usage, dict):
-            cached = int(
-                token_usage.get("prompt_cache_hit_tokens")
-                or token_usage.get("cached_tokens")
-                or token_usage.get("cache_read_input_tokens")
-                or 0
-            )
-    return {
-        "input_tokens": int(um.get("input_tokens") or 0),
-        "output_tokens": int(um.get("output_tokens") or 0),
-        "total_tokens": int(um.get("total_tokens") or 0),
-        "cached_tokens": cached,
-    }
 
 
 def _empty_usage() -> dict[str, int]:
@@ -659,41 +655,6 @@ def _elapsed_ms(start: float, end: float | None) -> int | None:
     return max(0, int(round((end - start) * 1000)))
 
 
-def _annotate_tool_call_batches(
-    tool_calls: list[dict[str, Any]], messages: Any
-) -> None:
-    """为工具调用记录标注批次号：同一条 AIMessage 发出的 tool_calls 是模型一轮
-    响应里的（可能并行）调用，共享同一个从 1 开始的 ``batch``。历史消息里的旧
-    tool_call_id 不在本轮记录中，自然被跳过，批次号只按本轮计数。
-    """
-    if not tool_calls or not isinstance(messages, (list, tuple)):
-        return
-    recorded = {entry.get("tool_call_id") for entry in tool_calls} - {None}
-    batch_by_call_id: dict[str, int] = {}
-    batch = 0
-    for message in messages:
-        calls = getattr(message, "tool_calls", None)
-        if not isinstance(calls, (list, tuple)):
-            continue
-        ids = [
-            call["id"]
-            for call in calls
-            if isinstance(call, dict) and call.get("id") in recorded
-        ]
-        if not ids:
-            continue
-        batch += 1
-        for call_id in ids:
-            batch_by_call_id[call_id] = batch
-    for entry in tool_calls:
-        tool_call_id = entry.get("tool_call_id")
-        entry["batch"] = (
-            batch_by_call_id.get(tool_call_id)
-            if isinstance(tool_call_id, str)
-            else None
-        )
-
-
 def _trace_status_event(event: dict[str, Any]) -> dict[str, Any] | None:
     message = str(event.get("message", "Agent 正在处理。")).strip()
     if not message:
@@ -736,9 +697,7 @@ def _trace_tool_call_started(
         _TOOL_PROGRESS_MESSAGES_EN if english else _TOOL_PROGRESS_MESSAGES_ZH
     )
     fallback = "Calling a tool." if english else "正在调用工具。"
-    messages = [
-        progress_messages.get(name, fallback) for name in tool_names
-    ]
+    messages = [progress_messages.get(name, fallback) for name in tool_names]
     unique_messages = list(dict.fromkeys(messages))
     if not unique_messages:
         message = fallback
@@ -912,9 +871,7 @@ def _iter_agent_stream_events_impl(
             if has_tool_call:
                 tool_names = _stream_message_tool_names(message)
                 known_tool_names = [
-                    name
-                    for name in tool_names
-                    if name in _TOOL_PROGRESS_MESSAGES_ZH
+                    name for name in tool_names if name in _TOOL_PROGRESS_MESSAGES_ZH
                 ]
                 # Natural model text is authoritative for the visible activity.
                 # When it is absent, wait for a complete known tool name before
@@ -952,7 +909,7 @@ def _iter_agent_stream_events_impl(
     answer = _extract_final_answer(final_state if final_state is not None else "")
     if guard_final_model_started and answer and first_token_at is None:
         first_token_at = time.monotonic()
-    result = {
+    result: dict[str, Any] = {
         "answer": answer,
         "retrieved_texts": list(retrieval_collector.texts),
         "retrieved_snippets": list(retrieval_collector.snippets),
@@ -994,6 +951,246 @@ def _iter_agent_stream_events_impl(
                 "phase": "answer",
                 "round": current_model_round,
             },
+        }
+    yield {"type": "done", "data": result}
+
+
+def _combined_stage_usage(state: dict[str, Any]) -> dict[str, int] | None:
+    usages = [
+        value
+        for value in (state.get("retrieval_usage"), state.get("answer_usage"))
+        if isinstance(value, dict)
+    ]
+    if not usages:
+        return None
+    return {
+        key: sum(
+            int(usage.get(key, 0))
+            for usage in usages
+            if isinstance(usage.get(key, 0), int)
+        )
+        for key in {key for usage in usages for key in usage}
+    }
+
+
+def _retrieval_answer_result(
+    *,
+    state: dict[str, Any],
+    collector: RetrievalCollector,
+    context: AgentRequestContext,
+    status_sink: AgentStatusSink,
+    thread_id: str,
+    ttft_ms: int | None = None,
+    trace: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    clarification = state.get("clarification")
+    used_retrieval = bool(collector.tool_calls)
+    answer = (
+        str(clarification.get("question", "请补充必要信息。"))
+        if isinstance(clarification, dict)
+        else str(state.get("answer", ""))
+    )
+    result: dict[str, Any] = {
+        "answer": answer,
+        "retrieved_texts": list(collector.texts),
+        "retrieved_snippets": list(collector.snippets),
+        "answer_input_citation_ids": list(state.get("answer_input_citation_ids", [])),
+        "omitted_citation_ids": list(state.get("omitted_citation_ids", [])),
+        "tool_calls": list(collector.tool_calls),
+        "route": "retrieval" if used_retrieval else "direct",
+        "route_source": "agent",
+        "route_reason": "检索 Agent 调用了知识库工具。"
+        if used_retrieval
+        else "检索 Agent 未调用知识库工具。",
+        "status_events": list(status_sink.events),
+        "usage": _combined_stage_usage(state),
+        "usage_by_stage": {
+            "retrieval": state.get("retrieval_usage"),
+            "answer": state.get("answer_usage"),
+        },
+        "guard": _guard_summary(context, thread_id),
+        "agent_version": "v1",
+    }
+    if trace is not None:
+        result["trace"] = trace
+    if ttft_ms is not None:
+        result["ttft_ms"] = ttft_ms
+    if isinstance(clarification, dict):
+        result["clarification"] = clarification
+    return result
+
+
+def _run_retrieval_answer_impl(
+    runner: AgentRunner,
+    user_query: str,
+    thread_id: str = "default",
+    *,
+    clarification_enabled: bool = False,
+) -> dict[str, Any]:
+    status_sink = AgentStatusSink()
+    collector, context = runner.new_request_context(
+        status_sink, clarification_enabled=clarification_enabled
+    )
+    route_decision = maybe_handle_non_retrieval_query(user_query)
+    if route_decision["route"] == "direct":
+        return {
+            "answer": route_decision["answer"],
+            "retrieved_texts": [],
+            "retrieved_snippets": [],
+            "answer_input_citation_ids": [],
+            "omitted_citation_ids": [],
+            "tool_calls": [],
+            "route": "direct",
+            "route_source": route_decision["route_source"],
+            "route_reason": route_decision["route_reason"],
+            "status_events": [],
+            "usage": None,
+            "usage_by_stage": {"retrieval": None, "answer": None},
+            "guard": _guard_summary(context, thread_id),
+            "agent_version": "v1",
+        }
+    state = runner.agent.invoke(
+        {"question": user_query, "run_id": f"{thread_id}-{time.monotonic_ns()}"},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": runner.recursion_limit,
+        },
+        context=context,
+    )
+    if not isinstance(state, dict):
+        raise RuntimeError("v1 Agent 返回了无效状态。")
+    return _retrieval_answer_result(
+        state=state,
+        collector=collector,
+        context=context,
+        status_sink=status_sink,
+        thread_id=thread_id,
+    )
+
+
+def _iter_retrieval_answer_events_impl(
+    runner: AgentRunner,
+    user_query: str,
+    thread_id: str = "default",
+    *,
+    clarification_enabled: bool = False,
+    cancellation_event: threading.Event | None = None,
+) -> Iterator[dict[str, Any]]:
+    start = time.monotonic()
+    status_sink = AgentStatusSink()
+    collector, context = runner.new_request_context(
+        status_sink, clarification_enabled=clarification_enabled
+    )
+    route_decision = maybe_handle_non_retrieval_query(user_query)
+    if route_decision["route"] == "direct":
+        result: dict[str, Any] = {
+            "answer": route_decision["answer"],
+            "retrieved_texts": [],
+            "retrieved_snippets": [],
+            "answer_input_citation_ids": [],
+            "omitted_citation_ids": [],
+            "tool_calls": [],
+            "route": "direct",
+            "route_source": route_decision["route_source"],
+            "route_reason": route_decision["route_reason"],
+            "status_events": [],
+            "trace": [],
+            "usage": None,
+            "usage_by_stage": {"retrieval": None, "answer": None},
+            "ttft_ms": _elapsed_ms(start, time.monotonic()),
+            "guard": _guard_summary(context, thread_id),
+            "agent_version": "v1",
+        }
+        yield {"type": "message", "data": {"delta": result["answer"]}}
+        yield {"type": "done", "data": result}
+        return
+
+    final_state: dict[str, Any] | None = None
+    first_token_at: float | None = None
+    trace: list[dict[str, Any]] = []
+    status_index = 0
+    streamed: list[str] = []
+    if cancellation_event is None:
+        cancellation_event = threading.Event()
+    context["cancellation_event"] = cancellation_event
+    agent_stream = runner.agent.stream(
+        {"question": user_query, "run_id": f"{thread_id}-{time.monotonic_ns()}"},
+        config={
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": runner.recursion_limit,
+        },
+        context=context,
+        stream_mode=["messages", "values", "custom"],
+        version="v2",
+    )
+    try:
+        for chunk in agent_stream:
+            if chunk.get("type") == "custom":
+                custom_event = chunk.get("data")
+                if (
+                    isinstance(custom_event, dict)
+                    and custom_event.get("event") == "retrieval_tool_call_started"
+                ):
+                    names = custom_event.get("tool_names")
+                    tool_names = (
+                        [str(name) for name in names]
+                        if isinstance(names, (list, tuple))
+                        else []
+                    )
+                    trace_event = _trace_tool_call_started(
+                        tool_names, english=prefers_english(user_query)
+                    )
+                    trace.append(trace_event)
+                    yield {"type": "trace", "data": trace_event}
+            elif chunk.get("type") == "messages":
+                message, metadata = chunk["data"]
+                if metadata.get("langgraph_node") != "answer":
+                    continue
+                text = _stream_message_text(message)
+                if text:
+                    if first_token_at is None:
+                        first_token_at = time.monotonic()
+                    streamed.append(text)
+                    # "answer" replaces the whole bubble; token deltas append
+                    # through the existing candidate-round SSE contract.
+                    yield {
+                        "type": "message",
+                        "data": {"delta": text, "phase": "candidate", "round": 1},
+                    }
+            elif chunk.get("type") == "values" and isinstance(chunk.get("data"), dict):
+                final_state = chunk["data"]
+                while status_index < len(status_sink.events):
+                    trace_event = _trace_status_event(status_sink.events[status_index])
+                    status_index += 1
+                    if trace_event is not None:
+                        trace.append(trace_event)
+                        yield {"type": "trace", "data": trace_event}
+    finally:
+        cancellation_event.set()
+        close_stream = getattr(agent_stream, "close", None)
+        if callable(close_stream):
+            close_stream()
+
+    if final_state is None:
+        raise RuntimeError("v1 Agent 未返回最终状态。")
+    result = _retrieval_answer_result(
+        state=final_state,
+        collector=collector,
+        context=context,
+        status_sink=status_sink,
+        thread_id=thread_id,
+        ttft_ms=_elapsed_ms(start, first_token_at),
+        trace=trace,
+    )
+    clarification = result.get("clarification")
+    if isinstance(clarification, dict):
+        yield {"type": "clarification", "data": clarification}
+    elif result["answer"] and "".join(streamed) != result["answer"]:
+        if first_token_at is None:
+            result["ttft_ms"] = _elapsed_ms(start, time.monotonic())
+        yield {
+            "type": "message",
+            "data": {"delta": result["answer"], "phase": "answer"},
         }
     yield {"type": "done", "data": result}
 

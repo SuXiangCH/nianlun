@@ -466,6 +466,7 @@ class ApplicationCreateRequest(ApiSchema):
     knowledge_base_id: str
     llm_model_id: str | None = Field(default=None, max_length=128)
     provider: str = Field(default="default", min_length=1, max_length=128)
+    agent_version: Literal["v0", "v1"] = "v0"
 
     @field_validator("llm_model_id")
     @classmethod
@@ -481,6 +482,7 @@ class ApplicationResponse(ApiSchema):
     knowledge_base_id: str
     llm_model_id: str | None
     provider: str
+    agent_version: Literal["v0", "v1"]
     created_at: datetime
     updated_at: datetime
 

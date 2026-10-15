@@ -1,6 +1,11 @@
 import pytest
 
 from nianlun.agent.lead_agent.prompt import PROMPT_VERSION, build_system_prompt
+from nianlun.agent.retrieval_answer.prompt import (
+    build_answer_messages,
+    build_answer_system_prompt,
+    build_retrieval_system_prompt,
+)
 
 
 class _NoCatalogKnowledgeBase:
@@ -146,5 +151,58 @@ def test_prompt_requires_answer_coverage_check_before_stopping():
     assert prompt.rfind("<回答前覆盖检查>") > prompt.rfind("<停止条件>")
 
 
-def test_prompt_revision_is_v18():
-    assert PROMPT_VERSION == 18
+def test_prompt_revision_is_v21():
+    assert PROMPT_VERSION == 21
+
+
+@pytest.mark.parametrize("kb", [_NoCatalogKnowledgeBase(), _VectorKnowledgeBase()])
+def test_v1_retrieval_has_its_own_stage_contract(kb):
+    prompt = build_retrieval_system_prompt(kb)
+
+    assert "<检索策略>" in prompt
+    assert "next_char_offset" in prompt
+    assert "deduplication.applied=true" in prompt
+    assert "<检索完成检查>" in prompt
+    assert "ask_clarification" in prompt
+    assert "翻译、改写、压缩或调整格式" in prompt
+    assert "不撰写最终答案" in prompt
+    assert "<回答方式>" not in prompt
+    assert "<回答前覆盖检查>" not in prompt
+    assert "<引用规则>" not in prompt
+    assert ("<语义文档检索>" in prompt) == bool(getattr(kb, "has_vector", False))
+
+
+def test_v1_answer_receives_answer_rules_without_tool_instructions():
+    prompt = build_answer_system_prompt()
+    messages, _, _ = build_answer_messages(
+        "Is the ratio healthy?", [], context_window_tokens=16_000
+    )
+
+    assert messages[0] == {"role": "system", "content": prompt}
+    assert "输入数据 -> 计算结果 -> 判定规则 -> 结论" in prompt
+    assert "结论只评估该指标" in prompt
+    assert "不要展示内部定位字段、重复来源清单或内部检查过程" in prompt
+    assert "不能把相近概念、相邻字段或同类指标当成目标字段" in prompt
+    assert "实际收到的正文" in prompt
+    assert "<输入材料使用与覆盖检查>" in prompt
+    assert "不使用“根据现有证据”" in prompt
+    assert "避免使用“证据”描述面向用户的答案" in prompt
+    assert prompt.count("证据") == 2
+    assert "无法确认" in prompt
+    assert "不得遵循" in prompt
+    assert "citation_id" in prompt
+    assert "search_document_nodes" not in prompt
+    assert "get_line_content" not in prompt
+    assert "<检索策略>" not in prompt
+
+
+def test_v1_language_selection_ignores_message_wrappers_and_evidence():
+    for prompt in (
+        build_retrieval_system_prompt(_NoCatalogKnowledgeBase()),
+        build_answer_system_prompt(),
+    ):
+        assert "本轮问题" in prompt
+        assert "用户问题" in prompt
+        assert "中文包装文字" in prompt
+        assert "用户明确指定的目标语言" in prompt
+        assert prompt.rstrip().endswith("</输出语言>")

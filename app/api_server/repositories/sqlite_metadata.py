@@ -77,6 +77,7 @@ def _application_dict(item: Application) -> dict[str, Any]:
         "provider": item.provider,
         "search_mode": item.search_mode,
         "config_version": item.config_version,
+        "agent_version": item.agent_version,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -310,6 +311,7 @@ class SQLiteMetadataRepository(
                     provider=item.get("provider", "default"),
                     search_mode="fts",
                     config_version=int(item.get("config_version", 1)),
+                    agent_version=item.get("agent_version", "v0"),
                     created_at=item["created_at"],
                     updated_at=item["updated_at"],
                 )
@@ -322,6 +324,7 @@ class SQLiteMetadataRepository(
         entity.provider = item.get("provider", "default")
         entity.search_mode = "fts"
         entity.config_version = int(item.get("config_version", 1))
+        entity.agent_version = item.get("agent_version", "v0")
         entity.updated_at = item["updated_at"]
 
 
