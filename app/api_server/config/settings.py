@@ -66,8 +66,25 @@ class ApiServerSettings:
     vector_build_workers: int = 1
     embedding_model: str | None = None
     embedding_dim: int | None = None
+    application_api_enabled: bool = False
+    application_api_max_concurrent: int = 8
+    application_api_app_concurrent: int = 4
+    application_api_client_concurrent: int = 2
+    application_api_requests_per_minute: int = 60
+    application_api_timeout_seconds: float = 300.0
+    application_api_retention_days: int = 30
 
     def __post_init__(self) -> None:
+        api_limits = (
+            self.application_api_max_concurrent,
+            self.application_api_app_concurrent,
+            self.application_api_client_concurrent,
+            self.application_api_requests_per_minute,
+            self.application_api_retention_days,
+            self.application_api_timeout_seconds,
+        )
+        if any(value <= 0 for value in api_limits):
+            raise ValueError("应用 API 限额、保留期与超时时间必须大于 0")
         if self.port < 1 or self.port > 65_535:
             raise ValueError("API port 必须在 1 到 65535 之间")
         if self.database_timeout_seconds <= 0:
@@ -149,6 +166,28 @@ class ApiServerSettings:
                 api_key=os.environ.get(f"NIANLUN_API_PROVIDER_{env_name}_API_KEY"),
             )
         return cls(
+            application_api_enabled=os.environ.get(
+                "NIANLUN_API_APPLICATION_ENABLED", "false"
+            ).lower()
+            == "true",
+            application_api_max_concurrent=int(
+                os.environ.get("NIANLUN_API_APPLICATION_MAX_CONCURRENT", "8")
+            ),
+            application_api_app_concurrent=int(
+                os.environ.get("NIANLUN_API_APPLICATION_APP_CONCURRENT", "4")
+            ),
+            application_api_client_concurrent=int(
+                os.environ.get("NIANLUN_API_APPLICATION_CLIENT_CONCURRENT", "2")
+            ),
+            application_api_requests_per_minute=int(
+                os.environ.get("NIANLUN_API_APPLICATION_REQUESTS_PER_MINUTE", "60")
+            ),
+            application_api_timeout_seconds=float(
+                os.environ.get("NIANLUN_API_APPLICATION_TIMEOUT_SECONDS", "300")
+            ),
+            application_api_retention_days=int(
+                os.environ.get("NIANLUN_API_APPLICATION_RETENTION_DAYS", "30")
+            ),
             host=os.environ.get("NIANLUN_API_HOST", cls.host),
             port=int(os.environ.get("NIANLUN_API_PORT", str(cls.port))),
             data_dir=data_dir,

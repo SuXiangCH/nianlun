@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
+import { BookOpen, Cpu, Database, MoreHorizontal, Pencil, PlugZap, Plus, RefreshCw, Search } from "lucide-react";
 import { Modal } from "../../components/Modal";
 import type {
   ModelConfigTestRequest,
@@ -21,10 +22,10 @@ interface Props {
 
 type ModelDraft = Omit<ModelProfileRequest, "api_key"> & { api_key: string };
 
-const categoryMeta: Record<ModelKind, { label: string; kicker: string; description: string }> = {
-  llm: { label: "LLM", kicker: "01 / CHAT", description: "管理对话模型和 OpenAI-compatible Chat API。" },
-  embedding: { label: "Embedding", kicker: "02 / RETRIEVAL", description: "管理语义检索模型和向量维度；具体知识库在知识库页面选择模型。" },
-  parser: { label: "文档解析", kicker: "03 / INGESTION", description: "管理 MinerU SaaS 或私有部署解析配置。" },
+const categoryMeta: Record<ModelKind, { label: string }> = {
+  llm: { label: "LLM" },
+  embedding: { label: "Embedding" },
+  parser: { label: "文档解析" },
 };
 
 const parserProfileLabel = (apiMode: "saas_precision" | "self_hosted") => (
@@ -105,6 +106,8 @@ export function ModelManagementView({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState<string | null>(null);
   const [testResults, setTestResults] = useState<Record<string, ModelConfigTestResult>>({});
+  const [query, setQuery] = useState("");
+  const [menuId, setMenuId] = useState<string | null>(null);
 
   const editorTestKey = editor ? `draft:${editor.id ?? "new"}` : null;
 
@@ -118,6 +121,7 @@ export function ModelManagementView({
 
   const loadProfiles = useCallback(() => {
     setLoading(true);
+    setMessage("");
     return onListModels()
       .then((items) => setProfiles(items))
       .catch((error: unknown) => setMessage(error instanceof Error ? error.message : "模型列表加载失败"))
@@ -127,6 +131,17 @@ export function ModelManagementView({
   useEffect(() => {
     void loadProfiles();
   }, [loadProfiles]);
+
+  useEffect(() => {
+    if (!menuId) return;
+    const close = (event: PointerEvent) => {
+      if (!(event.target instanceof Element) || !event.target.closest(".model-menu")) setMenuId(null);
+    };
+    const escape = (event: KeyboardEvent) => { if (event.key === "Escape") setMenuId(null); };
+    document.addEventListener("pointerdown", close);
+    document.addEventListener("keydown", escape);
+    return () => { document.removeEventListener("pointerdown", close); document.removeEventListener("keydown", escape); };
+  }, [menuId]);
 
   const openCreate = () => {
     setEditor({ id: null, draft: newDraft(kind) });
@@ -255,19 +270,20 @@ export function ModelManagementView({
     }
   };
 
-  const visibleProfiles = profiles.filter((item) => item.kind === kind);
+  const visibleProfiles = profiles.filter((item) => item.kind === kind && `${item.model || ""} ${item.name} ${item.base_url || ""} ${item.kind === "parser" ? parserProfileLabel(item.api_mode) : ""}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
   const meta = categoryMeta[kind];
   const editorResult = editorTestKey ? testResults[editorTestKey] : undefined;
 
   return (
-    <section className="model-management model-catalog">
-      <div className="section-heading">
-        <div>
-          <h2>模型管理</h2>
-          <p>按类别维护模型连接配置。LLM 和文档解析可设置默认项，Embedding 由知识库单独选择。</p>
+    <section className="model-management model-catalog model-workspace">
+      <header className="model-toolbar">
+        <nav className="model-navigation" aria-label="模型功能导航"><a href="#models" aria-current="page"><Cpu size={18} aria-hidden="true" />模型</a><span>{profiles.length} 个</span></nav>
+        <div className="model-toolbar-actions" role="search" aria-label="筛选模型">
+          <label className="model-search"><Search size={16} aria-hidden="true" /><input aria-label="搜索模型" placeholder="搜索模型或地址" value={query} onChange={(event) => { setQuery(event.target.value); setMenuId(null); }} /></label>
+          <button className="icon-button" type="button" title="刷新模型" aria-label="刷新模型" disabled={loading || testing !== null} onClick={() => void loadProfiles()}><RefreshCw size={16} className={loading ? "model-spinning" : undefined} /></button>
+          <button className="primary-button" type="button" onClick={openCreate}><Plus size={15} />新建模型</button>
         </div>
-        <button className="primary-button" type="button" onClick={openCreate}>+ 新建{meta.label}模型</button>
-      </div>
+      </header>
 
       <div className="model-category-tabs" role="tablist" aria-label="模型类别">
         {(Object.keys(categoryMeta) as ModelKind[]).map((item) => (
@@ -277,7 +293,9 @@ export function ModelManagementView({
             type="button"
             role="tab"
             aria-selected={kind === item}
-            onClick={() => { setKind(item); setMessage(""); }}
+            aria-controls="model-catalog-panel"
+            id={`model-tab-${item}`}
+            onClick={() => { setKind(item); setQuery(""); setMenuId(null); setMessage(""); }}
           >
             {categoryMeta[item].label}
             <span>{profiles.filter((profile) => profile.kind === item).length}</span>
@@ -285,63 +303,51 @@ export function ModelManagementView({
         ))}
       </div>
 
-      <div className="model-catalog-heading">
-        <div>
-          <span className="model-section-kicker">{meta.kicker}</span>
-          <h3>{meta.label}</h3>
-          <p>{meta.description}</p>
-        </div>
-        <span className="tag ready">{visibleProfiles.length} 个配置</span>
-      </div>
-
+      <div id="model-catalog-panel" role="tabpanel" aria-labelledby={`model-tab-${kind}`}>
       {loading ? <div className="loading" role="status">正在加载模型列表...</div> : visibleProfiles.length ? (
         <div className="model-profile-list">
+          <div className="model-list-labels"><span>模型名称 / 地址</span><span>规格</span><span>凭据</span><span>操作</span></div>
           {visibleProfiles.map((profile) => {
             const result = testResults[profile.id];
+            const label = profile.kind === "parser" ? parserProfileLabel(profile.api_mode) : profile.model || profile.name;
             return (
               <article className="model-profile-item" key={profile.id}>
                 <div className="model-profile-main">
-                  <div className="model-profile-icon" aria-hidden="true">{profile.kind === "llm" ? "◌" : profile.kind === "embedding" ? "∿" : "▤"}</div>
+                  <div className="model-profile-icon" aria-hidden="true">{profile.kind === "llm" ? <Cpu size={19} /> : profile.kind === "embedding" ? <Database size={19} /> : <BookOpen size={19} />}</div>
                   <div className="model-profile-copy">
                     <div className="model-profile-title">
-                      <strong>{profile.kind === "parser" ? parserProfileLabel(profile.api_mode) : profile.model || "模型名称未配置"}</strong>
-                      {profile.kind !== "embedding" && profile.is_default && <span className="tag ready">默认</span>}
+                      <strong title={label}>{label}</strong>
+                      {profile.kind !== "embedding" && profile.is_default && <span className="model-default-badge">默认</span>}
                     </div>
-                    <p>{profile.model || (profile.kind === "parser" ? `${profile.model_version} · ${profile.language}` : "模型名称未配置")}</p>
-                    <small>{profile.base_url || "URL 未配置"} · {profile.api_key_configured ? "Key 已配置" : "Key 未配置"}</small>
+                    <small title={profile.base_url || undefined}>{profile.base_url || "URL 未配置"}</small>
                   </div>
                 </div>
-                <div className="model-profile-meta">
-                  {profile.kind === "embedding" && <span>{profile.dimension ? `${profile.dimension} 维` : "默认维度"}</span>}
-                  {result && <span className={`model-test-result ${result.ok ? "is-success" : "is-error"}`}>{result.message}</span>}
+                <span className="model-profile-spec">{profile.kind === "llm" ? profile.context_window_tokens ? `${profile.context_window_tokens.toLocaleString()} tokens` : "默认上下文" : profile.kind === "embedding" ? profile.dimension ? `${profile.dimension} 维` : "默认维度" : `${profile.model_version.toUpperCase()} · ${profile.language}`}</span>
+                <span className={`model-key-status ${profile.api_key_configured ? "is-configured" : ""}`}>{profile.api_key_configured ? "已配置" : profile.kind === "parser" && profile.api_mode === "self_hosted" ? "未设置" : "未配置"}</span>
                   <div className="model-profile-actions">
-                    <button className="quiet-button" type="button" disabled={testing !== null} onClick={() => void testProfile(profile)}>测试</button>
-                    {profile.kind !== "embedding" && !profile.is_default && <button className="quiet-button" type="button" disabled={testing !== null} onClick={() => void setDefault(profile)}>设为默认</button>}
-                    <button className="outline-button" type="button" disabled={testing !== null} onClick={() => openEdit(profile)}>编辑</button>
-                    <button className="quiet-button danger-button" type="button" disabled={profile.is_default || testing !== null} onClick={() => void remove(profile)}>删除</button>
+                    <button className="icon-button" type="button" title={testing === profile.id ? "测试中" : "测试连接"} aria-label={`测试 ${label}`} disabled={testing !== null} onClick={() => void testProfile(profile)}>{testing === profile.id ? <RefreshCw size={16} className="model-spinning" /> : <PlugZap size={17} />}</button>
+                    <button className="icon-button" type="button" title="编辑模型" aria-label={`编辑 ${label}`} disabled={testing !== null} onClick={() => openEdit(profile)}><Pencil size={16} /></button>
+                    <div className="model-menu"><button className="icon-button" type="button" title="更多操作" aria-label={`${label}的更多操作`} aria-haspopup="menu" aria-expanded={menuId === profile.id} disabled={testing !== null} onClick={() => setMenuId(menuId === profile.id ? null : profile.id)}><MoreHorizontal size={18} /></button>{menuId === profile.id && <div className="model-menu-popover" role="menu">
+                      {profile.kind !== "embedding" && !profile.is_default && <button type="button" role="menuitem" onClick={() => { setMenuId(null); void setDefault(profile); }}>设为默认</button>}
+                      <button className="danger-button" type="button" role="menuitem" disabled={profile.is_default} title={profile.is_default ? "默认模型不可删除" : undefined} onClick={() => { setMenuId(null); void remove(profile); }}>删除模型</button>
+                    </div>}</div>
                   </div>
-                </div>
+                {result && <div className={`model-test-result model-row-result ${result.ok ? "is-success" : "is-error"}`} role={result.ok ? "status" : "alert"}>{result.message}</div>}
               </article>
             );
           })}
         </div>
       ) : (
-        <div className="empty-state model-catalog-empty">
-          <div>
-            <div className="empty-state-mark" aria-hidden="true">+</div>
-            <h2>还没有{meta.label}模型</h2>
-            <p>创建一个配置后，可以在这里测试并设置默认模型。</p>
-            <button className="primary-button" type="button" onClick={openCreate}>创建第一个</button>
-          </div>
-        </div>
+        <div className="model-empty"><Cpu size={26} /><span>{query.trim() ? "没有匹配的模型" : `暂无${meta.label}模型`}</span></div>
       )}
+      </div>
 
       {message && <p className="model-catalog-message" role="status">{message}</p>}
 
       {editor && (
         <Modal
           title={`${editor.id ? "编辑" : "新建"}${categoryMeta[editor.draft.kind].label}模型`}
-          description={editor.draft.kind === "embedding" ? "保存后可在知识库页面选择此 Embedding 模型。" : "保存后可将此配置设为当前类别的默认模型。"}
+          description=""
           onClose={() => {
             if (!saving && testing === null) {
               clearEditorTestResult();
@@ -357,7 +363,6 @@ export function ModelManagementView({
             {editor.draft.kind === "llm" && <div className="field">
               <label htmlFor="model-profile-context-window">上下文窗口（tokens）</label>
               <input id="model-profile-context-window" type="number" min={1} max={10000000} step={1} value={editor.draft.context_window_tokens ?? ""} disabled={saving || testing !== null} onChange={(event) => updateDraft("context_window_tokens", event.target.value ? Number(event.target.value) : null)} placeholder="例如：128000" />
-              <span className="field-help">达到该模型上下文窗口的 80% 时自动压缩历史对话。</span>
             </div>}
             {editor.draft.kind === "parser" && <>
               <div className="field">
@@ -392,7 +397,6 @@ export function ModelManagementView({
               <div className="field">
                 <label htmlFor="model-embedding-dimension">向量维度</label>
                 <input id="model-embedding-dimension" type="number" min={1} max={100000} step={1} value={editor.draft.dimension ?? ""} disabled={saving || testing !== null} onChange={(event) => updateDraft("dimension", event.target.value ? Number(event.target.value) : null)} placeholder="使用默认维度" />
-                <span className="field-help">知识库选择此模型后，切换维度需要在对应知识库重新构建向量索引。</span>
               </div>
             </>}
             <div className="field">
@@ -405,9 +409,9 @@ export function ModelManagementView({
               {editor.id && <label className="secret-clear"><input type="checkbox" checked={clearKey} disabled={saving || testing !== null} onChange={(event) => setClearKey(event.target.checked)} />清除已保存 Key</label>}
             </div>
             {editor.draft.kind === "parser" && <div className="parser-toggle-grid model-editor-toggles">
-              <label className="parser-toggle"><input type="checkbox" checked={editor.draft.is_ocr} disabled={saving || testing !== null} onChange={(event) => updateDraft("is_ocr", event.target.checked)} /><span><strong>OCR</strong><small>扫描 PDF 文字识别</small></span></label>
-              <label className="parser-toggle"><input type="checkbox" checked={editor.draft.enable_table} disabled={saving || testing !== null} onChange={(event) => updateDraft("enable_table", event.target.checked)} /><span><strong>表格识别</strong><small>保留表格结构</small></span></label>
-              <label className="parser-toggle"><input type="checkbox" checked={editor.draft.enable_formula} disabled={saving || testing !== null} onChange={(event) => updateDraft("enable_formula", event.target.checked)} /><span><strong>公式识别</strong><small>识别数学公式</small></span></label>
+              <label className="parser-toggle"><input type="checkbox" checked={editor.draft.is_ocr} disabled={saving || testing !== null} onChange={(event) => updateDraft("is_ocr", event.target.checked)} /><span><strong>OCR</strong></span></label>
+              <label className="parser-toggle"><input type="checkbox" checked={editor.draft.enable_table} disabled={saving || testing !== null} onChange={(event) => updateDraft("enable_table", event.target.checked)} /><span><strong>表格识别</strong></span></label>
+              <label className="parser-toggle"><input type="checkbox" checked={editor.draft.enable_formula} disabled={saving || testing !== null} onChange={(event) => updateDraft("enable_formula", event.target.checked)} /><span><strong>公式识别</strong></span></label>
             </div>}
             {editor.draft.kind !== "embedding" && <label className="secret-clear"><input type="checkbox" checked={editor.draft.is_default} disabled={saving || testing !== null} onChange={(event) => updateDraft("is_default", event.target.checked)} />设为默认模型</label>}
             {message && <span className="model-test-result is-error" role="alert">{message}</span>}

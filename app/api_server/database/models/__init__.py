@@ -2,6 +2,13 @@
 
 from .base import Base
 from .chat import Conversation, Message, MessageSource
+from .application_runs import ApplicationRun
+from .publishing import (
+    ApplicationRelease,
+    ApplicationDeployment,
+    ApplicationApiClient,
+    ApplicationApiKey,
+)
 from .documents import Document, DocumentArtifact, DocumentParseTask
 from .knowledge_bases import (
     Application,
@@ -25,6 +32,11 @@ from .pipeline import (
 
 __all__ = [
     "Application",
+    "ApplicationRun",
+    "ApplicationRelease",
+    "ApplicationDeployment",
+    "ApplicationApiClient",
+    "ApplicationApiKey",
     "Base",
     "Conversation",
     "Document",

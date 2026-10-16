@@ -131,6 +131,9 @@ class Application(Base):
     search_mode: Mapped[str] = mapped_column(String, nullable=False, default="fts")
     config_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     agent_version: Mapped[str] = mapped_column(String(8), nullable=False, default="v0")
+    clarification_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
 

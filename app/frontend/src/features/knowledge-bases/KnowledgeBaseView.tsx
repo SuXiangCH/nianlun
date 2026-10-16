@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, DragEvent, FormEvent, KeyboardEvent } from "react";
+import { ArrowLeft, BookOpen, Eye, MoreHorizontal, Plus, RefreshCw, Search, Settings2, Upload, X } from "lucide-react";
 import { Modal } from "../../components/Modal";
 import type { DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelProfile } from "../../types";
 import { DocumentReader } from "./DocumentReader";
@@ -111,6 +112,9 @@ export function KnowledgeBaseView({
   const [nameSaving, setNameSaving] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [documentQuery, setDocumentQuery] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [retryingDocumentId, setRetryingDocumentId] = useState<string | null>(null);
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null);
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
@@ -119,6 +123,11 @@ export function KnowledgeBaseView({
   const uploadAbort = useRef<AbortController | null>(null);
   const contentRequestVersion = useRef(0);
   const selected = items.find((item) => item.id === selectedId);
+  useEffect(() => {
+    setDocumentQuery("");
+    setSettingsOpen(false);
+    setOpenMenuId(null);
+  }, [selectedId]);
   const openUpload = (id: string) => {
     setUploadTargetId(id);
     setQueuedFiles([]);
@@ -171,13 +180,13 @@ export function KnowledgeBaseView({
     }
   };
   const cancelUpload = () => uploadAbort.current?.abort();
-  const uploadModal = uploadTargetId ? <Modal title="上传文档" description="选择文件后确认上传。文件提交后会继续在后台解析和建立索引。" onClose={closeUpload}>
+  const uploadModal = uploadTargetId ? <Modal title="上传文档" description="Markdown、PDF、Word · 单次最多 50 个文件" onClose={closeUpload}>
     <div className="upload-panel">
       <label className={`upload-dropzone ${uploadProgress ? "is-uploading" : ""}`} onDragOver={(event) => event.preventDefault()} onDrop={dropFiles}>
         <input className="file-input" type="file" multiple disabled={Boolean(uploadProgress)} accept=".md,.pdf,.doc,.docx,text/markdown,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document" onChange={chooseFiles} />
-        <strong>拖拽文件到这里，或点击选择文件</strong><span>支持 Markdown、PDF、Word，单次最多 50 个文件</span>
+        <Upload size={24} aria-hidden="true" /><strong>拖拽文件或点击选择</strong>
       </label>
-      {queuedFiles.length > 0 && <div className="upload-file-list">{queuedFiles.map((file) => <div className="upload-file" key={`${file.name}:${file.size}:${file.lastModified}`}><div><strong title={file.name}>{file.name}</strong><span>{formatBytes(file.size)}</span></div>{!uploadProgress && <button className="icon-button" type="button" title="移除文件" aria-label={`移除 ${file.name}`} onClick={() => setQueuedFiles((current) => current.filter((item) => item !== file))}>×</button>}</div>)}</div>}
+      {queuedFiles.length > 0 && <div className="upload-file-list">{queuedFiles.map((file) => <div className="upload-file" key={`${file.name}:${file.size}:${file.lastModified}`}><div><strong title={file.name}>{file.name}</strong><span>{formatBytes(file.size)}</span></div>{!uploadProgress && <button className="icon-button" type="button" title="移除文件" aria-label={`移除 ${file.name}`} onClick={() => setQueuedFiles((current) => current.filter((item) => item !== file))}><X size={16} /></button>}</div>)}</div>}
       {uploadProgress && <div className="upload-progress" role="status"><div><span>正在上传 {queuedFiles.length} 个文件</span><strong>{uploadProgress.total ? `${Math.min(100, Math.round(uploadProgress.loaded / uploadProgress.total * 100))}%` : "处理中"}</strong></div><progress value={uploadProgress.loaded} max={uploadProgress.total || 1} /></div>}
       {uploadError && <div className="upload-error" role="alert">{uploadError}</div>}
       <div className="modal-actions"><button className="outline-button" type="button" disabled={Boolean(uploadProgress)} onClick={closeUpload}>取消</button>{uploadProgress ? <button className="quiet-button danger-button" type="button" onClick={cancelUpload}>取消上传</button> : <button className="primary-button" type="button" disabled={!queuedFiles.length} onClick={() => void submitUpload()}>开始上传</button>}</div>
@@ -301,40 +310,42 @@ export function KnowledgeBaseView({
   }, [openMenuId]);
 
   if (selected) {
+    const filteredDocuments = documents.filter((document) => document.original_filename.toLocaleLowerCase().includes(documentQuery.trim().toLocaleLowerCase()));
     return (
-      <section>
-        <div className="detail-heading">
-          <button className="quiet-button" onClick={onBack} type="button">← 知识库</button>
-          <div className="detail-heading-main">
-            <div className="detail-kicker">知识库详情</div>
-            <h2>{selected.name}</h2>
-            <p>{selected.description || "未填写描述"}</p>
+      <section className="knowledge-workspace">
+        <header className="knowledge-toolbar">
+          <button className="icon-button" onClick={onBack} type="button" title="返回知识库" aria-label="返回知识库"><ArrowLeft size={18} /></button>
+          <div className="knowledge-title"><h2>{selected.name}</h2>{selected.description && <p>{selected.description}</p>}</div>
+          <div className="knowledge-toolbar-actions">
+            <button className="icon-button" onClick={() => setSettingsOpen(true)} type="button" title="知识库设置" aria-label="知识库设置"><Settings2 size={18} /></button>
+            <button className="primary-button knowledge-upload-button" onClick={() => openUpload(selected.id)} type="button" title="上传文档" aria-label="上传文档"><Upload size={15} /><span>上传文档</span></button>
           </div>
-          <div className="detail-actions">
-            <button className="primary-button" onClick={() => openUpload(selected.id)} type="button">上传文档</button>
-          </div>
+        </header>
+        <div className="knowledge-document-toolbar">
+          <div className="knowledge-document-label"><strong>文档</strong><span role="status">{filteredDocuments.length}</span></div>
+          <div className="knowledge-index-status"><span className={`knowledge-status ${ftsReady(selected) ? "ready" : selected.fts_status === "ready" ? "pending" : selected.fts_status}`}>全文 {ftsReady(selected) ? "已就绪" : selected.fts_status === "ready" ? "待更新" : ftsStatusLabel(selected.fts_status)}</span><span className={`knowledge-status ${!selected.vector_enabled ? "disabled" : vectorReady(selected, embeddingModels) ? "ready" : selected.vector_status === "ready" ? "pending" : selected.vector_status}`}>向量 {selected.vector_enabled ? (vectorReady(selected, embeddingModels) ? "已就绪" : selected.vector_status === "ready" ? "待更新" : vectorStatusLabel(selected.vector_status)) : "已关闭"}</span></div>
+          <label className="knowledge-search"><Search size={16} aria-hidden="true" /><input aria-label="搜索文档" placeholder="搜索文档" value={documentQuery} onChange={(event) => setDocumentQuery(event.target.value)} /></label>
+          <button className="icon-button" onClick={() => onLoadDocuments(selected.id)} type="button" title="刷新文档" aria-label="刷新文档" disabled={documentsLoading}><RefreshCw size={16} className={documentsLoading ? "knowledge-spinning" : undefined} /></button>
         </div>
-        <div className="detail-summary">
-          <span>{selected.document_count || 0} 个文档</span>
-          <span className={`tag ${selected.status}`}>{statusLabel(selected.status)}</span>
-          <span className={`tag ${ftsReady(selected) ? "ready" : selected.fts_status}`}>全文 {ftsReady(selected) ? "已就绪" : ftsStatusLabel(selected.fts_status)}</span>
-          <button className="outline-button" onClick={() => confirmRebuild(selected)} type="button" disabled={selected.fts_status === "pending" || selected.fts_status === "building"}>{ftsReady(selected) ? "重建全文索引" : "构建全文索引"}</button>
-          <span className={`tag ${vectorReady(selected, embeddingModels) ? "ready" : selected.vector_status}`}>向量 {selected.vector_enabled ? (vectorReady(selected, embeddingModels) ? "已就绪" : vectorStatusLabel(selected.vector_status)) : "已关闭"}</span>
-          <label className="field detail-vector-model"><span>Embedding 模型</span><select value={selected.embedding_model_id || ""} onChange={(event) => changeEmbeddingModel(event.target.value)}><option value="" disabled>请选择 Embedding 模型</option>{embeddingModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
-          <label className="switch-control detail-vector-switch"><input type="checkbox" checked={selected.vector_enabled} disabled={!selected.embedding_model_id} onChange={(event) => void onUpdateVectorEnabled(selected.id, event.target.checked)} /><span>{selected.vector_enabled ? "向量检索已开启" : "向量检索已关闭"}</span></label>
-          <button className="outline-button" onClick={() => confirmVectorRebuild(selected)} type="button" disabled={!selected.vector_enabled || !selected.embedding_model_id || selected.vector_status === "pending" || selected.vector_status === "building"}>{hasVectorIndex(selected) ? "重建向量索引" : "构建向量索引"}</button>
-          <button className="quiet-button" onClick={() => onLoadDocuments(selected.id)} type="button">刷新文档</button><label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>{selected.summary_enabled ? "摘要生成已开启" : "摘要生成已关闭"}</span></label><label className="switch-control detail-heading-recovery-switch" title="仅影响之后上传的 MinerU PDF，不会重建已有文档"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>{selected.heading_recovery_enabled ? "标题修复已开启" : "标题修复已关闭"}</span></label>
-        </div>
+        {settingsOpen && <Modal title="知识库设置" description="" onClose={() => setSettingsOpen(false)}><div className="knowledge-settings">
+          <section><h3>检索索引</h3><div className="knowledge-setting-row"><span>全文索引</span><button className="outline-button" onClick={() => confirmRebuild(selected)} type="button" disabled={selected.fts_status === "pending" || selected.fts_status === "building"}>{ftsReady(selected) ? "重建全文索引" : "构建全文索引"}</button></div>
+            <label className="field detail-vector-model"><span>Embedding 模型</span><select value={selected.embedding_model_id || ""} onChange={(event) => changeEmbeddingModel(event.target.value)}><option value="" disabled>请选择 Embedding 模型</option>{embeddingModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
+            <div className="knowledge-setting-row"><label className="switch-control detail-vector-switch"><input type="checkbox" checked={selected.vector_enabled} disabled={!selected.embedding_model_id} onChange={(event) => void onUpdateVectorEnabled(selected.id, event.target.checked)} /><span>向量检索</span></label><button className="outline-button" onClick={() => confirmVectorRebuild(selected)} type="button" disabled={!selected.vector_enabled || !selected.embedding_model_id || selected.vector_status === "pending" || selected.vector_status === "building"}>{hasVectorIndex(selected) ? "重建向量索引" : "构建向量索引"}</button></div>
+          </section>
+          <section><h3>文档处理</h3><label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>生成摘要</span></label><label className="switch-control detail-heading-recovery-switch" title="仅影响之后上传的 MinerU PDF"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>修复 PDF 标题</span></label></section>
+          <div className="modal-actions"><button className="primary-button" type="button" onClick={() => setSettingsOpen(false)}>完成</button></div>
+        </div></Modal>}
         {(selected.vector_status === "pending" || selected.vector_status === "building") && <div className="document-content-state">向量索引进度：{vectorProgressLabel(selected)}</div>}
-        {selected.vector_error && <div className="document-content-state is-error">向量索引：{selected.vector_error}</div>}
-        {documentsError && <div className="document-content-state is-error">{documentsError}</div>}
+        {selected.vector_error && <div className="document-content-state is-error" role="alert">向量索引：{selected.vector_error}</div>}
+        {selected.fts_error && <div className="document-content-state is-error" role="alert">全文索引：{selected.fts_error}</div>}
+        {documentsError && <div className="document-content-state is-error" role="alert">{documentsError}</div>}
         {documentsLoading ? <div className="document-list-state">正在加载文档...</div> : documents.length ? (
           <div className="document-list">
-            {documents.map((document) => (
+            {filteredDocuments.map((document) => (
               <Fragment key={document.id}>
                 <article className="document-row">
-                  <div className="document-row-main"><div className="document-file-icon" aria-hidden="true">{document.file_extension === ".pdf" ? "PDF" : document.file_extension === ".doc" || document.file_extension === ".docx" ? "DOC" : "MD"}</div><div className="document-row-copy"><strong title={document.original_filename}>{document.original_filename}</strong><span>{formatBytes(document.size_bytes)} · {document.parser === "mineru" ? "MinerU Precision" : "Markdown"}</span>{document.error_message && <small>{document.error_message}</small>}</div></div>
-                  <div className="document-row-meta"><span className={`tag ${document.status === "ready" ? "ready" : document.status === "failed" ? "error" : "indexing"}`}>{documentStageLabel(document)}</span>{documentProgressLabel(document) && <span>{documentProgressLabel(document)}</span>}{document.warnings.length > 0 && <span>{document.warnings.length} 条警告</span>}<button className="outline-button" type="button" disabled={!document.published_content_version || document.status === "failed"} onClick={() => void openContent(document.id)}>查看解析内容</button>{document.status === "failed" && <button className="outline-button" type="button" disabled={retryingDocumentId !== null} onClick={async () => { setRetryingDocumentId(document.id); try { await onRetryDocument(selected.id, document.id); } finally { setRetryingDocumentId(null); } }}>{retryingDocumentId === document.id ? "重试中..." : `重试${document.failed_stage ? ({ parse: "解析", normalize: "规范化", enrich: "增强", index: "索引" }[document.failed_stage]) : "处理"}`}</button>}<button className="quiet-button danger-button" type="button" onClick={() => void onDeleteDocument(selected.id, document.id)}>删除文档</button></div>
+                  <div className="document-row-main"><div className="document-file-icon" aria-hidden="true">{document.file_extension === ".pdf" ? "PDF" : document.file_extension === ".doc" || document.file_extension === ".docx" ? "DOC" : "MD"}</div><div className="document-row-copy"><strong title={document.original_filename}>{document.original_filename}</strong><span>{formatBytes(document.size_bytes)}</span>{document.error_message && <small>{document.error_message}</small>}</div></div>
+                  <div className="document-row-meta"><span className={`knowledge-status ${document.status === "ready" ? "ready" : document.status === "failed" ? "error" : "indexing"}`}>{document.status === "ready" ? "可用" : documentStageLabel(document)}</span>{document.status !== "ready" && documentProgressLabel(document) && <span>{documentProgressLabel(document)}</span>}{document.warnings.length > 0 && <span>{document.warnings.length} 条警告</span>}{Boolean(document.published_content_version) && document.status !== "failed" && <button className="icon-button" type="button" title="查看解析内容" aria-label={`查看 ${document.original_filename}`} onClick={() => void openContent(document.id)}><Eye size={17} /><span className="knowledge-sr-only">查看解析内容</span></button>}{document.status === "failed" && <button className="outline-button" type="button" disabled={retryingDocumentId !== null} onClick={async () => { setRetryingDocumentId(document.id); try { await onRetryDocument(selected.id, document.id); } finally { setRetryingDocumentId(null); } }}>{retryingDocumentId === document.id ? "重试中..." : `重试${document.failed_stage ? ({ parse: "解析", normalize: "规范化", enrich: "增强", index: "索引" }[document.failed_stage]) : "处理"}`}</button>}<div className="kb-card-menu"><button className="icon-button" type="button" title="更多操作" aria-label={`${document.original_filename}的更多操作`} aria-haspopup="menu" aria-expanded={openMenuId === `document:${document.id}`} onClick={() => setOpenMenuId(openMenuId === `document:${document.id}` ? null : `document:${document.id}`)}><MoreHorizontal size={18} /></button>{openMenuId === `document:${document.id}` && <div className="kb-card-menu-popover" role="menu"><button className="kb-card-menu-item is-danger" role="menuitem" type="button" onClick={() => { setOpenMenuId(null); void onDeleteDocument(selected.id, document.id); }}>删除文档</button></div>}</div></div>
                 </article>
                 {contentDocumentId === document.id && (
                   <DocumentReader
@@ -351,35 +362,39 @@ export function KnowledgeBaseView({
               </Fragment>
             ))}
           </div>
-        ) : <div className="document-list-state">这个知识库还没有文档，上传 Markdown、PDF 或 Word 开始建立内容。</div>}
+        ) : <div className="document-list-state">暂无文档</div>}
+        {!documentsLoading && documents.length > 0 && !filteredDocuments.length && <div className="document-list-state">没有匹配的文档</div>}
         {uploadModal}
       </section>
     );
   }
 
+  const filteredItems = items.filter((item) => `${item.name} ${item.description}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
   return (
-    <section>
-      <div className="section-heading"><div><h2>知识库</h2><p>为 Agent 准备可检索、可持续更新的资料。</p></div><div className="section-actions"><button className="primary-button" onClick={onCreate} type="button">+ 新建知识库</button></div></div>
+    <section className="knowledge-workspace">
+      <header className="knowledge-toolbar"><nav className="knowledge-navigation" aria-label="知识库功能导航"><a href="#knowledge" aria-current="page"><BookOpen size={18} />知识库</a><span role="status">{filteredItems.length} 个</span></nav><div className="knowledge-toolbar-actions" role="search" aria-label="筛选知识库"><label className="knowledge-search"><Search size={16} aria-hidden="true" /><input aria-label="搜索知识库" placeholder="搜索知识库" value={query} disabled={!items.length} onChange={(event) => setQuery(event.target.value)} /></label><button className="primary-button" onClick={onCreate} type="button"><Plus size={15} />新建知识库</button></div></header>
       {items.length ? (
-        <div className="list-grid">
-          {items.map((item) => (
+        <div className="knowledge-list">
+          <div className="knowledge-list-labels"><span>知识库名称</span><span>文档数</span><span>状态</span><span>更新日期</span><span /></div>
+          {filteredItems.map((item) => (
             <article className="list-item is-clickable" key={item.id} role="button" tabIndex={0} onClick={() => openCard(item.id)} onKeyDown={(event) => onCardKeyDown(event, item.id)}>
-              <div className="kb-card-heading">
                 <div className="list-item-main">
-                  <div className="list-item-icon" aria-hidden="true">▤</div>
-                  <div className="list-item-copy"><strong title={item.name}>{item.name}</strong><p>{item.description || "未填写描述"}</p></div>
+                  <div className="list-item-icon" aria-hidden="true"><BookOpen size={19} /></div>
+                  <div className="list-item-copy"><strong title={item.name}>{item.name}</strong>{item.description && <p>{item.description}</p>}</div>
                 </div>
+                <span className="knowledge-document-count">{item.document_count || 0}</span>
+                <span className={`knowledge-status ${item.status}`}>{statusLabel(item.status)}</span>
+                <time className="knowledge-updated" dateTime={item.updated_at}>{new Date(item.updated_at).toLocaleDateString("zh-CN")}</time>
                 <div className="kb-card-menu" onClick={(event) => event.stopPropagation()}>
-                  <button className="icon-button kb-card-menu-trigger" onClick={() => setOpenMenuId((current) => current === item.id ? null : item.id)} type="button" title="更多操作" aria-label={`${item.name}的更多操作`} aria-haspopup="menu" aria-expanded={openMenuId === item.id}>⋯</button>
+                  <button className="icon-button kb-card-menu-trigger" onClick={() => setOpenMenuId((current) => current === item.id ? null : item.id)} type="button" title="更多操作" aria-label={`${item.name}的更多操作`} aria-haspopup="menu" aria-expanded={openMenuId === item.id}><MoreHorizontal size={18} /></button>
                   {openMenuId === item.id && <div className="kb-card-menu-popover" role="menu"><button className="kb-card-menu-item" onClick={() => { setOpenMenuId(null); setNameError(null); setEditingItem(item); }} type="button" role="menuitem">编辑名称</button><button className="kb-card-menu-item is-danger" onClick={() => { setOpenMenuId(null); void onDeleteKnowledgeBase(item.id); }} type="button" role="menuitem">删除知识库</button></div>}
                 </div>
-              </div>
-              <div className="kb-card-meta"><span>{item.document_count || 0} 个文档</span><span className={`tag ${item.status}`}>{statusLabel(item.status)}</span></div>
             </article>
           ))}
         </div>
-      ) : <div className="empty-state"><div><div className="empty-state-mark" aria-hidden="true">▤</div><h2>还没有知识库</h2><p>创建一个知识库，然后上传 Markdown、PDF 或 Word 文档。</p><button className="primary-button" onClick={onCreate} type="button">创建第一个知识库</button></div></div>}
-      {editingItem && <Modal title="编辑知识库名称" description="修改后不会影响已有文档和索引。" onClose={() => { if (!nameSaving) setEditingItem(null); }}><form className="form-grid" onSubmit={(event) => void submitName(event)}><div className="field"><label htmlFor="kb-edit-name">名称</label><input id="kb-edit-name" name="name" required maxLength={128} defaultValue={editingItem.name} /></div>{nameError && <div className="upload-error" role="alert">{nameError}</div>}<div className="modal-actions"><button className="outline-button" onClick={() => setEditingItem(null)} type="button" disabled={nameSaving}>取消</button><button className="primary-button" type="submit" disabled={nameSaving}>{nameSaving ? "保存中..." : "保存"}</button></div></form></Modal>}
+      ) : <div className="knowledge-empty"><BookOpen size={28} /><h3>暂无知识库</h3></div>}
+      {items.length > 0 && !filteredItems.length && <div className="knowledge-empty">没有匹配的知识库</div>}
+      {editingItem && <Modal title="编辑知识库名称" description="" onClose={() => { if (!nameSaving) setEditingItem(null); }}><form className="form-grid" onSubmit={(event) => void submitName(event)}><div className="field"><label htmlFor="kb-edit-name">名称</label><input id="kb-edit-name" name="name" required maxLength={128} defaultValue={editingItem.name} /></div>{nameError && <div className="upload-error" role="alert">{nameError}</div>}<div className="modal-actions"><button className="outline-button" onClick={() => setEditingItem(null)} type="button" disabled={nameSaving}>取消</button><button className="primary-button" type="submit" disabled={nameSaving}>{nameSaving ? "保存中..." : "保存"}</button></div></form></Modal>}
       {uploadModal}
     </section>
   );

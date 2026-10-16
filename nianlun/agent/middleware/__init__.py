@@ -29,6 +29,7 @@ from nianlun.agent.middleware.context_summarization_middleware import (
     DEFAULT_SUMMARIZATION_TOKEN_TRIGGER,
     DEFAULT_SUMMARIZATION_TRIGGER,
     ContextSummarizationMiddleware,
+    HistoryOverCapacityError,
     build_evidence_reference_index,
 )
 from nianlun.agent.middleware.dangling_tool_call_middleware import (
@@ -90,6 +91,7 @@ __all__ = [
     "DanglingToolCallMiddleware",
     "DEFAULT_PER_TOOL_HARD_LIMITS",
     "GuardFinalizationError",
+    "HistoryOverCapacityError",
     "LoopGuardState",
     "LoopGuardSummary",
     "RETRIEVAL_DEDUPLICATION_TOOL_NAMES",

@@ -14,9 +14,9 @@ from nianlun.agent.middleware.request_cancellation_middleware import (
     raise_if_cancelled,
 )
 from nianlun.models.llm import content_to_text
-from nianlun.agent.retrieval_answer.prompt import (
-    build_answer_messages,
-    build_retrieval_messages,
+from nianlun.agent.retrieval_answer.input_messages import (
+    build_answer_input,
+    build_retrieval_input,
 )
 from nianlun.agent.retrieval_answer.state import RetrievalAnswerGraphState
 from nianlun.agent.tool_call_batches import annotate_tool_call_batches
@@ -111,6 +111,7 @@ def build_retrieval_answer_graph(
     answer_model: Any,
     recursion_limit: int,
     context_window_tokens: int | None,
+    checkpointer: Any = None,
 ) -> Any:
     """构建固定为 retrieval -> answer 的外层图。"""
 
@@ -118,10 +119,11 @@ def build_retrieval_answer_graph(
         state: RetrievalAnswerGraphState,
         runtime: Runtime[AgentRequestContext],
     ) -> dict[str, Any]:
-        retrieval_messages = build_retrieval_messages(
+        retrieval_messages = build_retrieval_input(
             state["question"],
             context_window_tokens=context_window_tokens,
             conversation_context=state.get("conversation_context", []),
+            input_messages=runtime.context.get("input_messages"),
         )
         final_result: dict[str, Any] | None = None
         usage_messages: list[Any] = []
@@ -240,11 +242,12 @@ def build_retrieval_answer_graph(
         runtime: Runtime[AgentRequestContext],
     ) -> dict[str, Any]:
         raise_if_cancelled(runtime)
-        messages, citation_ids, omitted_ids = build_answer_messages(
+        messages, citation_ids, omitted_ids = build_answer_input(
             state["question"],
             state.get("retrieved_snippets", []),
             context_window_tokens=context_window_tokens,
             conversation_context=state.get("conversation_context", []),
+            input_messages=runtime.context.get("input_messages"),
         )
         response = answer_model.invoke(messages)
         answer_text = content_to_text(response)
@@ -277,7 +280,9 @@ def build_retrieval_answer_graph(
         "retrieval", after_retrieval, {"answer": "answer", "done": END}
     )
     builder.add_edge("answer", END)
-    return builder.compile(checkpointer=MemorySaver())
+    return builder.compile(
+        checkpointer=checkpointer if checkpointer is not None else MemorySaver()
+    )
 
 
 __all__ = ["build_retrieval_answer_graph"]

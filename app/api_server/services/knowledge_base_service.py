@@ -236,21 +236,24 @@ class KnowledgeBaseService:
     def delete(self, knowledge_base_id: str) -> dict[str, Any]:
         """Hard-delete a knowledge base and its API-owned workspace."""
         item = self.require_record(knowledge_base_id)
-        application_count = self.repository.count_applications_for_knowledge_base(
-            knowledge_base_id
-        )
-        if application_count:
-            raise ApiError(
-                "知识库仍被应用绑定，请先删除或解绑这些应用",
-                status.HTTP_409_CONFLICT,
-            )
-
         workspace = self._workspace_path(str(item["workspace_relpath"]))
-        if workspace.exists():
-            with workspace_lock(workspace):
-                shutil.rmtree(workspace)
-        if not self.repository.delete_knowledge_base(knowledge_base_id):
-            raise ApiError("知识库不存在", status.HTTP_404_NOT_FOUND)
+        staged = workspace.with_name(f".{workspace.name}.deleting-{uuid.uuid4().hex}")
+        lock = workspace_lock(workspace) if workspace.exists() else nullcontext()
+        with lock:
+            try:
+                with self.repository.deleting_knowledge_base(
+                    knowledge_base_id
+                ) as current:
+                    if current is None:
+                        raise ApiError("知识库不存在", status.HTTP_404_NOT_FOUND)
+                    if workspace.exists():
+                        workspace.rename(staged)
+            except BaseException:
+                if staged.exists():
+                    staged.rename(workspace)
+                raise
+            if staged.exists():
+                shutil.rmtree(staged)
         return item
 
     def add_markdown(

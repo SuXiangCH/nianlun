@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any
 
@@ -165,9 +166,15 @@ class SQLiteChatRepository:
         assistant_message_id: str,
         user_content: str,
         now: datetime,
+        session: Session | None = None,
+        channel: str = "console",
     ) -> None:
         timestamp = now.isoformat()
-        with self.factory.session_scope(write=True) as session:
+        with (
+            nullcontext(session)
+            if session is not None
+            else self.factory.session_scope(write=True)
+        ) as session:
             conversation = session.get(Conversation, conversation_id)
             if conversation is None:
                 conversation = Conversation(
@@ -182,6 +189,8 @@ class SQLiteChatRepository:
                 session.add(conversation)
                 next_seq = 1
             else:
+                if conversation.channel != channel:
+                    raise ValueError("会话不存在")
                 if conversation.application_id != application_id:
                     raise ValueError("会话不属于当前应用")
                 if conversation.status == "deleted":
@@ -235,9 +244,14 @@ class SQLiteChatRepository:
         usage: dict[str, int] | None = None,
         ttft_ms: int | None = None,
         now: datetime,
+        session: Session | None = None,
     ) -> None:
         timestamp = now.isoformat()
-        with self.factory.session_scope(write=True) as session:
+        with (
+            nullcontext(session)
+            if session is not None
+            else self.factory.session_scope(write=True)
+        ) as session:
             message = self._require_assistant_message(
                 session,
                 application_id,
@@ -284,9 +298,14 @@ class SQLiteChatRepository:
         assistant_message_id: str,
         error_message: str,
         now: datetime,
+        session: Session | None = None,
     ) -> None:
         timestamp = now.isoformat()
-        with self.factory.session_scope(write=True) as session:
+        with (
+            nullcontext(session)
+            if session is not None
+            else self.factory.session_scope(write=True)
+        ) as session:
             message = self._require_assistant_message(
                 session,
                 application_id,
@@ -368,6 +387,7 @@ class SQLiteChatRepository:
                 select(Conversation)
                 .where(
                     Conversation.application_id == application_id,
+                    Conversation.channel == "console",
                     Conversation.status != "deleted",
                 )
                 .order_by(Conversation.updated_at.desc())
@@ -401,6 +421,7 @@ class SQLiteChatRepository:
                 select(Conversation).where(
                     Conversation.id == conversation_id,
                     Conversation.application_id == application_id,
+                    Conversation.channel == "console",
                     Conversation.status != "deleted",
                 )
             )
@@ -448,6 +469,7 @@ class SQLiteChatRepository:
                     Message.id == message_id,
                     Conversation.id == conversation_id,
                     Conversation.application_id == application_id,
+                    Conversation.channel == "console",
                 )
             )
             return _source_dict(source) if source is not None else None
@@ -458,6 +480,7 @@ class SQLiteChatRepository:
                 select(Conversation).where(
                     Conversation.id == conversation_id,
                     Conversation.application_id == application_id,
+                    Conversation.channel == "console",
                 )
             )
             if conversation is None:

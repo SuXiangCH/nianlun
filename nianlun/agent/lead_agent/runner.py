@@ -36,6 +36,31 @@ from nianlun.agent.usage import message_usage as _message_usage
 logger = logging.getLogger(__name__)
 
 
+def _route_with_checkpoint(
+    runner: AgentRunner, user_query: str, thread_id: str
+) -> dict[str, Any]:
+    decision = maybe_handle_non_retrieval_query(user_query)
+    if decision["route"] == "direct":
+        update_state = getattr(runner.agent, "update_state", None)
+        if (
+            callable(update_state)
+            and getattr(runner.agent, "checkpointer", None) is not None
+        ):
+            turns = [
+                {"role": "user", "content": user_query},
+                {"role": "assistant", "content": decision["answer"]},
+            ]
+            update_state(
+                {"configurable": {"thread_id": thread_id}},
+                {
+                    "conversation_context"
+                    if runner.agent_version == "v1"
+                    else "messages": turns
+                },
+            )
+    return decision
+
+
 # ============ 检索状态收集 ============
 
 
@@ -259,7 +284,67 @@ class AgentRunner:
             user_query,
             thread_id=thread_id,
             clarification_enabled=clarification_enabled,
+            cancellation_event=cancellation_event,
         )
+
+    def iter_public_events(
+        self,
+        messages: list[dict[str, str]],
+        thread_id: str,
+        *,
+        clarification_enabled: bool = False,
+        cancellation_event: threading.Event | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Append-only output: v0 retries are dropped; only the final answer is emitted."""
+        query = messages[-1]["content"]
+        events = (
+            _iter_retrieval_answer_events_impl(
+                self,
+                query,
+                thread_id=thread_id,
+                clarification_enabled=clarification_enabled,
+                cancellation_event=cancellation_event,
+                input_messages=messages,
+            )
+            if self.agent_version == "v1"
+            else _iter_agent_stream_events_impl(
+                self,
+                query,
+                thread_id=thread_id,
+                clarification_enabled=clarification_enabled,
+                cancellation_event=cancellation_event,
+                input_messages=messages,
+            )
+        )
+        emitted = ""
+        try:
+            for event in events:
+                if cancellation_event is not None and cancellation_event.is_set():
+                    raise RuntimeError("Agent 调用已取消。")
+                if event["type"] == "message" and self.agent_version == "v1":
+                    data = event["data"]
+                    text = str(data.get("delta", ""))
+                    if data.get("phase") == "answer":
+                        if not text.startswith(emitted):
+                            raise RuntimeError("最终回答与已输出内容不一致。")
+                        text = text[len(emitted) :]
+                    if text:
+                        emitted += text
+                        yield {"type": "message", "data": {"delta": text}}
+                elif event["type"] == "done":
+                    answer = str(event["data"]["answer"])
+                    if not answer.startswith(emitted):
+                        raise RuntimeError("最终回答与已输出内容不一致。")
+                    if answer[len(emitted) :]:
+                        yield {
+                            "type": "message",
+                            "data": {"delta": answer[len(emitted) :]},
+                        }
+                    yield event
+        finally:
+            close_events = getattr(events, "close", None)
+            if callable(close_events):
+                close_events()
 
 
 def _guard_summary(context: AgentRequestContext, thread_id: str) -> LoopGuardSummary:
@@ -471,7 +556,7 @@ def _run_agent_impl(
         status_sink, clarification_enabled=clarification_enabled
     )
 
-    route_decision = maybe_handle_non_retrieval_query(user_query)
+    route_decision = _route_with_checkpoint(runner, user_query, thread_id)
     if route_decision["route"] == "direct":
         return {
             "answer": route_decision["answer"],
@@ -554,7 +639,7 @@ def _run_agent_streaming_impl(
     status_sink = AgentStatusSink(print_to_stdout=True)
     retrieval_collector, context = runner.new_request_context(status_sink)
 
-    route_decision = maybe_handle_non_retrieval_query(user_query)
+    route_decision = _route_with_checkpoint(runner, user_query, thread_id)
     if route_decision["route"] == "direct":
         print(route_decision["answer"])
         return {
@@ -718,6 +803,8 @@ def _iter_agent_stream_events_impl(
     thread_id: str = "default",
     *,
     clarification_enabled: bool = False,
+    cancellation_event: threading.Event | None = None,
+    input_messages: list[dict[str, str]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield transport-neutral events for HTTP or other streaming frontends.
 
@@ -732,13 +819,21 @@ def _iter_agent_stream_events_impl(
     retrieval_collector, context = runner.new_request_context(
         status_sink, clarification_enabled=clarification_enabled
     )
+    if input_messages is not None:
+        context["input_messages"] = input_messages
+    if cancellation_event is not None:
+        context["cancellation_event"] = cancellation_event
     # 首 token 时延（TTFT）：从本函数入口计到「最终答案」的首个文本 token 产出。
     # 含路由判定、工具决策轮与检索/工具执行耗时——即用户等到第一个答案字的真实时延。
     # 纯客户端网络往返不计入。工具轮的自然进度说明不是答案；遇到工具调用时
     # 重置打点，只保留最后一轮工具之后最终答案的首 token。
     start = time.monotonic()
     first_token_at: float | None = None
-    route_decision = maybe_handle_non_retrieval_query(user_query)
+    route_decision = (
+        {"route": "agent"}
+        if input_messages is not None
+        else _route_with_checkpoint(runner, user_query, thread_id)
+    )
     if route_decision["route"] == "direct":
         first_token_at = time.monotonic()
         result = {
@@ -812,7 +907,11 @@ def _iter_agent_stream_events_impl(
         current_model_round = None
         current_model_tool_trace_emitted = False
 
-    messages = [{"role": "user", "content": user_query}]
+    messages = (
+        input_messages
+        if input_messages is not None
+        else [{"role": "user", "content": user_query}]
+    )
     for chunk in agent.stream(
         {"messages": messages},
         config={
@@ -1031,7 +1130,7 @@ def _run_retrieval_answer_impl(
     collector, context = runner.new_request_context(
         status_sink, clarification_enabled=clarification_enabled
     )
-    route_decision = maybe_handle_non_retrieval_query(user_query)
+    route_decision = _route_with_checkpoint(runner, user_query, thread_id)
     if route_decision["route"] == "direct":
         return {
             "answer": route_decision["answer"],
@@ -1075,13 +1174,20 @@ def _iter_retrieval_answer_events_impl(
     *,
     clarification_enabled: bool = False,
     cancellation_event: threading.Event | None = None,
+    input_messages: list[dict[str, str]] | None = None,
 ) -> Iterator[dict[str, Any]]:
     start = time.monotonic()
     status_sink = AgentStatusSink()
     collector, context = runner.new_request_context(
         status_sink, clarification_enabled=clarification_enabled
     )
-    route_decision = maybe_handle_non_retrieval_query(user_query)
+    if input_messages is not None:
+        context["input_messages"] = input_messages
+    route_decision = (
+        {"route": "agent"}
+        if input_messages is not None
+        else _route_with_checkpoint(runner, user_query, thread_id)
+    )
     if route_decision["route"] == "direct":
         result: dict[str, Any] = {
             "answer": route_decision["answer"],
@@ -1123,6 +1229,7 @@ def _iter_retrieval_answer_events_impl(
         stream_mode=["messages", "values", "custom"],
         version="v2",
     )
+    stream_exhausted = False
     try:
         for chunk in agent_stream:
             if chunk.get("type") == "custom":
@@ -1165,8 +1272,10 @@ def _iter_retrieval_answer_events_impl(
                     if trace_event is not None:
                         trace.append(trace_event)
                         yield {"type": "trace", "data": trace_event}
+        stream_exhausted = True
     finally:
-        cancellation_event.set()
+        if not stream_exhausted:
+            cancellation_event.set()
         close_stream = getattr(agent_stream, "close", None)
         if callable(close_stream):
             close_stream()

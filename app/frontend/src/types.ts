@@ -14,7 +14,134 @@ export interface Application {
   search_mode: "scan" | "fts";
   created_at: string;
   updated_at: string;
+  /** Optional when reading legacy application fixtures; current API always supplies both. */
+  config_version?: number;
+  clarification_enabled?: boolean;
 }
+
+export interface ApplicationUpdateRequest {
+  expected_config_version: number;
+  name: string;
+  description: string;
+  knowledge_base_id: string;
+  llm_model_id: string | null;
+  agent_version: AgentVersion;
+  clarification_enabled: boolean;
+}
+
+export interface ApplicationRelease {
+  id: string;
+  application_id: string;
+  sequence: number;
+  draft_config_version: number;
+  config_schema_version: number;
+  config_hash: string;
+  config: PublishedApplicationConfig;
+  created_at: string;
+}
+
+export interface PublishedApplicationConfig {
+  schema_version: 1;
+  application_id: string;
+  agent_version: AgentVersion;
+  llm_model_id: string;
+  model: string;
+  provider: string;
+  base_url: string;
+  context_window_tokens: number;
+  knowledge_base_id: string;
+  knowledge_update_policy: "latest_committed";
+  clarification_enabled: boolean;
+  temperature: number;
+  thinking: boolean | null;
+  loop_guard: {
+    enabled: boolean;
+    repeat_warn_threshold: number;
+    repeat_hard_limit: number;
+    no_progress_warn_rounds: number;
+    no_progress_hard_rounds: number;
+    model_round_warn_threshold: number;
+    max_model_rounds: number;
+    tool_round_warn_threshold: number;
+    max_tool_rounds: number;
+    total_tool_call_warn_threshold: number;
+    max_total_tool_calls: number;
+    per_tool_hard_limits: Record<string, number>;
+    recursion_limit: number;
+    case_timeout_seconds: number;
+  };
+  prompt_version: number;
+  tool_schema_version: number;
+  checkpoint_schema_version: number;
+  v1_prompt_hash: string;
+}
+
+export interface ApplicationPublication {
+  application_id: string;
+  api_channel_created: boolean;
+  enabled: boolean;
+  active_release: ApplicationRelease | null;
+  deployment_version: number;
+  config_version: number;
+  has_unpublished_changes: boolean;
+  dependencies_ready: boolean;
+  dependency_error: string | null;
+  draft_ready: boolean;
+  draft_error: string | null;
+}
+
+export interface ApplicationApiClient {
+  id: string;
+  application_id: string;
+  name: string;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ApplicationApiKey {
+  key_id: string;
+  client_id: string;
+  name: string;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+}
+
+export interface ApplicationRun {
+  run_id: string;
+  app_id: string;
+  client_id: string;
+  release_id: string;
+  conversation_id: string;
+  status: string;
+  error_type: string | null;
+  error_status: number | null;
+  error_message: string | null;
+  result: PublicChatResponse | null;
+  created_at: string;
+  updated_at: string;
+  knowledge_base_content_version: number;
+  request_id: string | null;
+  duration_ms: number;
+  usage: Record<string, number> | null;
+}
+
+export interface PublicChatResponse {
+  app_id: string;
+  release_id: string;
+  run_id: string;
+  conversation_id: string;
+  message_id: string;
+  answer: string;
+  retrieved_snippets: SourceSnippet[];
+  usage: Record<string, number> | null;
+  ttft_ms: number | null;
+  clarification: ClarificationRequest | null;
+  knowledge_base_content_version: number;
+}
+
+export interface ApplicationPage<T> { items: T[]; total: number; }
 
 export interface KnowledgeBase {
   id: string;

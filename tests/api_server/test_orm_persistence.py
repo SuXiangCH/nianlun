@@ -56,6 +56,11 @@ def _seed_application(factory: SQLiteConnectionFactory) -> None:
 
 def test_orm_models_cover_all_business_tables():
     assert set(Base.metadata.tables) == {
+        "application_releases",
+        "application_deployments",
+        "application_api_clients",
+        "application_api_keys",
+        "application_runs",
         "knowledge_bases",
         "applications",
         "upload_operations",
@@ -94,8 +99,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 8
-    assert versions == {8}
+    assert migrations.SCHEMA_VERSION == 9
+    assert versions == {9}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -213,7 +218,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {8}
+    assert versions == {9}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -275,7 +280,7 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {8}
+    assert versions == {9}
 
 
 def test_schema_migration_replaces_document_hash_constraint_with_partial_index(

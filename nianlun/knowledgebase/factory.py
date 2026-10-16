@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from nianlun.indexing.fts.config import FTS_SCHEMA_CHECK_TIMEOUT_SECONDS
@@ -15,6 +16,7 @@ from nianlun.knowledgebase.core import KnowledgeBase
 from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
 from nianlun.knowledgebase.full_text_retriever import FullTextNodeRetriever
 from nianlun.knowledgebase.local_scan_retriever import LocalScanNodeRetriever
+from nianlun.knowledgebase.retrieval_ports import DocumentSearchPort, NodeSearchPort
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,8 @@ class KnowledgeBaseFactory:
     """根据应用配置创建 workspace、FTS 和语义检索适配器。"""
 
     config: KnowledgeBaseConfig
+    full_text_transform: Callable[[NodeSearchPort], NodeSearchPort] | None = None
+    semantic_transform: Callable[[DocumentSearchPort], DocumentSearchPort] | None = None
 
     def create(
         self,
@@ -33,15 +37,20 @@ class KnowledgeBaseFactory:
         allow_env_fallback: bool,
     ) -> KnowledgeBase:
         full_text_retriever = self._create_full_text_retriever()
+        semantic = self._create_semantic_retriever(
+            api_key=api_key,
+            base_url=base_url,
+            allow_env_fallback=allow_env_fallback,
+        )
+        if self.full_text_transform is not None:
+            full_text_retriever = self.full_text_transform(full_text_retriever)
+        if semantic is not None and self.semantic_transform is not None:
+            semantic = self.semantic_transform(semantic)
 
         return KnowledgeBase(
             workspace_dir=self.config.workspace_dir,
             full_text_retriever=full_text_retriever,
-            semantic_document_retriever=self._create_semantic_retriever(
-                api_key=api_key,
-                base_url=base_url,
-                allow_env_fallback=allow_env_fallback,
-            ),
+            semantic_document_retriever=semantic,
             snapshot_relpath=self.config.snapshot_relpath,
             snapshot_manifest_sha256=self.config.snapshot_manifest_sha256,
             knowledge_base_id=self.config.knowledge_base_id,

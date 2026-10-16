@@ -110,6 +110,21 @@ class AgentRuntime:
             cancellation_event=cancellation_event,
         )
 
+    def iter_public_events(
+        self,
+        messages: list[dict[str, str]],
+        thread_id: str,
+        *,
+        clarification_enabled: bool = False,
+        cancellation_event: threading.Event | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        return self.runner.iter_public_events(
+            messages,
+            thread_id=thread_id,
+            clarification_enabled=clarification_enabled,
+            cancellation_event=cancellation_event,
+        )
+
 
 def run_agent(
     runtime: AgentRuntime,

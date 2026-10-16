@@ -9,6 +9,12 @@ from app.api_server.apis.v1.knowledge_bases.api import (
     router as knowledge_bases_router,
 )
 from app.api_server.apis.v1.models.api import router as models_router
+from app.api_server.apis.v1.apps.publishing import router as publishing_router
+from app.api_server.apis.v1.runtime.api import (
+    router as runtime_router,
+    management_router as runs_router,
+)
+from app.api_server.apis.v1.runtime.openai import router as openai_router
 
 v1_router = APIRouter()
 # FastAPI 0.135+ keeps nested includes as lazy ``_IncludedRouter`` objects.
@@ -20,6 +26,10 @@ for child_router in (
     apps_router,
     chat_router,
     models_router,
+    publishing_router,
+    runtime_router,
+    runs_router,
+    openai_router,
 ):
     v1_router.routes.extend(child_router.routes)
 
