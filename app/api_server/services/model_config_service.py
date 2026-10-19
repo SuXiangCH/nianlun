@@ -3,21 +3,29 @@
 from __future__ import annotations
 
 import uuid
+import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 from fastapi import status
+from langchain_core.messages import HumanMessage
 
 from app.api_server.apis.v1.schemas import (
     ModelConfigTestRequest,
     ModelConfigTestResponse,
+    ModelConnectionCheck,
     ModelProfileRequest,
     ModelProfileResponse,
 )
 from app.api_server.common.errors import ApiError
 from app.api_server.config import ProviderConfig
 from app.api_server.repositories import SQLiteMetadataRepository
+from app.api_server.services.model_vision_probe import (
+    VISION_PROMPT,
+    create_vision_sample,
+)
 from nianlun.models.embedding import build_embeddings_model
 from nianlun.models.llm import build_chat_model
 
@@ -71,7 +79,8 @@ class ModelConfigService:
         for secret in secrets:
             if secret:
                 message = message.replace(secret, "***")
-        return message
+        # Providers may echo only a prefix of the submitted image URL.
+        return re.sub(r"data:image/[^\s\"'<>]*", "***", message, flags=re.IGNORECASE)
 
     @staticmethod
     def _test_parser_endpoint(
@@ -103,22 +112,59 @@ class ModelConfigService:
         defaults: tuple[str | None, str | None, str | None, int | None] | None = None,
     ) -> ModelConfigTestResponse:
         api_key: str | None = None
+        checks: list[ModelConnectionCheck] = []
+        probe_secrets: list[str | None] = []
         try:
             model, base_url, api_key, dimension = self._test_endpoint_values(
                 request, defaults
             )
+            probe_secrets.append(api_key)
             if not base_url:
                 raise RuntimeError("模型 API URL 未配置")
             if request.target in {"llm", "embedding"} and not model:
                 raise RuntimeError("模型名称未配置")
             if request.target == "llm":
-                build_chat_model(
+                llm = build_chat_model(
                     model=model,
                     base_url=base_url,
                     api_key=api_key,
                     allow_env_fallback=False,
-                ).invoke("连接测试：请仅回复 OK。")
+                    request_timeout_seconds=20.0,
+                    max_retries=0,
+                )
+                # Compatible endpoints differ on token-limit parameter names.
+                llm.invoke("连接测试：请仅回复 OK。")
+                checks.append(
+                    ModelConnectionCheck(
+                        capability="text", status="passed", message="文本连接成功"
+                    )
+                )
                 message = "LLM 连接成功"
+                if request.supports_vision is True:
+                    data_url = create_vision_sample()
+                    probe_secrets.extend((data_url, data_url.split(",", 1)[1]))
+                    # Probe transport compatibility without grading the reply.
+                    llm.invoke(
+                        [
+                            HumanMessage(
+                                content=[
+                                    {"type": "text", "text": VISION_PROMPT},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": data_url},
+                                    },
+                                ]
+                            )
+                        ],
+                    )
+                    checks.append(
+                        ModelConnectionCheck(
+                            capability="vision",
+                            status="passed",
+                            message="图片输入请求成功",
+                        )
+                    )
+                    message = "文本连接与图片输入请求通过"
             elif request.target == "embedding":
                 vector = build_embeddings_model(
                     model=model,
@@ -140,13 +186,34 @@ class ModelConfigService:
                     base_url, api_key, getattr(request, "api_mode", "saas_precision")
                 )
             return ModelConfigTestResponse(
-                target=request.target, ok=True, message=message
+                target=request.target, ok=True, message=message, checks=checks
             )
         except Exception as exc:
+            message = self._test_error_message(exc, tuple(probe_secrets))[:1000]
+            if request.target == "llm":
+                vision_failed = bool(checks)
+                if vision_failed and isinstance(exc, json.JSONDecodeError):
+                    message = "图片请求失败：接口响应格式无效，请检查接口兼容性"
+                checks.append(
+                    ModelConnectionCheck(
+                        capability="vision" if vision_failed else "text",
+                        status="failed",
+                        message=message,
+                    )
+                )
+                if request.supports_vision is True and not vision_failed:
+                    checks.append(
+                        ModelConnectionCheck(
+                            capability="vision",
+                            status="skipped",
+                            message="文本连接失败，未执行图片检测",
+                        )
+                    )
             return ModelConfigTestResponse(
                 target=request.target,
                 ok=False,
-                message=self._test_error_message(exc, (api_key,)),
+                message=message,
+                checks=checks,
             )
 
     @staticmethod
@@ -210,6 +277,8 @@ class ModelConfigService:
         values = request.model_dump()
         values["id"] = profile_id
         values["is_default"] = bool(request.is_default or current["is_default"])
+        if "supports_vision" not in request.model_fields_set:
+            values.pop("supports_vision")
         if "api_key" not in request.model_fields_set:
             values["api_key"] = current["api_key"]
         try:
@@ -295,6 +364,12 @@ class ModelConfigService:
             base_url=base_url,
             api_key=api_key,
             dimension=dimension,
+            supports_vision=(
+                override.supports_vision
+                if override is not None
+                and "supports_vision" in override.model_fields_set
+                else item.get("supports_vision")
+            ),
             api_mode=(
                 override.api_mode
                 if override is not None and "api_mode" in override.model_fields_set

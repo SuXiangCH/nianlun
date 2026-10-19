@@ -38,6 +38,7 @@ def _model_profile_dict(item: ModelProfile) -> dict[str, Any]:
         if embedding is not None
         else None,
         "context_window_tokens": llm.context_window_tokens if llm is not None else None,
+        "supports_vision": llm.supports_vision if llm is not None else None,
         "dimension": embedding.dimension if embedding is not None else None,
         "enabled": bool(embedding.enabled) if embedding is not None else False,
         "api_mode": parser.api_mode if parser is not None else "saas_precision",
@@ -123,6 +124,7 @@ class ModelProfileRepositoryMixin:
                     profile_id=profile_id,
                     model=config.get("model"),
                     context_window_tokens=config.get("context_window_tokens"),
+                    supports_vision=config.get("supports_vision"),
                 )
             )
         elif kind == "embedding":
@@ -159,6 +161,8 @@ class ModelProfileRepositoryMixin:
             session.add(item)
             item.model = config.get("model")
             item.context_window_tokens = config.get("context_window_tokens")
+            if "supports_vision" in config:
+                item.supports_vision = config["supports_vision"]
         elif kind == "embedding":
             item = session.get(
                 EmbeddingModelProfile, profile_id

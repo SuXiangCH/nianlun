@@ -773,6 +773,10 @@ h1 { margin-top: 0; font-size: 24px; font-weight: 650; letter-spacing: 0; }
 .model-workspace .model-profile-copy small { margin-top: 5px; color: var(--ink-faint); font-size: 11px; }
 .model-workspace .model-default-badge { flex-shrink: 0; padding: 2px 6px; border: 0; border-radius: 4px; color: var(--accent); background: var(--accent-pale); font-size: 10px; font-weight: 400; }
 .model-profile-spec { color: var(--ink-muted); font-size: 11px; overflow-wrap: anywhere; }
+.model-profile-spec > span { display: block; }
+.model-profile-spec .model-vision-status { display: flex; align-items: center; gap: 5px; margin-top: 6px; color: var(--ink-faint); }
+.model-vision-status svg { flex-shrink: 0; }
+.model-profile-spec .model-vision-status.is-supported { color: var(--accent); }
 .model-key-status { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-placeholder); font-size: 11px; white-space: nowrap; }
 .model-key-status::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .model-key-status.is-configured { color: var(--accent); }
@@ -794,6 +798,13 @@ h1 { margin-top: 0; font-size: 24px; font-weight: 650; letter-spacing: 0; }
 .model-editor .parser-toggle strong { font-size: 12px; font-weight: 400; white-space: nowrap; }
 .model-editor > .secret-clear { font-size: 11px; }
 .model-editor .modal-actions { margin-top: 14px; }
+.model-test-result.model-checks { display: grid; gap: 8px; color: var(--ink-body); background: var(--surface-muted); }
+.model-check-result { display: grid; grid-template-columns: 62px 40px minmax(0, 1fr); align-items: baseline; gap: 8px; font-size: 11px; }
+.model-check-result strong { font-weight: 500; }
+.model-check-result small { color: var(--ink-muted); font-size: inherit; overflow-wrap: anywhere; }
+.model-check-result.is-passed > span { color: var(--accent); }
+.model-check-result.is-failed > span { color: var(--coral); }
+.model-check-result.is-skipped > span { color: var(--ink-faint); }
 .model-spinning { animation: model-spin 1s linear infinite; }
 @keyframes model-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .model-spinning { animation: none; } }
@@ -807,6 +818,7 @@ h1 { margin-top: 0; font-size: 24px; font-weight: 650; letter-spacing: 0; }
   .main-content:has(.model-workspace) .topbar-actions { width: 100%; justify-content: flex-end; padding: 0; }
 }
 @media (max-width: 640px) {
+  .model-check-result small { grid-column: 1 / -1; }
   .model-toolbar { display: grid; grid-template-columns: 1fr; gap: 12px; }
   .model-navigation { min-height: 34px; margin: 0; }
   .model-navigation a { padding: 8px 0; }

@@ -45,6 +45,7 @@ const knowledgeBase = (overrides: Partial<KnowledgeBase>): KnowledgeBase => ({
 });
 
 const embeddingModel: ModelProfile = {
+  supports_vision: null,
   id: "embedding-1",
   kind: "embedding",
   name: "测试 Embedding",

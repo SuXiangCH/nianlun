@@ -41,6 +41,8 @@ def build_chat_model(
     api_key: str | None = None,
     base_url: str | None = None,
     allow_env_fallback: bool = True,
+    request_timeout_seconds: float = 300.0,
+    max_retries: int = 2,
 ) -> ChatOpenAI:
     """构建 ChatOpenAI。
 
@@ -67,7 +69,8 @@ def build_chat_model(
         "model": model,
         "api_key": api_key,
         "temperature": temperature,
-        "timeout": 300,
+        "timeout": request_timeout_seconds,
+        "max_retries": max_retries,
         # 让流式响应也回带 usage（OpenAI 的 stream_options.include_usage）。非流式
         # ``invoke`` 不受影响；流式路径据此读取 token 用量与缓存命中。
         "stream_usage": True,

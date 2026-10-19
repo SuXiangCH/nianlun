@@ -306,12 +306,18 @@ export interface ModelConfigTestRequest {
   api_key?: string | null;
   dimension?: number | null;
   api_mode?: "saas_precision" | "self_hosted";
+  supports_vision?: boolean | null;
 }
 
 export interface ModelConfigTestResult {
   target: ModelTestTarget;
   ok: boolean;
   message: string;
+  checks?: Array<{
+    capability: "text" | "vision";
+    status: "passed" | "failed" | "skipped";
+    message: string;
+  }>;
 }
 
 export type ModelKind = ModelTestTarget;
@@ -322,6 +328,7 @@ export interface ModelProfile {
   name: string;
   model: string | null;
   context_window_tokens: number | null;
+  supports_vision: boolean | null;
   base_url: string | null;
   api_key_configured: boolean;
   enabled: boolean;
@@ -343,6 +350,7 @@ export interface ModelProfileRequest {
   name: string;
   model: string | null;
   context_window_tokens: number | null;
+  supports_vision?: boolean | null;
   base_url: string;
   api_key?: string | null;
   enabled: boolean;
