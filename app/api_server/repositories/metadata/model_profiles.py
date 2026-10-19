@@ -5,11 +5,15 @@ from __future__ import annotations
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.api_server.database.connection import SQLiteConnectionFactory
+from app.api_server.common.errors import ApiError
+from app.api_server.repositories.publishing import PublishingRepository
 from app.api_server.database.models import (
     Application,
+    Document,
+    DocumentEnrichmentTask,
     EmbeddingModelProfile,
     KnowledgeBase,
     LLMModelProfile,
@@ -212,6 +216,23 @@ class ModelProfileRepositoryMixin:
                 raise KeyError(config["id"])
             if item.kind != config["kind"]:
                 raise ValueError("模型类型不可修改")
+            if item.kind == "llm":
+                current = _model_profile_dict(item)
+                execution_changed = (
+                    current["base_url"] != config.get("base_url")
+                    or current["model"] != config.get("model")
+                    or (current["context_window_tokens"] or 128_000)
+                    != (config.get("context_window_tokens") or 128_000)
+                )
+                if (
+                    execution_changed
+                    and PublishingRepository.count_live_resource_references(
+                        session, "llm_model_id", item.id
+                    )
+                ):
+                    raise ApiError(
+                        "模型仍被已启用发布入口或 API 会话使用，请复制为新模型", 409
+                    )
             if config.get("is_default"):
                 self._clear_default_profiles(session, item.kind)
             item.name = str(config["name"])
@@ -239,4 +260,44 @@ class ModelProfileRepositoryMixin:
             item = session.get(ModelProfile, profile_id)
             if item is None:
                 raise KeyError(profile_id)
+            if item.kind == "llm" and session.scalar(
+                select(KnowledgeBase.id)
+                .where(KnowledgeBase.llm_model_id == profile_id)
+                .limit(1)
+            ):
+                raise ApiError(
+                    "该 LLM 模型已被知识库使用，请先为这些知识库选择其他模型", 409
+                )
+            # A successful retry must release references from older failed attempts.
+            newer = aliased(DocumentEnrichmentTask)
+            if item.kind == "llm" and session.scalar(
+                select(DocumentEnrichmentTask.id)
+                .join(Document, Document.id == DocumentEnrichmentTask.document_id)
+                .where(
+                    DocumentEnrichmentTask.llm_profile_id == profile_id,
+                    DocumentEnrichmentTask.state.in_(("queued", "running", "failed")),
+                    Document.status != "deleted",
+                    Document.pipeline_generation
+                    == DocumentEnrichmentTask.pipeline_generation,
+                    ~select(newer.id)
+                    .where(
+                        newer.document_id == DocumentEnrichmentTask.document_id,
+                        newer.pipeline_generation
+                        == DocumentEnrichmentTask.pipeline_generation,
+                        newer.attempt > DocumentEnrichmentTask.attempt,
+                    )
+                    .exists(),
+                )
+                .limit(1)
+            ):
+                raise ApiError(
+                    "模型仍被未完成或可重试的文档处理任务使用，暂不能删除", 409
+                )
+            if (
+                item.kind == "llm"
+                and PublishingRepository.count_live_resource_references(
+                    session, "llm_model_id", profile_id
+                )
+            ):
+                raise ApiError("模型仍被已启用发布入口或 API 会话使用，暂不能删除", 409)
             session.delete(item)

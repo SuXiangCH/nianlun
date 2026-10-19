@@ -41,6 +41,9 @@ def create_app(
         try:
             yield
         finally:
+            invocations = getattr(active_services, "invocations", None)
+            if invocations is not None:
+                invocations.close()
             for service_name in ("chat", "documents", "fts", "vector"):
                 service = getattr(active_services, service_name)
                 try:

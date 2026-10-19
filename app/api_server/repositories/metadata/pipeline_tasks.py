@@ -9,6 +9,7 @@ from typing import Any, TypeVar
 from sqlalchemy import delete, func, or_, select, update
 
 from app.api_server.database.connection import SQLiteConnectionFactory
+from app.api_server.common.errors import ApiError
 from app.api_server.database.models import (
     Document,
     DocumentEnrichmentCallResult,
@@ -17,6 +18,8 @@ from app.api_server.database.models import (
     DocumentParseTask,
     DocumentPipelineEvent,
     DocumentStagingAllocation,
+    KnowledgeBase,
+    ModelProfile,
     UploadOperation,
 )
 
@@ -226,6 +229,7 @@ class DocumentPipelineRepositoryMixin:
         prompt_schema_version: int,
         options_json: str,
         now: str,
+        use_knowledge_base_model: bool = False,
     ) -> dict[str, Any]:
         with self.factory.session_scope(write=True) as session:
             document = session.get(Document, document_id)
@@ -255,6 +259,28 @@ class DocumentPipelineRepositoryMixin:
                     DocumentEnrichmentTask.pipeline_generation == pipeline_generation,
                 )
             )
+            if use_knowledge_base_model:
+                # Keep model selection and its durable reference in one write transaction.
+                kb = session.get(KnowledgeBase, document.knowledge_base_id)
+                if kb is None:
+                    raise ValueError("知识库不存在")
+                profile = (
+                    session.get(ModelProfile, kb.llm_model_id)
+                    if kb.llm_model_id
+                    else session.scalars(
+                        select(ModelProfile).where(
+                            ModelProfile.kind == "llm", ModelProfile.is_default == 1
+                        )
+                    ).first()
+                )
+                llm_profile_id = profile.id if profile is not None else None
+                llm_profile_updated_at = (
+                    profile.updated_at if profile is not None else None
+                )
+            if llm_profile_id is not None:
+                profile = session.get(ModelProfile, llm_profile_id)
+                if profile is None or profile.kind != "llm":
+                    raise ApiError("文档处理模型已变化，请重试", 409)
             item = DocumentEnrichmentTask(
                 id=str(uuid.uuid4()),
                 document_id=document_id,

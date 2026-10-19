@@ -3,6 +3,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 
 from nianlun.agent.middleware import (
@@ -31,6 +32,60 @@ def _make_summary_model(summary_text="compressed context"):
 
     model.ainvoke.side_effect = async_invoke
     return model
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_external_history_is_preserved_past_summarization_triggers(asynchronous):
+    model = _make_summary_model()
+    middleware = ContextSummarizationMiddleware(
+        model,
+        model_context_limit=100,
+        context_overhead_tokens=10,
+        token_counter=lambda _: 75,
+    )
+    messages = []
+    for index in range(17):
+        messages.extend(
+            [HumanMessage(content=f"question-{index}"), AIMessage(content="answer")]
+        )
+    messages.append(HumanMessage(content="follow up"))
+    original = [message.model_copy(deep=True) for message in messages]
+    runtime = SimpleNamespace(context={"input_messages": [{"role": "user"}]})
+
+    if asynchronous:
+        result = asyncio.run(middleware.abefore_model({"messages": messages}, runtime))
+    else:
+        result = middleware.before_model({"messages": messages}, runtime)
+
+    assert result is None
+    assert messages == original
+    model.invoke.assert_not_called()
+    model.ainvoke.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_external_history_over_capacity_fails_without_compaction(asynchronous):
+    model = _make_summary_model()
+    middleware = ContextSummarizationMiddleware(
+        model,
+        model_context_limit=100,
+        context_overhead_tokens=10,
+        token_counter=lambda _: 90,
+    )
+    messages = [HumanMessage(content="complete caller history")]
+    runtime = SimpleNamespace(context={"input_messages": [{"role": "user"}]})
+
+    with pytest.raises(ValueError, match="context capacity") as error:
+        if asynchronous:
+            asyncio.run(middleware.abefore_model({"messages": messages}, runtime))
+        else:
+            middleware.before_model({"messages": messages}, runtime)
+
+    # A typed error lets the public API map this to 400 instead of a generic 502.
+    assert type(error.value).__name__ == "HistoryOverCapacityError"
+    assert messages[0].content == "complete caller history"
+    model.invoke.assert_not_called()
+    model.ainvoke.assert_not_called()
 
 
 def _make_document_content_tool_message():

@@ -324,7 +324,8 @@ def test_v1_stream_only_emits_answer_text() -> None:
     assert [event["type"] for event in events].count("done") == 1
 
 
-def test_v1_answer_chunks_append_before_model_finishes() -> None:
+@pytest.mark.parametrize("public", [False, True])
+def test_v1_answer_chunks_append_before_model_finishes(public: bool) -> None:
     class PausedAnswerModel(GenericFakeChatModel):
         _release: threading.Event = PrivateAttr(default_factory=threading.Event)
         _finished: threading.Event = PrivateAttr(default_factory=threading.Event)
@@ -351,7 +352,14 @@ def test_v1_answer_chunks_append_before_model_finishes() -> None:
         kb=_KnowledgeBase(),
         agent_version="v1",
     )
-    events = runtime.iter_events("What was the revenue?", thread_id="live-answer")
+    events = (
+        runtime.iter_public_events(
+            [{"role": "user", "content": "What was the revenue?"}],
+            thread_id="live-answer",
+        )
+        if public
+        else runtime.iter_events("What was the revenue?", thread_id="live-answer")
+    )
     try:
         first = next(events)
         assert first["type"] == "message"
@@ -362,8 +370,9 @@ def test_v1_answer_chunks_append_before_model_finishes() -> None:
     remaining = list(events)
     chunks = [first, *[event for event in remaining if event["type"] == "message"]]
     assert len(chunks) > 1
-    assert all(event["data"]["phase"] == "candidate" for event in chunks)
-    assert {event["data"]["round"] for event in chunks} == {1}
+    if not public:
+        assert all(event["data"]["phase"] == "candidate" for event in chunks)
+        assert {event["data"]["round"] for event in chunks} == {1}
     assert "".join(event["data"]["delta"] for event in chunks) == "Revenue is 100 [1]."
     assert remaining[-1]["type"] == "done"
     assert remaining[-1]["data"]["answer"] == "Revenue is 100 [1]."

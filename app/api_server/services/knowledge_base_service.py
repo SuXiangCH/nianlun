@@ -134,6 +134,8 @@ class KnowledgeBaseService:
 
     def create(self, request: KnowledgeBaseCreateRequest) -> KnowledgeBaseResponse:
         knowledge_base_id = str(uuid.uuid4())
+        if request.llm_model_id is not None:
+            self.models.require_llm_profile(request.llm_model_id)
         if request.embedding_model_id is not None:
             self.models.require_embedding_profile(request.embedding_model_id)
         workspace_dir = self._workspace_path(knowledge_base_id)
@@ -154,6 +156,7 @@ class KnowledgeBaseService:
                 "document_count": 0,
                 "summary_enabled": request.summary_enabled,
                 "heading_recovery_enabled": request.heading_recovery_enabled,
+                "llm_model_id": request.llm_model_id,
                 "embedding_model_id": request.embedding_model_id,
                 "content_version": 0,
                 "fts_status": "disabled",
@@ -192,6 +195,10 @@ class KnowledgeBaseService:
             updates["summary_enabled"] = request.summary_enabled
         if request.heading_recovery_enabled is not None:
             updates["heading_recovery_enabled"] = request.heading_recovery_enabled
+        if "llm_model_id" in request.model_fields_set:
+            if request.llm_model_id is not None:
+                self.models.require_llm_profile(request.llm_model_id)
+            updates["llm_model_id"] = request.llm_model_id
         if "embedding_model_id" in request.model_fields_set:
             if request.embedding_model_id is None:
                 raise ApiError(
@@ -236,21 +243,24 @@ class KnowledgeBaseService:
     def delete(self, knowledge_base_id: str) -> dict[str, Any]:
         """Hard-delete a knowledge base and its API-owned workspace."""
         item = self.require_record(knowledge_base_id)
-        application_count = self.repository.count_applications_for_knowledge_base(
-            knowledge_base_id
-        )
-        if application_count:
-            raise ApiError(
-                "知识库仍被应用绑定，请先删除或解绑这些应用",
-                status.HTTP_409_CONFLICT,
-            )
-
         workspace = self._workspace_path(str(item["workspace_relpath"]))
-        if workspace.exists():
-            with workspace_lock(workspace):
-                shutil.rmtree(workspace)
-        if not self.repository.delete_knowledge_base(knowledge_base_id):
-            raise ApiError("知识库不存在", status.HTTP_404_NOT_FOUND)
+        staged = workspace.with_name(f".{workspace.name}.deleting-{uuid.uuid4().hex}")
+        lock = workspace_lock(workspace) if workspace.exists() else nullcontext()
+        with lock:
+            try:
+                with self.repository.deleting_knowledge_base(
+                    knowledge_base_id
+                ) as current:
+                    if current is None:
+                        raise ApiError("知识库不存在", status.HTTP_404_NOT_FOUND)
+                    if workspace.exists():
+                        workspace.rename(staged)
+            except BaseException:
+                if staged.exists():
+                    staged.rename(workspace)
+                raise
+            if staged.exists():
+                shutil.rmtree(staged)
         return item
 
     def add_markdown(
@@ -331,7 +341,7 @@ class KnowledgeBaseService:
                 elif item["summary_enabled"]:
                     _, document = build_workspace_doc(
                         str(staging_path),
-                        llm=self.models.build_llm(),
+                        llm=self.models.build_llm(item.get("llm_model_id")),
                         thin=tree_options.subtree_folding_enabled,
                         min_node_token=tree_options.min_subtree_tokens,
                     )

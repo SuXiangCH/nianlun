@@ -266,7 +266,7 @@ def test_hanging_llm_does_not_leave_document_running(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: delegate,
+        lambda _self, _profile_id=None: delegate,
     )
     client = TestClient(
         create_app(

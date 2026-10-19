@@ -9,6 +9,7 @@ import threading
 import uuid
 from contextlib import nullcontext
 from collections.abc import Callable
+from app.api_server.services.index_access import IndexAccessCoordinator
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,6 +62,8 @@ class FTSIndexService:
     base keeps that implementation isolated while SQLite revisions prevent a
     stale build from being advertised as ready after a concurrent upload.
     """
+
+    index_access: IndexAccessCoordinator | None = None
 
     def __init__(
         self,
@@ -254,6 +257,25 @@ class FTSIndexService:
             raise ApiError("API Server 未启用 FTS", status.HTTP_503_SERVICE_UNAVAILABLE)
 
     def _build(
+        self,
+        knowledge_base_id: str,
+        revision: int,
+        collection_name: str,
+        workspace_dir: Path,
+        *,
+        force: bool = False,
+    ) -> None:
+        coordinator = getattr(self, "index_access", None)
+        with (
+            coordinator.mutation(knowledge_base_id, "fts")
+            if coordinator
+            else nullcontext()
+        ):
+            self._build_locked(
+                knowledge_base_id, revision, collection_name, workspace_dir, force=force
+            )
+
+    def _build_locked(
         self,
         knowledge_base_id: str,
         revision: int,

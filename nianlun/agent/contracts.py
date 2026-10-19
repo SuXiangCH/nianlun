@@ -88,6 +88,7 @@ class AgentRequestContext(TypedDict):
     loop_guard_state: NotRequired[Any]
     status_sink: NotRequired[Any]
     cancellation_event: NotRequired[Any]
+    input_messages: NotRequired[list[dict[str, str]]]
 
 
 __all__ = [

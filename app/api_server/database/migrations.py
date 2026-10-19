@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import sqlite3
 
+from sqlalchemy import MetaData
+from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
+from sqlalchemy.schema import CreateIndex, CreateTable
+
 from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 11
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -20,7 +24,7 @@ def _record_current_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO schema_migrations(version, name, applied_at)
-        VALUES (?, 'application_agent_version', CURRENT_TIMESTAMP)
+        VALUES (?, 'knowledge_base_llm_selection', CURRENT_TIMESTAMP)
         """,
         (SCHEMA_VERSION,),
     )
@@ -45,6 +49,18 @@ def _migrate_heading_recovery_enabled(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE knowledge_bases "
             "ADD COLUMN heading_recovery_enabled INTEGER NOT NULL DEFAULT 1"
+        )
+
+
+def _migrate_knowledge_base_llm(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute('PRAGMA table_info("knowledge_bases")')
+    }
+    if "llm_model_id" not in columns:
+        connection.execute(
+            "ALTER TABLE knowledge_bases ADD COLUMN llm_model_id VARCHAR NULL "
+            "REFERENCES model_profiles(id) ON DELETE RESTRICT"
         )
 
 
@@ -380,6 +396,73 @@ def _migrate_application_agent_version(connection: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_application_api(connection: sqlite3.Connection) -> None:
+    additions = {
+        "applications": {"clarification_enabled": "BOOLEAN NOT NULL DEFAULT 1"},
+        "conversations": {
+            "channel": "VARCHAR NOT NULL DEFAULT 'console'",
+            "api_client_id": "VARCHAR NULL",
+            "external_user_id": "VARCHAR NULL",
+            "release_id": "VARCHAR NULL",
+            "context_state": "VARCHAR NOT NULL DEFAULT 'ready'",
+            "expires_at": "VARCHAR(64) NULL",
+        },
+    }
+    for table, columns in additions.items():
+        existing = {
+            str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                connection.execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}'
+                )
+    _rebuild_conversations_api_constraints(connection)
+
+
+def _rebuild_conversations_api_constraints(connection: sqlite3.Connection) -> None:
+    """Install the ownership checks SQLite cannot add with ALTER TABLE."""
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
+    ).fetchone()
+    required_checks = {
+        "ck_conversations_channel",
+        "ck_conversations_api_owner",
+        "ck_conversations_context_state",
+    }
+    if table_sql is not None and all(
+        name in str(table_sql[0]) for name in required_checks
+    ):
+        return
+
+    dependent_definitions = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = 'conversations' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        )
+    ]
+    # Compile the replacement from the ORM so fresh and upgraded schemas agree.
+    replacement_metadata = MetaData()
+    Base.metadata.tables["applications"].to_metadata(replacement_metadata)
+    source = Base.metadata.tables["conversations"]
+    replacement = source.to_metadata(replacement_metadata, name="conversations_v9")
+    dialect = sqlite_dialect()
+    connection.execute(str(CreateTable(replacement).compile(dialect=dialect)))
+    columns = ", ".join(f'"{column.name}"' for column in source.columns)
+    connection.execute(
+        f"INSERT INTO conversations_v9 ({columns}) SELECT {columns} FROM conversations"
+    )
+    connection.execute("DROP TABLE conversations")
+    connection.execute("ALTER TABLE conversations_v9 RENAME TO conversations")
+    for definition in dependent_definitions:
+        connection.execute(definition)
+    for index in source.indexes:
+        connection.execute(
+            str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect))
+        )
+
+
 def _rebuild_document_artifacts_for_v2_kinds(
     connection: sqlite3.Connection,
 ) -> None:
@@ -436,6 +519,18 @@ def _rebuild_document_artifacts_for_v2_kinds(
         "CREATE INDEX idx_document_artifacts_document_kind "
         "ON document_artifacts(document_id, kind)"
     )
+
+
+def _migrate_release_descriptions(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute('PRAGMA table_info("application_releases")')
+    }
+    if "description" not in columns:
+        connection.execute(
+            "ALTER TABLE application_releases "
+            "ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def _require_current_schema(connection: sqlite3.Connection) -> None:
@@ -498,6 +593,9 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
         _migrate_document_tombstones(connection)
         _migrate_parse_chunk_plan(connection)
         _migrate_application_agent_version(connection)
+        _migrate_application_api(connection)
+        _migrate_release_descriptions(connection)
+        _migrate_knowledge_base_llm(connection)
         _require_current_schema(connection)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:

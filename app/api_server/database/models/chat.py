@@ -36,6 +36,18 @@ class Conversation(Base):
             "status IN ('active', 'archived', 'deleted')",
             name="ck_conversations_status",
         ),
+        CheckConstraint(
+            "channel IN ('console', 'api')", name="ck_conversations_channel"
+        ),
+        CheckConstraint(
+            "(channel = 'console' AND api_client_id IS NULL AND external_user_id IS NULL AND release_id IS NULL) OR "
+            "(channel = 'api' AND api_client_id IS NOT NULL AND external_user_id IS NOT NULL AND length(trim(external_user_id)) > 0 AND release_id IS NOT NULL)",
+            name="ck_conversations_api_owner",
+        ),
+        CheckConstraint(
+            "context_state IN ('ready', 'interrupted', 'cleanup_pending', 'expired')",
+            name="ck_conversations_context_state",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
@@ -47,6 +59,16 @@ class Conversation(Base):
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
     last_message_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    channel: Mapped[str] = mapped_column(
+        String, nullable=False, default="console", server_default="console"
+    )
+    api_client_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    external_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    release_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    context_state: Mapped[str] = mapped_column(
+        String, nullable=False, default="ready", server_default="ready"
+    )
+    expires_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     application: Mapped[Application] = relationship(back_populates="conversations")
     messages: Mapped[list[Message]] = relationship(

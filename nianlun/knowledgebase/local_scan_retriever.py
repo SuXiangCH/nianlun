@@ -34,6 +34,9 @@ class LocalScanNodeRetriever:
         )
         self.knowledge_base_id = knowledge_base_id
 
+    def close(self) -> None:
+        self.view.close()
+
     def search(
         self,
         query: str,

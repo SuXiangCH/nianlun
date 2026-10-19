@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Generator
+from contextlib import contextmanager
 from typing import Any, Literal
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.api_server.database.connection import SQLiteConnectionFactory
+from app.api_server.common.errors import ApiError
 from app.api_server.database.models import (
     Application,
     KnowledgeBase,
@@ -29,6 +32,8 @@ from app.api_server.repositories.metadata.publishing import (
     WorkspaceRevisionRepositoryMixin,
 )
 from app.api_server.repositories.metadata.uploads import UploadOperationRepositoryMixin
+from app.api_server.repositories.publishing import PublishingRepository
+from app.api_server.database.models.application_runs import ApplicationRun
 
 MetadataKind = Literal["knowledge_bases", "applications"]
 
@@ -43,6 +48,7 @@ def _knowledge_base_dict(item: KnowledgeBase) -> dict[str, Any]:
         "document_count": item.document_count,
         "summary_enabled": bool(item.summary_enabled),
         "heading_recovery_enabled": bool(item.heading_recovery_enabled),
+        "llm_model_id": item.llm_model_id,
         "content_version": item.content_version,
         "fts_status": item.fts_status,
         "fts_revision": item.fts_revision,
@@ -78,6 +84,7 @@ def _application_dict(item: Application) -> dict[str, Any]:
         "search_mode": item.search_mode,
         "config_version": item.config_version,
         "agent_version": item.agent_version,
+        "clarification_enabled": item.clarification_enabled,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -168,6 +175,7 @@ class SQLiteMetadataRepository(
             "name",
             "summary_enabled",
             "heading_recovery_enabled",
+            "llm_model_id",
             "vector_model_id",
             "vector_status",
             "vector_revision",
@@ -195,24 +203,34 @@ class SQLiteMetadataRepository(
             session.flush()
             return _knowledge_base_dict(entity)
 
-    def count_applications_for_knowledge_base(self, knowledge_base_id: str) -> int:
-        with self.factory.session_scope() as session:
-            count = session.scalar(
-                select(func.count(Application.id)).where(
-                    Application.knowledge_base_id == knowledge_base_id
-                )
-            )
-            return int(count or 0)
-
     def delete_knowledge_base(self, knowledge_base_id: str) -> bool:
-        """Hard-delete a knowledge base after its workspace is cleaned up."""
+        with self.deleting_knowledge_base(knowledge_base_id) as item:
+            return item is not None
+
+    @contextmanager
+    def deleting_knowledge_base(
+        self, knowledge_base_id: str
+    ) -> Generator[dict[str, Any] | None, None, None]:
+        """Hold the reference fence while the service stages workspace removal."""
         with self.factory.session_scope(write=True) as session:
             item = session.get(KnowledgeBase, knowledge_base_id)
             if item is None:
-                return False
+                yield None
+                return
+            draft = session.scalar(
+                select(Application.id)
+                .where(Application.knowledge_base_id == knowledge_base_id)
+                .limit(1)
+            )
+            if draft is not None or PublishingRepository.count_live_resource_references(
+                session, "knowledge_base_id", knowledge_base_id
+            ):
+                raise ApiError(
+                    "知识库仍有应用绑定，或被发布版本、API 会话使用，暂不能删除", 409
+                )
+            yield _knowledge_base_dict(item)
             session.delete(item)
             session.flush()
-            return True
 
     def delete_application(self, application_id: str) -> bool:
         """Hard-delete an application; dependent chat data cascades in SQLite."""
@@ -220,6 +238,12 @@ class SQLiteMetadataRepository(
             item = session.get(Application, application_id)
             if item is None:
                 return False
+            PublishingRepository.assert_application_deletable(session, application_id)
+            session.execute(
+                delete(ApplicationRun).where(
+                    ApplicationRun.application_id == application_id
+                )
+            )
             session.delete(item)
             session.flush()
             return True
@@ -241,6 +265,7 @@ class SQLiteMetadataRepository(
                 heading_recovery_enabled=bool(
                     item.get("heading_recovery_enabled", True)
                 ),
+                llm_model_id=item.get("llm_model_id"),
                 content_version=int(item.get("content_version", 0)),
                 fts_status=item.get("fts_status", "disabled"),
                 fts_revision=item.get("fts_revision"),
@@ -275,6 +300,7 @@ class SQLiteMetadataRepository(
             entity.heading_recovery_enabled = bool(
                 item.get("heading_recovery_enabled", True)
             )
+            entity.llm_model_id = item.get("llm_model_id")
             entity.content_version = int(item.get("content_version", 0))
             entity.fts_status = item.get("fts_status", "disabled")
             entity.fts_revision = item.get("fts_revision")
@@ -312,6 +338,7 @@ class SQLiteMetadataRepository(
                     search_mode="fts",
                     config_version=int(item.get("config_version", 1)),
                     agent_version=item.get("agent_version", "v0"),
+                    clarification_enabled=bool(item.get("clarification_enabled", True)),
                     created_at=item["created_at"],
                     updated_at=item["updated_at"],
                 )
@@ -325,6 +352,7 @@ class SQLiteMetadataRepository(
         entity.search_mode = "fts"
         entity.config_version = int(item.get("config_version", 1))
         entity.agent_version = item.get("agent_version", "v0")
+        entity.clarification_enabled = bool(item.get("clarification_enabled", True))
         entity.updated_at = item["updated_at"]
 
 

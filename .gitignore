@@ -53,9 +53,12 @@ node_modules/
 app/frontend/node_modules/
 docs/*
 !docs/usage.md
+!docs/application_api.md
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/evaluation.md
 !docs/architecture/agent_tool_loop_guard.md
 !docs/architecture/weak_titled_markdown_structure_design.md
 !docs/architecture/document_processing_pipeline_design.md
+!docs/architecture/application_api_publishing_design.md
+!docs/architecture/application_api_publishing_plan.md

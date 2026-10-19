@@ -7,11 +7,12 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import status
 
 from nianlun.agent.contracts import AGENT_TOOL_SCHEMA_VERSION
+from nianlun.config import get_enable_thinking, get_openai_temperature
 from nianlun.agent.lead_agent.prompt import PROMPT_VERSION
 from nianlun.agent.lead_agent.runtime import AgentRuntime
 from nianlun.agent.lead_agent.factory import AgentRuntimeFactory
@@ -24,6 +25,20 @@ from app.api_server.common.errors import ApiError
 from app.api_server.repositories import SQLiteMetadataRepository
 from app.api_server.services.model_config_service import ModelConfigService
 from nianlun.knowledgebase import KnowledgeBaseConfig
+from nianlun.knowledgebase.factory import KnowledgeBaseFactory
+from nianlun.knowledgebase.local_scan_retriever import LocalScanNodeRetriever
+from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
+    AgentLoopGuardConfig,
+)
+from app.api_server.services.workspace_store import workspace_lock
+from app.api_server.services.index_access import (
+    IndexAccessCoordinator,
+    GuardedFullTextRetriever,
+    GuardedSemanticRetriever,
+)
+
+if TYPE_CHECKING:
+    from app.api_server.apis.v1.publishing_schemas import PublishedConfig
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +99,7 @@ class ApplicationService:
         self.embedding_model = embedding_model
         self.embedding_dim = embedding_dim
         self.model_config_service = model_config_service
+        self.index_access = IndexAccessCoordinator(knowledge_base_lookup)
         self._runtimes: dict[
             str, tuple[RuntimeCapabilityFingerprint, AgentRuntime]
         ] = {}
@@ -153,14 +169,129 @@ class ApplicationService:
             "search_mode": "fts",
             "config_version": 1,
             "agent_version": request.agent_version,
+            "clarification_enabled": request.clarification_enabled,
             "created_at": timestamp.isoformat(),
             "updated_at": timestamp.isoformat(),
         }
         self.repository.put("applications", application_id, item)
         return self._response(item)
 
+    def release_runtime(
+        self,
+        config: PublishedConfig,
+        checkpointer: Any,
+        knowledge_base_record: dict[str, Any],
+    ) -> AgentRuntime:
+        """Build one bounded invocation runtime while pinning its current snapshot."""
+        if self.model_config_service is None:
+            raise ApiError("API Server 未启用模型配置服务", 503)
+        profile = self.model_config_service.require_llm_profile(config.llm_model_id)
+        workspace = Path(knowledge_base_record["workspace_dir"])
+        with workspace_lock(workspace):
+            knowledge = self.knowledge_base_lookup(config.knowledge_base_id)
+            knowledge_base_record.update(knowledge)
+            if not knowledge.get("snapshot_relpath") or not knowledge.get(
+                "snapshot_manifest_sha256"
+            ):
+                raise ApiError("知识库 committed snapshot 不可用", 503)
+            revision = int(knowledge["content_version"])
+            embedding: dict[str, Any] = {"enabled": False}
+            if knowledge.get("embedding_model_id"):
+                embedding = self.model_config_service.embedding_runtime_config(
+                    str(knowledge["embedding_model_id"]),
+                    strict=False,
+                )
+            kb_config = KnowledgeBaseConfig(
+                workspace_dir=workspace,
+                knowledge_base_id=config.knowledge_base_id,
+                content_version=revision,
+                snapshot_relpath=knowledge["snapshot_relpath"],
+                snapshot_manifest_sha256=knowledge["snapshot_manifest_sha256"],
+                fts_enabled=self.fts_enabled,
+                fts_ready=knowledge.get("fts_status") == "ready"
+                and knowledge.get("fts_revision") == revision,
+                fts_collection=knowledge.get("fts_collection"),
+                milvus_uri=self.milvus_uri,
+                milvus_token=self.milvus_token,
+                vector_enabled=self._vector_index_ready(knowledge, embedding),
+                vector_collection=knowledge.get("vector_collection"),
+                embedding_model=embedding.get("model"),
+                embedding_dim=embedding.get("dimension"),
+                embedding_base_url=embedding.get("base_url"),
+                embedding_api_key=embedding.get("api_key"),
+            )
+
+            def guard_fts(remote):
+                if isinstance(remote, LocalScanNodeRetriever):
+                    return remote
+                fallback = LocalScanNodeRetriever(
+                    workspace_dir=workspace,
+                    snapshot_relpath=knowledge["snapshot_relpath"],
+                    snapshot_manifest_sha256=knowledge["snapshot_manifest_sha256"],
+                    knowledge_base_id=config.knowledge_base_id,
+                    content_version=revision,
+                )
+                return GuardedFullTextRetriever(
+                    self.index_access,
+                    config.knowledge_base_id,
+                    revision,
+                    remote,
+                    fallback,
+                )
+
+            try:
+                knowledge_base = KnowledgeBaseFactory(
+                    kb_config,
+                    full_text_transform=guard_fts,
+                    semantic_transform=lambda remote: GuardedSemanticRetriever(
+                        self.index_access, config.knowledge_base_id, revision, remote
+                    ),
+                ).create(
+                    api_key=profile.get("api_key"),
+                    base_url=config.base_url,
+                    allow_env_fallback=False,
+                )
+            except RuntimeError as exc:
+                # The knowledge base cannot serve retrieval (no FTS, no usable
+                # committed snapshot): a service-capability gap, not a caller error.
+                logger.exception(
+                    "agent.release_runtime_knowledge_base_unavailable application_id=%s",
+                    config.application_id,
+                )
+                raise ApiError(
+                    "知识库检索不可用", status.HTTP_503_SERVICE_UNAVAILABLE
+                ) from exc
+        try:
+            return self.runtime_factory(
+                knowledge_base=knowledge_base,
+                model=config.model,
+                base_url=config.base_url,
+                api_key=profile.get("api_key"),
+                context_window_tokens=config.context_window_tokens,
+                allow_env_fallback=False,
+                tool_logging=False,
+                agent_version=config.agent_version,
+                temperature=config.temperature,
+                enable_thinking=config.thinking,
+                loop_guard_config=AgentLoopGuardConfig(
+                    **config.loop_guard.model_dump()
+                ),
+                checkpointer=checkpointer,
+            )
+        except BaseException:
+            close = getattr(knowledge_base, "close", None)
+            if callable(close):
+                close()
+            raise
+
+    @staticmethod
+    def release_runtime_resources(runtime: AgentRuntime) -> None:
+        close = getattr(runtime.kb, "close", None)
+        if callable(close):
+            close()
+
     def delete(self, application_id: str) -> None:
-        """Hard-delete an application and its persisted conversations."""
+        """Delete an application after live API dependencies have been released."""
         with self._lock:
             if not self.repository.delete_application(application_id):
                 raise ApiError("应用不存在", status.HTTP_404_NOT_FOUND)
@@ -273,16 +404,32 @@ class ApplicationService:
                 snapshot_manifest_sha256=knowledge_base.get("snapshot_manifest_sha256"),
                 content_version=content_version,
             )
-            runtime = self.runtime_factory(
-                knowledge_base_config=config,
-                model=effective_model or provider.model,
-                base_url=provider.base_url,
-                api_key=provider.api_key,
-                context_window_tokens=context_window_tokens,
-                allow_env_fallback=False,
-                tool_logging=False,
-                agent_version=item.get("agent_version", "v0"),
-            )
+            try:
+                runtime = self.runtime_factory(
+                    knowledge_base_config=config,
+                    model=effective_model or provider.model,
+                    base_url=provider.base_url,
+                    api_key=provider.api_key,
+                    context_window_tokens=context_window_tokens,
+                    allow_env_fallback=False,
+                    tool_logging=False,
+                    agent_version=item.get("agent_version", "v0"),
+                    # The console/editor runtime keeps the CLI sampling defaults; only
+                    # published releases pin temperature/thinking from their config.
+                    temperature=get_openai_temperature(),
+                    enable_thinking=get_enable_thinking(),
+                )
+            except RuntimeError as exc:
+                # Knowledge-base construction failures surface as a capability gap.
+                # Log the original so a non-FTS RuntimeError is not silently masked.
+                logger.exception(
+                    "agent.runtime_build_failed application_id=%s error=%s",
+                    application_id,
+                    exc,
+                )
+                raise ApiError(
+                    "知识库检索不可用", status.HTTP_503_SERVICE_UNAVAILABLE
+                ) from exc
             runtime_kb = getattr(runtime, "kb", None)
             if vector_enabled and runtime_kb is not None and not runtime_kb.has_vector:
                 logger.warning(

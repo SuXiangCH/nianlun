@@ -344,6 +344,14 @@ def _extract_summary_text(model_response: Any) -> str:
     return ""
 
 
+class HistoryOverCapacityError(ValueError):
+    """The caller-owned transcript exceeds the model context budget.
+
+    Typed so the public API can map it to a deterministic 400, while callers
+    that only catch ``ValueError`` keep working.
+    """
+
+
 class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
     """通用的上下文预算和证据感知摘要 middleware。
 
@@ -446,12 +454,25 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
     async def abefore_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
         return await self._build_async_summarization_state_update(state, runtime)
 
+    def _preserve_external_history(self, runtime: Any, total_tokens: int) -> bool:
+        context = getattr(runtime, "context", None)
+        if not isinstance(context, Mapping) or context.get("input_messages") is None:
+            return False
+        # Public callers own the history; never silently replace it with a summary.
+        if self._has_reached_hard_context_token_limit(total_tokens):
+            raise HistoryOverCapacityError(
+                "Complete request history exceeds model context capacity"
+            )
+        return True
+
     def _build_summarization_state_update(
         self, state: Any, runtime: Any
     ) -> dict[str, Any] | None:
         messages = state["messages"]
-        self._ensure_message_ids(messages)
         total_tokens = self.token_counter(messages)
+        if self._preserve_external_history(runtime, total_tokens):
+            return None
+        self._ensure_message_ids(messages)
         if not self._should_summarize(messages, total_tokens):
             return None
 
@@ -523,8 +544,10 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
         self, state: Any, runtime: Any
     ) -> dict[str, Any] | None:
         messages = state["messages"]
-        self._ensure_message_ids(messages)
         total_tokens = self.token_counter(messages)
+        if self._preserve_external_history(runtime, total_tokens):
+            return None
+        self._ensure_message_ids(messages)
         if not self._should_summarize(messages, total_tokens):
             return None
 

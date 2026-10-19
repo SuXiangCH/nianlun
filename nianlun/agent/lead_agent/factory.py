@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -52,6 +53,9 @@ class AgentRuntimeFactory:
     allow_env_fallback: bool = True
     loop_guard_config: AgentLoopGuardConfig | None = None
     agent_version: AgentVersion = "v0"
+    temperature: float | None = None
+    enable_thinking: bool | None = None
+    checkpointer: Any = None
 
     def __post_init__(self) -> None:
         if self.knowledge_base is not None and self.knowledge_base_config is not None:
@@ -89,8 +93,18 @@ class AgentRuntimeFactory:
 
         llm = build_chat_model(
             model=model,
-            temperature=get_openai_temperature(),
-            enable_thinking=get_enable_thinking(),
+            temperature=(
+                self.temperature
+                if self.temperature is not None
+                else get_openai_temperature()
+                if self.allow_env_fallback
+                else 0.0
+            ),
+            enable_thinking=(
+                get_enable_thinking()
+                if self.allow_env_fallback and self.enable_thinking is None
+                else self.enable_thinking
+            ),
             api_key=api_key,
             base_url=base_url,
             allow_env_fallback=self.allow_env_fallback,
@@ -106,7 +120,7 @@ class AgentRuntimeFactory:
         )
         loop_guard_config = self.loop_guard_config or AgentLoopGuardConfig()
         middleware = [
-            *([RequestCancellationMiddleware()] if self.agent_version == "v1" else []),
+            RequestCancellationMiddleware(),
             ContextSummarizationMiddleware(
                 llm,
                 context_overhead_tokens=estimate_agent_context_overhead(
@@ -124,7 +138,11 @@ class AgentRuntimeFactory:
             llm,
             tools=tools,
             system_prompt=effective_system_prompt,
-            checkpointer=MemorySaver(),
+            checkpointer=(
+                self.checkpointer if self.checkpointer is not None else MemorySaver()
+            )
+            if self.agent_version == "v0"
+            else None,
             context_schema=AgentRequestContext,
             name="pageindex-multi-doc-rag",
             middleware=middleware,
@@ -135,6 +153,7 @@ class AgentRuntimeFactory:
                 answer_model=llm,
                 recursion_limit=loop_guard_config.recursion_limit,
                 context_window_tokens=self.context_window_tokens,
+                checkpointer=self.checkpointer,
             )
         return AgentRuntime(
             agent=graph,

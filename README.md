@@ -61,7 +61,7 @@ npm run dev
 
 1. **导入数据集（可选，替代手动上传）**：`uv run python -m app.api_server.import_datasets --knowledge-base 财报数据集 --create`——把 `datasets/` 的全部财报（Markdown + 预建树，含 LLM 摘要）批量灌入知识库，零模型调用，前端直接可见；导入后自动构建 FTS（需 Milvus 可达，不可达时文档仍可见、FTS 可稍后重建）。详见 [`datasets/README.md`](datasets/README.md)。
 2. **模型管理**：配置 LLM Profile（provider / model / api_key / base_url），可选配置 Embedding 与 MinerU 解析器。模型目录存于 SQLite，是 API Server 唯一的模型配置来源（不依赖 `.env` 中的模型项）。
-3. **知识库**：创建知识库并上传文档。Markdown 直接解析入库；PDF / Word 经 MinerU（SaaS 或私有化部署）转换为 Markdown 后入库，入库后自动构建 FTS 索引，可按需再开启向量索引。
+3. **知识库**：创建知识库并上传文档。Markdown 直接解析入库；PDF / Word 经 MinerU（SaaS 或私有化部署）转换为 Markdown 后入库，入库后自动构建 FTS 索引，可按需再开启向量索引。文档处理 LLM 可在创建时或知识库设置中单独选择，留空时跟随系统默认；切换用于后续进入增强队列的任务，已有文档不会自动重跑，Agent 对话模型仍独立配置。
 4. **应用**：创建应用，绑定知识库与模型，选择检索模式。
 5. **对话**：在对话页选择应用提问，流式输出回答并展示命中的证据片段。
 

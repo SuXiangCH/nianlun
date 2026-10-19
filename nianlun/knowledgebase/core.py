@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from nianlun.knowledgebase.config import (
     NODE_HINT_SUMMARY_LIMIT,
@@ -18,11 +18,7 @@ from nianlun.knowledgebase.config import (
     WORKSPACE_DIR,
 )
 from nianlun.knowledgebase.workspace_view import WorkspaceView
-
-if TYPE_CHECKING:
-    from nianlun.knowledgebase.semantic_retriever import SemanticDocumentRetriever
-    from nianlun.knowledgebase.full_text_retriever import FullTextNodeRetriever
-    from nianlun.knowledgebase.local_scan_retriever import LocalScanNodeRetriever
+from nianlun.knowledgebase.retrieval_ports import DocumentSearchPort, NodeSearchPort
 
 
 MAX_LINE_SPEC_LINES = 500
@@ -63,10 +59,8 @@ class KnowledgeBase:
         self,
         workspace_dir: Path | str = WORKSPACE_DIR,
         *,
-        full_text_retriever: FullTextNodeRetriever
-        | LocalScanNodeRetriever
-        | None = None,
-        semantic_document_retriever: SemanticDocumentRetriever | None = None,
+        full_text_retriever: NodeSearchPort | None = None,
+        semantic_document_retriever: DocumentSearchPort | None = None,
         snapshot_relpath: str | None = None,
         snapshot_manifest_sha256: str | None = None,
         knowledge_base_id: str | None = None,
@@ -106,6 +100,14 @@ class KnowledgeBase:
     def has_vector(self) -> bool:
         """Whether semantic document routing is available."""
         return self._semantic_document_retriever is not None
+
+    def close(self) -> None:
+        """Release immutable snapshot readers owned by this runtime."""
+        self._workspace_view.close()
+        for retriever in (self._full_text_retriever, self._semantic_document_retriever):
+            close = getattr(retriever, "close", None)
+            if callable(close):
+                close()
 
     # ============ 数据加载 ============
 

@@ -9,6 +9,13 @@ from app.api_server.config import ApiServerSettings
 from app.api_server.database import SQLiteConnectionFactory, initialize_database
 from app.api_server.repositories import SQLiteChatRepository, SQLiteMetadataRepository
 from app.api_server.services.application_service import ApplicationService
+from app.api_server.repositories.publishing import PublishingRepository
+from app.api_server.services.application_release_service import (
+    ApplicationReleaseService,
+)
+from app.api_server.services.application_invocation_service import (
+    ApplicationInvocationService,
+)
 from app.api_server.services.chat_service import ChatService
 from app.api_server.services.document_ingestion_service import DocumentIngestionService
 from app.api_server.services.fts_index_service import FTSIndexService
@@ -30,6 +37,8 @@ class ApiServices:
     applications: ApplicationService
     chat: ChatService
     models: ModelConfigService
+    publishing: ApplicationReleaseService
+    invocations: ApplicationInvocationService
 
 
 def build_services(settings: ApiServerSettings) -> ApiServices:
@@ -89,11 +98,17 @@ def build_services(settings: ApiServerSettings) -> ApiServices:
         embedding_dim=settings.embedding_dim,
         model_config_service=models,
     )
+    fts.index_access = applications.index_access
+    vector.index_access = applications.index_access
     documents.recover_workspace_documents()
     knowledge_bases.reconcile()
     fts.recover_pending()
     vector.recover_pending()
     documents.recover()
+    publishing = ApplicationReleaseService(PublishingRepository(factory), applications)
+    invocations = ApplicationInvocationService(
+        publishing, applications, factory, settings
+    )
     return ApiServices(
         knowledge_bases=knowledge_bases,
         documents=documents,
@@ -102,6 +117,8 @@ def build_services(settings: ApiServerSettings) -> ApiServices:
         applications=applications,
         chat=ChatService(applications, chat_repository),
         models=models,
+        publishing=publishing,
+        invocations=invocations,
     )
 
 

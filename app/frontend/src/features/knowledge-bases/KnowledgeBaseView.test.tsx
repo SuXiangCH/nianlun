@@ -3,7 +3,7 @@
 import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { KnowledgeBase, ModelProfile } from "../../types";
+import type { KnowledgeBase, KnowledgeBaseDocument, ModelProfile } from "../../types";
 import { KnowledgeBaseView } from "./KnowledgeBaseView";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -16,6 +16,7 @@ const knowledgeBase = (overrides: Partial<KnowledgeBase>): KnowledgeBase => ({
   document_count: 1,
   summary_enabled: true,
   heading_recovery_enabled: true,
+  llm_model_id: null,
   workspace_dir: "/tmp/kb-1",
   workspace_relpath: "kb-1",
   content_version: 2,
@@ -65,6 +66,18 @@ const embeddingModel: ModelProfile = {
   updated_at: "2026-08-15T00:00:00Z",
 };
 
+const documentRecord = (overrides: Partial<KnowledgeBaseDocument> = {}): KnowledgeBaseDocument => ({
+  id: "doc-1", knowledge_base_id: "kb-1", original_filename: "report.md", file_extension: ".md",
+  mime_type: "text/markdown", size_bytes: 64, parser: "native_markdown", status: "ready",
+  parsed_content_version: 1, pipeline_generation: 1, current_stage: "complete", stage_state: "succeeded",
+  failed_stage: null, progress_completed: null, progress_total: null, progress_unit: null, warnings: [],
+  published_content_version: 1, progress: { completed: null, total: null, unit: null },
+  parse: { chunks_completed: 0, chunks_total: 0, pages_completed: 0, pages_total: 0 },
+  error_code: null, error_message: null, latest_task: null, artifacts: [],
+  created_at: "2026-08-15T00:00:00Z", updated_at: "2026-08-15T00:00:00Z", completed_at: "2026-08-15T00:00:00Z",
+  ...overrides,
+});
+
 describe("KnowledgeBaseView", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -87,6 +100,7 @@ describe("KnowledgeBaseView", () => {
       documents: [],
       documentsLoading: false,
       documentsError: null,
+      llmModels: [],
       embeddingModels: [embeddingModel],
       onCreate: vi.fn(),
       onOpen: vi.fn(),
@@ -97,6 +111,7 @@ describe("KnowledgeBaseView", () => {
       onRebuildVector: vi.fn(),
       onUpdateSummary: vi.fn(),
       onUpdateHeadingRecovery: vi.fn(),
+      onUpdateLlmModel: vi.fn().mockResolvedValue(undefined),
       onUpdateName: vi.fn(),
       onUpdateEmbeddingModel: vi.fn(),
       onUpdateVectorEnabled: vi.fn(),
@@ -111,17 +126,130 @@ describe("KnowledgeBaseView", () => {
     return props;
   };
 
-  it("keeps index actions in the detail view", () => {
+  const openSettings = () => act(() => container.querySelector<HTMLButtonElement>("[aria-label='知识库设置']")!.click());
+
+  it("selects a document LLM independently and can return to the system default", async () => {
+    const llm = { ...embeddingModel, id: "llm-1", kind: "llm" as const, name: "文档模型", model: "document-chat" };
+    const props = renderView({ selectedId: "kb-1", llmModels: [llm] });
+    openSettings();
+    const select = container.querySelector<HTMLSelectElement>("[aria-label='LLM 模型']");
+    expect(select).not.toBeNull();
+    expect(select!.value).toBe("");
+    expect(select!.options[0].textContent).toContain("跟随系统默认");
+    expect(select!.options[0].textContent).toContain("document-chat");
+    await act(async () => {
+      select!.value = "llm-1";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(props.onUpdateLlmModel).toHaveBeenCalledWith("kb-1", "llm-1");
+    act(() => root.render(<KnowledgeBaseView {...props} items={[knowledgeBase({ llm_model_id: "llm-1" })]} />));
+    expect(select!.value).toBe("llm-1");
+    await act(async () => {
+      select!.value = "";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(props.onUpdateLlmModel).toHaveBeenLastCalledWith("kb-1", null);
+  });
+
+  it("disables the LLM selector while saving and keeps the saved selection after failure", async () => {
+    let rejectSave!: (reason: Error) => void;
+    const save = new Promise<void>((_resolve, reject) => { rejectSave = reject; });
+    renderView({
+      selectedId: "kb-1",
+      llmModels: [{ ...embeddingModel, id: "llm-1", kind: "llm", model: "document-chat" }],
+      onUpdateLlmModel: vi.fn(() => save),
+    });
+    openSettings();
+    const select = container.querySelector<HTMLSelectElement>("[aria-label='LLM 模型']");
+    expect(select).not.toBeNull();
+    await act(async () => {
+      select!.value = "llm-1";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(select!.disabled).toBe(true);
+    await act(async () => rejectSave(new Error("模型切换失败")));
+    expect(select!.disabled).toBe(false);
+    expect(select!.value).toBe("");
+    expect(container.querySelector("[role='alert']")?.textContent).toContain("模型切换失败");
+  });
+
+  it("shows a missing default without preventing selection of another LLM", () => {
+    renderView({ selectedId: "kb-1", llmModels: [] });
+    openSettings();
+    const select = container.querySelector<HTMLSelectElement>("[aria-label='LLM 模型']");
+    expect(select).not.toBeNull();
+    expect(select!.options[0].textContent).toContain("未配置");
+  });
+
+  it("uses a compact searchable list without repeated headings or placeholder descriptions", () => {
+    renderView({ items: [knowledgeBase({}), knowledgeBase({ id: "kb-2", name: "财务资料" })] });
+    expect(container.querySelector("nav[aria-label='知识库功能导航']")?.textContent).toContain("知识库");
+    expect(container.textContent).not.toContain("未填写描述");
+    expect(container.textContent).not.toContain("为 Agent 准备");
+    const input = container.querySelector<HTMLInputElement>("[aria-label='搜索知识库']")!;
+    expect(input).toBeTruthy();
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "财务");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.textContent).toContain("财务资料");
+    expect(container.textContent).not.toContain("产品知识库");
+  });
+
+  it("keeps index controls in settings and leaves document actions in the detail view", () => {
     renderView({
       items: [knowledgeBase({ id: "existing" })],
       selectedId: "existing",
     });
 
+    expect(container.textContent).not.toContain("重建向量索引");
+    expect(container.textContent).not.toContain("知识库详情");
+    expect(container.querySelector("[aria-label='刷新文档']")).toBeTruthy();
+    openSettings();
     const labels = Array.from(container.querySelectorAll("button")).map((button) => button.textContent);
     expect(labels).toContain("重建向量索引");
     expect(labels).toContain("重建全文索引");
     expect(labels).toContain("上传文档");
     expect(labels).not.toContain("删除知识库");
+  });
+
+  it("filters documents, keeps errors visible and moves deletion into the document menu", () => {
+    const props = renderView({ selectedId: "kb-1", documents: [documentRecord(), documentRecord({ id: "doc-2", original_filename: "failed.pdf", status: "failed", current_stage: "parse", stage_state: "failed", failed_stage: "parse", error_message: "解析失败", published_content_version: null })] });
+    expect(container.textContent).not.toContain("删除文档");
+    expect(container.textContent).toContain("解析失败");
+    expect(container.querySelector("[aria-label='查看 failed.pdf']")).toBeNull();
+    act(() => container.querySelector<HTMLButtonElement>("[aria-label='report.md的更多操作']")!.click());
+    act(() => container.querySelector<HTMLButtonElement>("[role=menuitem]")!.click());
+    expect(props.onDeleteDocument).toHaveBeenCalledWith("kb-1", "doc-1");
+    act(() => container.querySelector<HTMLButtonElement>("[aria-label='刷新文档']")!.click());
+    expect(props.onLoadDocuments).toHaveBeenCalledWith("kb-1");
+    const input = container.querySelector<HTMLInputElement>("[aria-label='搜索文档']")!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "missing");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelector(".knowledge-document-label [role=status]")?.textContent).toBe("0");
+    expect(container.textContent).toContain("没有匹配的文档");
+  });
+
+  it("preserves upload progress and abort when uploading from the compact toolbar", async () => {
+    const onUpload = vi.fn<ComponentProps<typeof KnowledgeBaseView>["onUpload"]>().mockImplementation((_id, _files, progress, signal) => {
+      progress?.(5, 10);
+      return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(new DOMException("Cancelled", "AbortError")), { once: true }));
+    });
+    renderView({ selectedId: "kb-1", onUpload });
+    act(() => Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "上传文档")!.click());
+    const input = container.querySelector<HTMLInputElement>("input[type=file]")!;
+    Object.defineProperty(input, "files", { value: [new File(["hello"], "notes.md", { type: "text/markdown" })] });
+    act(() => input.dispatchEvent(new Event("change", { bubbles: true })));
+    await act(async () => { Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "开始上传")!.click(); });
+    expect(container.querySelector(".upload-progress")?.textContent).toContain("50%");
+    const signal = onUpload.mock.calls[0][3]!;
+    expect(signal.aborted).toBe(false);
+    await act(async () => { Array.from(container.querySelectorAll("button")).find((button) => button.textContent === "取消上传")!.click(); });
+    expect(signal.aborted).toBe(true);
+    expect(container.querySelector(".upload-error")).toBeNull();
+    expect(container.querySelector("[role=dialog]")).toBeTruthy();
   });
 
   it("keeps list cards focused on navigation, rename, and delete", async () => {
@@ -164,6 +292,7 @@ describe("KnowledgeBaseView", () => {
         documents={[]}
         documentsLoading={false}
         documentsError={null}
+        llmModels={[]}
         embeddingModels={[embeddingModel]}
         onCreate={vi.fn()}
         onOpen={vi.fn()}
@@ -174,6 +303,7 @@ describe("KnowledgeBaseView", () => {
         onRebuildVector={vi.fn()}
         onUpdateSummary={vi.fn()}
         onUpdateHeadingRecovery={vi.fn()}
+        onUpdateLlmModel={vi.fn()}
         onUpdateName={vi.fn()}
         onUpdateEmbeddingModel={vi.fn()}
         onUpdateVectorEnabled={vi.fn()}
@@ -185,6 +315,7 @@ describe("KnowledgeBaseView", () => {
       />,
     ));
 
+    openSettings();
     const labels = Array.from(container.querySelectorAll("button")).map((button) => button.textContent);
     expect(labels).toContain("重建向量索引");
   });
@@ -198,6 +329,7 @@ describe("KnowledgeBaseView", () => {
         documents={[]}
         documentsLoading={false}
         documentsError={null}
+        llmModels={[]}
         embeddingModels={[embeddingModel]}
         onCreate={vi.fn()}
         onOpen={vi.fn()}
@@ -208,6 +340,7 @@ describe("KnowledgeBaseView", () => {
         onRebuildVector={vi.fn()}
         onUpdateSummary={vi.fn()}
         onUpdateHeadingRecovery={vi.fn()}
+        onUpdateLlmModel={vi.fn()}
         onUpdateName={vi.fn()}
         onUpdateEmbeddingModel={vi.fn()}
         onUpdateVectorEnabled={onUpdateVectorEnabled}
@@ -219,6 +352,7 @@ describe("KnowledgeBaseView", () => {
       />,
     ));
 
+    openSettings();
     const toggle = container.querySelector<HTMLInputElement>(".detail-vector-switch input")!;
     expect(toggle.checked).toBe(true);
     expect(container.querySelector<HTMLSelectElement>(".detail-vector-model select")!.value).toBe("embedding-1");
@@ -233,6 +367,7 @@ describe("KnowledgeBaseView", () => {
       onUpdateHeadingRecovery,
     });
 
+    openSettings();
     const toggle = container.querySelector<HTMLInputElement>(
       ".detail-heading-recovery-switch input",
     )!;

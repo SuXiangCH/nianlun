@@ -1,6 +1,7 @@
 """Manage knowledge-base vector indexes owned by the API Server."""
 
 from __future__ import annotations
+from app.api_server.services.index_access import IndexAccessCoordinator
 
 import hashlib
 import logging
@@ -50,6 +51,8 @@ logger = logging.getLogger(__name__)
 
 class VectorIndexService:
     """Build and publish one isolated dense-vector index per knowledge base."""
+
+    index_access: IndexAccessCoordinator | None = None
 
     def __init__(
         self,
@@ -224,6 +227,31 @@ class VectorIndexService:
             )
 
     def _build(
+        self,
+        knowledge_base_id: str,
+        revision: int,
+        collection_name: str,
+        workspace_dir: Path,
+        config: dict[str, Any],
+        *,
+        full_rebuild: bool = False,
+    ) -> None:
+        coordinator = getattr(self, "index_access", None)
+        with (
+            coordinator.mutation(knowledge_base_id, "vector")
+            if coordinator
+            else nullcontext()
+        ):
+            self._build_locked(
+                knowledge_base_id,
+                revision,
+                collection_name,
+                workspace_dir,
+                config,
+                full_rebuild=full_rebuild,
+            )
+
+    def _build_locked(
         self,
         knowledge_base_id: str,
         revision: int,

@@ -35,7 +35,7 @@ def get_app(application_id: str, request: Request) -> dict[str, Any]:
 
 @router.delete("/{application_id}")
 def delete_app(application_id: str, request: Request) -> dict[str, Any]:
-    _services(request).applications.delete(application_id)
+    _services(request).invocations.delete_application(application_id)
     return success(None)
 
 
