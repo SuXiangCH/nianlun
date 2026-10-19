@@ -2,6 +2,7 @@ from collections.abc import AsyncIterator, Iterator
 import json
 import logging
 from pathlib import Path
+from threading import Event, get_ident
 import time
 from typing import Any
 
@@ -9,11 +10,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.api_server.services.model_config_service as model_config_service
+import app.api_server.services.workspace_snapshot as workspace_snapshot
+import app.api_server.services.workspace_store as workspace_store
 from app.api_server.apis.v1.schemas import ChatResponse, DocumentResponse
 from app.api_server.config import ApiServerSettings
 from app.api_server.main import create_app
 from app.api_server.services.container import build_services
-from app.api_server.services.workspace_store import TREE_BUILD_OPTIONS_FILENAME
+from app.api_server.services.workspace_store import (
+    TREE_BUILD_OPTIONS_FILENAME,
+    workspace_lock,
+)
 
 
 class FakeSummaryLLM:
@@ -478,8 +484,51 @@ def test_disabled_summary_upload_does_not_require_llm(tmp_path: Path) -> None:
     assert response.status_code == 200
 
 
+@pytest.fixture(params=[False, True], ids=["normal", "projection_pending"])
+def pending_document_projection(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Event | None]:
+    if not request.param:
+        yield None
+        return
+    pending = Event()
+    resume = Event()
+    finished = Event()
+    reader_thread = get_ident()
+    original_projection = workspace_snapshot.repair_v1_projection
+    original_lock_for = workspace_store._lock_for
+
+    def pause_projection(
+        workspace: Path, manifest: workspace_snapshot.WorkspaceSnapshotManifest
+    ) -> None:
+        if not manifest.documents:
+            original_projection(workspace, manifest)
+            return
+        pending.set()
+        try:
+            assert resume.wait(5), "projection reader did not acquire workspace lock"
+            original_projection(workspace, manifest)
+        finally:
+            finished.set()
+
+    def resume_on_reader_lock(path: Path):
+        # Release the writer as this test attempts to enter the shared lock.
+        if get_ident() == reader_thread and pending.is_set():
+            resume.set()
+        return original_lock_for(path)
+
+    monkeypatch.setattr(workspace_snapshot, "repair_v1_projection", pause_projection)
+    monkeypatch.setattr(workspace_store, "_lock_for", resume_on_reader_lock)
+    try:
+        yield pending
+    finally:
+        resume.set()
+        if pending.is_set():
+            assert finished.wait(5), "projection writer did not finish"
+
+
 def test_document_and_knowledge_base_delete_remove_persisted_data(
-    tmp_path: Path,
+    tmp_path: Path, pending_document_projection: Event | None
 ) -> None:
     client = TestClient(create_app(_settings(tmp_path)))
     created = client.post(
@@ -498,12 +547,16 @@ def test_document_and_knowledge_base_delete_remove_persisted_data(
         _wait_document_ready(client, knowledge_base_id, document_id)["status"]
         == "ready"
     )
+    if pending_document_projection is not None:
+        assert pending_document_projection.wait(5)
     workspace = Path(created["workspace_dir"])
-    manifest = json.loads((workspace / "_meta.json").read_text())
-    source = workspace / manifest[document_id]["path"]
-    root_tree = workspace / f"{document_id}.json"
-    assert source.exists()
-    assert root_tree.exists()
+    # Ready refers to the committed snapshot; the V1 projection may still be writing.
+    with workspace_lock(workspace):
+        manifest = json.loads((workspace / "_meta.json").read_text())
+        source = workspace / manifest[document_id]["path"]
+        root_tree = workspace / f"{document_id}.json"
+        assert source.exists()
+        assert root_tree.exists()
 
     deleted_document = client.delete(
         f"/api/v1/knowledge-bases/{knowledge_base_id}/documents/{document_id}"
@@ -902,7 +955,7 @@ def test_model_catalog_connection_tests_use_mocked_services(
     calls: dict[str, Any] = {}
 
     class FakeChat:
-        def invoke(self, prompt: str) -> object:
+        def invoke(self, prompt: str, **_kwargs: Any) -> object:
             calls["llm_prompt"] = prompt
             return object()
 
@@ -944,12 +997,17 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "target": "llm",
         "ok": True,
         "message": "LLM 连接成功",
+        "checks": [
+            {"capability": "text", "status": "passed", "message": "文本连接成功"}
+        ],
     }
     assert calls["llm"] == {
         "model": "draft-chat",
         "base_url": "https://draft.example/v1",
         "api_key": "draft-key",
         "allow_env_fallback": False,
+        "request_timeout_seconds": 20.0,
+        "max_retries": 0,
     }
 
     profiles = {}
@@ -992,6 +1050,11 @@ def test_model_catalog_connection_tests_use_mocked_services(
                 if kind == "embedding"
                 else "MinerU API 连接成功，查询接口可用"
             ),
+            "checks": (
+                [{"capability": "text", "status": "passed", "message": "文本连接成功"}]
+                if kind == "llm"
+                else []
+            ),
         }
 
     assert calls["llm"] == {
@@ -999,6 +1062,8 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "base_url": "https://catalog-llm.example/v1",
         "api_key": "catalog-llm-key",
         "allow_env_fallback": False,
+        "request_timeout_seconds": 20.0,
+        "max_retries": 0,
     }
     assert calls["embedding"] == {
         "model": "catalog-embedding",
@@ -1024,6 +1089,8 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "base_url": "https://unsaved.example/v1",
         "api_key": "unsaved-key",
         "allow_env_fallback": False,
+        "request_timeout_seconds": 20.0,
+        "max_retries": 0,
     }
 
     response = client.post(
@@ -1035,6 +1102,9 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "target": "llm",
         "ok": False,
         "message": "模型 API URL 未配置",
+        "checks": [
+            {"capability": "text", "status": "failed", "message": "模型 API URL 未配置"}
+        ],
     }
 
 

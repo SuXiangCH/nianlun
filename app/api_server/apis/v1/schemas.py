@@ -187,6 +187,13 @@ class ModelConfigTestRequest(ModelEndpointConfigUpdate):
     model: str | None = Field(default=None, max_length=256)
     dimension: int | None = Field(default=None, gt=0, le=100_000)
     api_mode: Literal["saas_precision", "self_hosted"] = "saas_precision"
+    supports_vision: bool | None = Field(default=None, strict=True)
+
+    @model_validator(mode="after")
+    def validate_vision_target(self) -> "ModelConfigTestRequest":
+        if self.target != "llm" and self.supports_vision is not None:
+            raise ValueError("supports_vision 仅适用于 LLM")
+        return self
 
     @field_validator("model")
     @classmethod
@@ -195,10 +202,17 @@ class ModelConfigTestRequest(ModelEndpointConfigUpdate):
         return normalized or None
 
 
+class ModelConnectionCheck(ApiSchema):
+    capability: Literal["text", "vision"]
+    status: Literal["passed", "failed", "skipped"]
+    message: str
+
+
 class ModelConfigTestResponse(ApiSchema):
     target: Literal["llm", "embedding", "parser"]
     ok: bool
     message: str
+    checks: list[ModelConnectionCheck] = Field(default_factory=list)
 
 
 class ModelProfileRequest(ModelEndpointConfigUpdate):
@@ -209,6 +223,7 @@ class ModelProfileRequest(ModelEndpointConfigUpdate):
     base_url: str | None = Field(default=..., max_length=2_048)
     model: str | None = Field(default=None, max_length=256)
     context_window_tokens: int | None = Field(default=None, gt=0, le=10_000_000)
+    supports_vision: bool | None = Field(default=None, strict=True)
     dimension: int | None = Field(default=None, gt=0, le=100_000)
     # Kept for backwards-compatible clients; knowledge-base selection is the
     # source of truth for whether an Embedding profile is used.
@@ -250,6 +265,8 @@ class ModelProfileRequest(ModelEndpointConfigUpdate):
             raise ValueError(f"{self.kind} 模型名称不能为空")
         if self.kind != "llm" and self.context_window_tokens is not None:
             raise ValueError("context_window_tokens 仅适用于 LLM")
+        if self.kind != "llm" and self.supports_vision is not None:
+            raise ValueError("supports_vision 仅适用于 LLM")
         return self
 
     @field_validator("language")
@@ -286,6 +303,7 @@ class ModelProfileResponse(ApiSchema):
     name: str
     model: str | None
     context_window_tokens: int | None
+    supports_vision: bool | None = None
     base_url: str | None
     api_key_configured: bool
     enabled: bool
@@ -514,6 +532,7 @@ __all__ = [
     "KnowledgeBaseResponse",
     "ModelConfigTestRequest",
     "ModelConfigTestResponse",
+    "ModelConnectionCheck",
     "ModelProfileRequest",
     "ModelProfileResponse",
     "MessageSourceResponse",

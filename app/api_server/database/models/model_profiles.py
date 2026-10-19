@@ -69,6 +69,7 @@ class LLMModelProfile(Base):
     )
     model: Mapped[str | None] = mapped_column(String, nullable=True)
     context_window_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    supports_vision: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     profile: Mapped[ModelProfile] = relationship(back_populates="llm_config")
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { BookOpen, Cpu, Database, MoreHorizontal, Pencil, PlugZap, Plus, RefreshCw, Search } from "lucide-react";
+import { BookOpen, CircleHelp, Cpu, Database, Eye, EyeOff, MoreHorizontal, Pencil, PlugZap, Plus, RefreshCw, Search } from "lucide-react";
 import { Modal } from "../../components/Modal";
 import type {
   ModelConfigTestRequest,
@@ -37,6 +37,7 @@ const newDraft = (kind: ModelKind): ModelDraft => ({
   name: "",
   model: null,
   context_window_tokens: null,
+  supports_vision: null,
   base_url: "",
   api_key: "",
   enabled: true,
@@ -56,6 +57,7 @@ const draftFromProfile = (profile: ModelProfile): ModelDraft => ({
   name: profile.name,
   model: profile.model,
   context_window_tokens: profile.context_window_tokens,
+  supports_vision: profile.supports_vision ?? null,
   base_url: profile.base_url || "",
   api_key: "",
   enabled: true,
@@ -75,6 +77,7 @@ const testRequestFromDraft = (draft: ModelDraft, clearKey: boolean): ModelConfig
   model: draft.model,
   base_url: draft.base_url,
   dimension: draft.dimension,
+  ...(draft.kind === "llm" ? { supports_vision: draft.supports_vision ?? null } : {}),
   ...(draft.kind === "parser" ? { api_mode: draft.api_mode } : {}),
   ...(clearKey ? { api_key: null } : draft.api_key.trim() ? { api_key: draft.api_key.trim() } : {}),
 });
@@ -87,6 +90,17 @@ const requestFromDraft = (draft: ModelDraft, clearKey: boolean): ModelProfileReq
     ...(clearKey ? { api_key: null } : api_key.trim() ? { api_key: api_key.trim() } : {}),
   };
 };
+
+function ConnectionTestResult({ result, row = false }: { result: ModelConfigTestResult; row?: boolean }) {
+  const detailed = Boolean(result.checks?.length);
+  return <div className={`model-test-result ${row ? "model-row-result" : ""} ${detailed ? "model-checks" : result.ok ? "is-success" : "is-error"}`} role={result.ok ? "status" : "alert"}>
+    {detailed ? result.checks?.map((check) => <div className={`model-check-result is-${check.status}`} key={check.capability}>
+      <strong>{check.capability === "text" ? "文本连接" : "图片输入"}</strong>
+      <span>{check.status === "passed" ? "通过" : check.status === "failed" ? "失败" : "未执行"}</span>
+      <small>{check.message}</small>
+    </div>) : result.message}
+  </div>;
+}
 
 export function ModelManagementView({
   onListModels,
@@ -322,17 +336,17 @@ export function ModelManagementView({
                     <small title={profile.base_url || undefined}>{profile.base_url || "URL 未配置"}</small>
                   </div>
                 </div>
-                <span className="model-profile-spec">{profile.kind === "llm" ? profile.context_window_tokens ? `${profile.context_window_tokens.toLocaleString()} tokens` : "默认上下文" : profile.kind === "embedding" ? profile.dimension ? `${profile.dimension} 维` : "默认维度" : `${profile.model_version.toUpperCase()} · ${profile.language}`}</span>
+                <div className="model-profile-spec"><span>{profile.kind === "llm" ? profile.context_window_tokens ? `${profile.context_window_tokens.toLocaleString()} tokens` : "默认上下文" : profile.kind === "embedding" ? profile.dimension ? `${profile.dimension} 维` : "默认维度" : `${profile.model_version.toUpperCase()} · ${profile.language}`}</span>{profile.kind === "llm" && <span className={`model-vision-status ${profile.supports_vision === true ? "is-supported" : ""}`}>{profile.supports_vision === true ? <><Eye size={13} aria-hidden="true" />支持视觉</> : profile.supports_vision === false ? <><EyeOff size={13} aria-hidden="true" />不支持视觉</> : <><CircleHelp size={13} aria-hidden="true" />视觉未确认</>}</span>}</div>
                 <span className={`model-key-status ${profile.api_key_configured ? "is-configured" : ""}`}>{profile.api_key_configured ? "已配置" : profile.kind === "parser" && profile.api_mode === "self_hosted" ? "未设置" : "未配置"}</span>
                   <div className="model-profile-actions">
-                    <button className="icon-button" type="button" title={testing === profile.id ? "测试中" : "测试连接"} aria-label={`测试 ${label}`} disabled={testing !== null} onClick={() => void testProfile(profile)}>{testing === profile.id ? <RefreshCw size={16} className="model-spinning" /> : <PlugZap size={17} />}</button>
+                    <button className="icon-button" type="button" title={testing === profile.id ? "测试中" : profile.supports_vision === true ? "测试文本与图片输入（最多 2 次模型调用）" : "测试连接"} aria-label={`测试 ${label}`} disabled={testing !== null} onClick={() => void testProfile(profile)}>{testing === profile.id ? <RefreshCw size={16} className="model-spinning" /> : <PlugZap size={17} />}</button>
                     <button className="icon-button" type="button" title="编辑模型" aria-label={`编辑 ${label}`} disabled={testing !== null} onClick={() => openEdit(profile)}><Pencil size={16} /></button>
                     <div className="model-menu"><button className="icon-button" type="button" title="更多操作" aria-label={`${label}的更多操作`} aria-haspopup="menu" aria-expanded={menuId === profile.id} disabled={testing !== null} onClick={() => setMenuId(menuId === profile.id ? null : profile.id)}><MoreHorizontal size={18} /></button>{menuId === profile.id && <div className="model-menu-popover" role="menu">
                       {profile.kind !== "embedding" && !profile.is_default && <button type="button" role="menuitem" onClick={() => { setMenuId(null); void setDefault(profile); }}>设为默认</button>}
                       <button className="danger-button" type="button" role="menuitem" disabled={profile.is_default} title={profile.is_default ? "默认模型不可删除" : undefined} onClick={() => { setMenuId(null); void remove(profile); }}>删除模型</button>
                     </div>}</div>
                   </div>
-                {result && <div className={`model-test-result model-row-result ${result.ok ? "is-success" : "is-error"}`} role={result.ok ? "status" : "alert"}>{result.message}</div>}
+                {result && <ConnectionTestResult result={result} row />}
               </article>
             );
           })}
@@ -363,6 +377,12 @@ export function ModelManagementView({
             {editor.draft.kind === "llm" && <div className="field">
               <label htmlFor="model-profile-context-window">上下文窗口（tokens）</label>
               <input id="model-profile-context-window" type="number" min={1} max={10000000} step={1} value={editor.draft.context_window_tokens ?? ""} disabled={saving || testing !== null} onChange={(event) => updateDraft("context_window_tokens", event.target.value ? Number(event.target.value) : null)} placeholder="例如：128000" />
+            </div>}
+            {editor.draft.kind === "llm" && <div className="field">
+              <label htmlFor="model-profile-vision">视觉能力</label>
+              <select id="model-profile-vision" value={editor.draft.supports_vision == null ? "" : String(editor.draft.supports_vision)} disabled={saving || testing !== null} onChange={(event) => updateDraft("supports_vision", event.target.value === "" ? null : event.target.value === "true")}>
+                <option value="">未确认</option><option value="true">支持</option><option value="false">不支持</option>
+              </select>
             </div>}
             {editor.draft.kind === "parser" && <>
               <div className="field">
@@ -415,9 +435,9 @@ export function ModelManagementView({
             </div>}
             {editor.draft.kind !== "embedding" && <label className="secret-clear"><input type="checkbox" checked={editor.draft.is_default} disabled={saving || testing !== null} onChange={(event) => updateDraft("is_default", event.target.checked)} />设为默认模型</label>}
             {message && <span className="model-test-result is-error" role="alert">{message}</span>}
-            {editorResult && <span className={`model-test-result ${editorResult.ok ? "is-success" : "is-error"}`} role={editorResult.ok ? "status" : "alert"}>{editorResult.message}</span>}
+            {editorResult && <ConnectionTestResult result={editorResult} />}
             <div className="modal-actions">
-              <button className="quiet-button" type="button" disabled={saving || testing !== null} onClick={() => void testEditor()}>{testing === editorTestKey ? "测试中..." : "测试连接"}</button>
+              <button className="quiet-button" type="button" title={editor.draft.kind === "llm" && editor.draft.supports_vision === true ? "测试文本与图片输入（最多 2 次模型调用）" : "测试连接"} disabled={saving || testing !== null} onClick={() => void testEditor()}>{testing === editorTestKey ? "测试中..." : "测试连接"}</button>
               <button className="outline-button" type="button" disabled={saving || testing !== null} onClick={() => setEditor(null)}>取消</button>
               <button className="primary-button" type="submit" disabled={saving || testing !== null}>{saving ? "保存中..." : "保存"}</button>
             </div>

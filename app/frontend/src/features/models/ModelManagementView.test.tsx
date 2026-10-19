@@ -10,6 +10,7 @@ import type { ModelProfile } from "../../types";
 
 const profile = (overrides: Partial<ModelProfile> = {}): ModelProfile => ({
   id: "llm-1", kind: "llm", name: "chat-model", model: "chat-model", context_window_tokens: 128000,
+  supports_vision: null,
   base_url: "https://model.test/v1", api_key_configured: true, enabled: true, api_mode: "saas_precision",
   dimension: null, model_version: "vlm", language: "ch", is_ocr: false, enable_table: true,
   enable_formula: true, page_ranges: "", is_default: false,
@@ -37,6 +38,59 @@ describe("Model management", () => {
     expect(button, label).toBeTruthy();
     await act(async () => button!.click());
   };
+
+  it("edits and saves all three vision states without exposing the field for embedding models", async () => {
+    const props = await renderView({ onUpdateModel: vi.fn().mockResolvedValue(profile()) });
+    for (const [value, expected] of [["true", true], ["false", false], ["", null]] as const) {
+      await click("编辑 chat-model");
+      const select = container.querySelector<HTMLSelectElement>("#model-profile-vision");
+      expect(select).not.toBeNull();
+      await act(async () => {
+        select!.value = value;
+        select!.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+      await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+      expect(props.onUpdateModel).toHaveBeenLastCalledWith("llm-1", expect.objectContaining({ supports_vision: expected }));
+    }
+    await click("Embedding1"); await click("编辑 embed-model");
+    expect(container.querySelector("#model-profile-vision")).toBeNull();
+  });
+
+  it("defaults new models to unconfirmed vision and preserves an existing selection", async () => {
+    await renderView({ onListModels: vi.fn().mockResolvedValue([profile({ supports_vision: true })]) });
+    expect(container.querySelector(".model-vision-status")?.textContent).toContain("支持视觉");
+    await click("编辑 chat-model");
+    expect(container.querySelector<HTMLSelectElement>("#model-profile-vision")?.value).toBe("true");
+    await click("取消"); await click("新建模型");
+    expect(container.querySelector<HTMLSelectElement>("#model-profile-vision")?.value).toBe("");
+  });
+
+  it("distinguishes unsupported vision from an unconfirmed capability in the list", async () => {
+    await renderView({ onListModels: vi.fn().mockResolvedValue([
+      profile({ id: "supported", supports_vision: true }),
+      profile({ id: "unsupported", supports_vision: false }),
+      profile({ id: "unconfirmed", supports_vision: null }),
+    ]) });
+    expect(Array.from(container.querySelectorAll(".model-vision-status"), (item) => item.textContent)).toEqual(["支持视觉", "不支持视觉", "视觉未确认"]);
+  });
+
+  it("tests the unsaved vision setting and displays text and image results separately", async () => {
+    const props = await renderView({ onTestModel: vi.fn().mockResolvedValue({ target: "llm", ok: false, message: "图片检测失败", checks: [
+      { capability: "text", status: "passed", message: "连接成功" },
+      { capability: "vision", status: "failed", message: "接口拒绝图片请求" },
+    ] }) });
+    await click("编辑 chat-model");
+    await act(async () => {
+      const select = container.querySelector<HTMLSelectElement>("#model-profile-vision")!;
+      select.value = "true"; select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await click("测试连接");
+    expect(props.onTestModel).toHaveBeenCalledWith("llm-1", expect.objectContaining({ supports_vision: true }));
+    expect(container.querySelectorAll(".model-check-result")).toHaveLength(2);
+    expect(container.querySelector(".model-check-result.is-passed")?.textContent).toContain("文本连接");
+    expect(container.querySelector(".model-check-result.is-failed")?.textContent).toContain("图片输入");
+    expect(container.querySelector<HTMLSelectElement>("#model-profile-vision")?.value).toBe("true");
+  });
 
   it("uses compact navigation and filters the current category without repeated names", async () => {
     await renderView();

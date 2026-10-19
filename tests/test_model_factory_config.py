@@ -155,6 +155,23 @@ def test_chat_factory_only_sends_explicit_thinking_disable() -> None:
     assert disabled.extra_body == {"chat_template_kwargs": {"enable_thinking": False}}
 
 
+def test_chat_factory_probe_limits_do_not_change_runtime_defaults() -> None:
+    defaults = {
+        "model": "test-model",
+        "api_key": "test-key",
+        "allow_env_fallback": False,
+    }
+    runtime = llm_module.build_chat_model(**defaults)
+    probe = llm_module.build_chat_model(
+        **defaults, request_timeout_seconds=20.0, max_retries=0
+    )
+    assert runtime.request_timeout == 300.0
+    assert runtime.max_retries == 2
+    assert probe.request_timeout == 20.0
+    assert probe.max_retries == 0
+    assert probe.root_client.max_retries == 0
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [(None, None), ("true", None), ("false", False), ("invalid", None)],

@@ -12,7 +12,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -24,7 +24,7 @@ def _record_current_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO schema_migrations(version, name, applied_at)
-        VALUES (?, 'knowledge_base_llm_selection', CURRENT_TIMESTAMP)
+        VALUES (?, 'llm_vision_capability', CURRENT_TIMESTAMP)
         """,
         (SCHEMA_VERSION,),
     )
@@ -49,6 +49,17 @@ def _migrate_heading_recovery_enabled(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE knowledge_bases "
             "ADD COLUMN heading_recovery_enabled INTEGER NOT NULL DEFAULT 1"
+        )
+
+
+def _migrate_llm_vision_capability(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute('PRAGMA table_info("llm_model_profiles")')
+    }
+    if "supports_vision" not in columns:
+        connection.execute(
+            "ALTER TABLE llm_model_profiles ADD COLUMN supports_vision BOOLEAN NULL"
         )
 
 
@@ -596,6 +607,7 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
         _migrate_application_api(connection)
         _migrate_release_descriptions(connection)
         _migrate_knowledge_base_llm(connection)
+        _migrate_llm_vision_capability(connection)
         _require_current_schema(connection)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:

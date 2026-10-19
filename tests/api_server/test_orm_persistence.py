@@ -100,8 +100,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 11
-    assert versions == {11}
+    assert migrations.SCHEMA_VERSION == 12
+    assert versions == {12}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -270,7 +270,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {11}
+    assert versions == {12}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -332,7 +332,7 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {11}
+    assert versions == {12}
 
 
 def test_schema_migration_replaces_document_hash_constraint_with_partial_index(
