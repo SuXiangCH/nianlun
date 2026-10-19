@@ -1,4 +1,4 @@
-import type { AgentVersion, Application, ApplicationApiClient, ApplicationApiKey, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, ApplicationUpdateRequest, BatchUploadResult, ConversationMessageRecord, ConversationRecord, DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelConfigTestRequest, ModelConfigTestResult, ModelKind, ModelProfile, ModelProfileRequest, SourceSnippet } from "../types";
+import type { AgentVersion, Application, ApplicationApiClient, ApplicationApiKey, ApplicationDeploymentEvent, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, ApplicationUpdateRequest, BatchUploadResult, ConversationMessageRecord, ConversationRecord, DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelConfigTestRequest, ModelConfigTestResult, ModelKind, ModelProfile, ModelProfileRequest, SourceSnippet } from "../types";
 
 const configuredBase = window.NIANLUN_API_BASE || import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 export const API_BASE = configuredBase.replace(/\/$/, "");
@@ -89,13 +89,17 @@ function uploadRequest<T>(
 
 export const api = {
   listApps: () => request<Application[]>("/api/v1/apps"),
-  getApp: (id: string) => request<Application>(`/api/v1/apps/${encodeURIComponent(id)}`),
+  getApp: (id: string, signal?: AbortSignal) => request<Application>(`/api/v1/apps/${encodeURIComponent(id)}`, { signal }),
   createApp: (body: { name: string; description: string; knowledge_base_id: string; llm_model_id: string; agent_version: AgentVersion }) => request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(body) }),
   deleteApp: (id: string) => request<null>(`/api/v1/apps/${encodeURIComponent(id)}`, { method: "DELETE" }),
   updateApp: (id: string, body: ApplicationUpdateRequest) => request<Application>(`/api/v1/apps/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   getPublication: (id: string, signal?: AbortSignal) => request<ApplicationPublication>(`/api/v1/apps/${encodeURIComponent(id)}/publication`, { signal }),
   createPublicationChannel: (id: string, type: "api") => request<ApplicationPublication>(`/api/v1/apps/${encodeURIComponent(id)}/channels`, { method: "POST", body: JSON.stringify({ type }) }),
   publishApp: (id: string, body: { expected_config_version: number; expected_deployment_version: number }) => request<ApplicationPublication>(`/api/v1/apps/${encodeURIComponent(id)}/publish`, { method: "POST", body: JSON.stringify(body) }),
+  createRelease: (id: string, body: { expected_config_version: number; description: string }) => request<ApplicationRelease>(`/api/v1/apps/${encodeURIComponent(id)}/releases`, { method: "POST", body: JSON.stringify(body) }),
+  deployRelease: (id: string, body: { channel_type: "api"; release_id: string; expected_deployment_version: number }) => request<ApplicationPublication>(`/api/v1/apps/${encodeURIComponent(id)}/deployments`, { method: "POST", body: JSON.stringify(body) }),
+  restoreRelease: (id: string, releaseId: string, expected_config_version: number) => request<Application>(`/api/v1/apps/${encodeURIComponent(id)}/releases/${encodeURIComponent(releaseId)}/restore`, { method: "POST", body: JSON.stringify({ expected_config_version }) }),
+  listDeployments: (id: string, offset = 0, signal?: AbortSignal) => request<ApplicationPage<ApplicationDeploymentEvent>>(`/api/v1/apps/${encodeURIComponent(id)}/deployments?limit=20&offset=${offset}`, { signal }),
   updatePublication: (id: string, body: { enabled: boolean; expected_deployment_version: number }) => request<ApplicationPublication>(`/api/v1/apps/${encodeURIComponent(id)}/publication`, { method: "PATCH", body: JSON.stringify(body) }),
   listReleases: (id: string, offset = 0, signal?: AbortSignal) => request<ApplicationPage<ApplicationRelease>>(`/api/v1/apps/${encodeURIComponent(id)}/releases?limit=20&offset=${offset}`, { signal }),
   listApiClients: (id: string, signal?: AbortSignal) => request<ApplicationApiClient[]>(`/api/v1/apps/${encodeURIComponent(id)}/api-clients`, { signal }),
@@ -111,9 +115,9 @@ export const api = {
     return request<ApplicationPage<ApplicationRun>>(`/api/v1/apps/${encodeURIComponent(id)}/runs?${query}`, { signal });
   },
   listKnowledgeBases: () => request<KnowledgeBase[]>("/api/v1/knowledge-bases"),
-  updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; heading_recovery_enabled?: boolean; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; heading_recovery_enabled?: boolean; llm_model_id?: string | null; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteKnowledgeBase: (id: string) => request<null>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  listModels: (kind?: ModelKind) => request<ModelProfile[]>(`/api/v1/models${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`),
+  listModels: (kind?: ModelKind, signal?: AbortSignal) => request<ModelProfile[]>(`/api/v1/models${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`, { signal }),
   createModel: (body: ModelProfileRequest) => request<ModelProfile>("/api/v1/models", { method: "POST", body: JSON.stringify(body) }),
   updateModel: (id: string, body: ModelProfileRequest) => request<ModelProfile>(`/api/v1/models/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteModel: (id: string) => request<null>(`/api/v1/models/${encodeURIComponent(id)}`, { method: "DELETE" }),

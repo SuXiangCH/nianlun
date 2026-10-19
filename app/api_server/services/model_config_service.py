@@ -177,9 +177,7 @@ class ModelConfigService:
             message = "LLM 模型不存在" if profile_id else "未配置默认 LLM 模型"
             raise ApiError(message, status.HTTP_422_UNPROCESSABLE_ENTITY)
         if item["kind"] != "llm":
-            raise ApiError(
-                "Agent 只能选择 LLM 模型", status.HTTP_422_UNPROCESSABLE_ENTITY
-            )
+            raise ApiError("只能选择 LLM 模型", status.HTTP_422_UNPROCESSABLE_ENTITY)
         return item
 
     def create_profile(self, request: ModelProfileRequest) -> ModelProfileResponse:
@@ -317,20 +315,20 @@ class ModelConfigService:
             )
         return profile
 
-    def build_llm(self) -> Any:
+    def build_llm(self, profile_id: str | None = None) -> Any:
         """Build the strict catalog LLM used by API-server indexing tasks."""
-        profile = self._default_catalog_profile("llm")
+        profile = self.require_llm_profile(profile_id)
         model = str(profile.get("model") or "").strip()
         if not model:
             raise ApiError(
-                f"默认模型“{profile['name']}”未配置模型名称",
+                f"模型“{profile['name']}”未配置模型名称",
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
         base_url = self._catalog_base_url(profile)
         api_key = str(profile.get("api_key") or "").strip()
         if not api_key:
             raise ApiError(
-                f"默认模型“{profile['name']}”未配置 API Key",
+                f"模型“{profile['name']}”未配置 API Key",
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
         return build_chat_model(

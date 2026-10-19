@@ -3,7 +3,9 @@ import type { FormEvent } from "react";
 import { ArrowLeft, ArrowUpRight, BookOpen, Bot, Braces, Building2, Check, ChevronLeft, ChevronRight, Copy, Globe, MessageCircle, Plus, RefreshCw, Upload } from "lucide-react";
 import { api, API_BASE, publicApiBase } from "../../api/client";
 import { Modal } from "../../components/Modal";
-import type { Application, ApplicationApiClient, ApplicationApiKey, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, KnowledgeBase, ModelProfile } from "../../types";
+import type { Application, ApplicationApiClient, ApplicationApiKey, ApplicationDeploymentEvent, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, KnowledgeBase, ModelProfile } from "../../types";
+import { ApplicationVersions, VersionDetail } from "./ApplicationVersions";
+import { ApplicationPublishPanel } from "./ApplicationPublishPanel";
 
 interface Props {
   app: Application;
@@ -13,7 +15,7 @@ interface Props {
   onUse: (id: string) => void;
   onUpdated?: (app: Application) => void;
 }
-type Tab = "publication" | "draft" | "clients" | "history" | "runs";
+type Tab = "publication" | "draft" | "clients" | "history" | "runs" | "deployments";
 const timestamp = (value: string): string => new Date(value).toLocaleString();
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : "请求失败，请重试";
 const statusLabel = (publication: ApplicationPublication): string => !publication.active_release ? "未发布" : publication.enabled ? "已发布" : "已停用";
@@ -93,15 +95,20 @@ function KeyDialog({ appId, client, rotationKey, onClose, onRegistered, onRevoke
 
 export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUse, onUpdated }: Props) {
   const [draft, setDraft] = useState(app);
+  const [draftModels, setDraftModels] = useState(llmModels);
   const [draftDirty, setDraftDirty] = useState(false);
   const [tab, setTab] = useState<Tab>("publication");
   const [apiDetail, setApiDetail] = useState(false);
   const [confirmPublish, setConfirmPublish] = useState(false);
+  const [publishRelease, setPublishRelease] = useState<ApplicationRelease | null>(null);
+  const [inspectRelease, setInspectRelease] = useState<ApplicationRelease | null>(null);
   const [createChannel, setCreateChannel] = useState(false);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [publication, setPublication] = useState<ApplicationPublication | null>(null);
   const [releases, setReleases] = useState<ApplicationPage<ApplicationRelease>>({ items: [], total: 0 });
   const [releaseOffset, setReleaseOffset] = useState(0);
+  const [deployments, setDeployments] = useState<ApplicationPage<ApplicationDeploymentEvent>>({ items: [], total: 0 });
+  const [deploymentOffset, setDeploymentOffset] = useState(0);
   const [clients, setClients] = useState<ApplicationApiClient[]>([]);
   const [selectedClientId, setSelectedClientId] = useState("");
   const [keys, setKeys] = useState<ApplicationApiKey[]>([]);
@@ -129,6 +136,9 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
         if (tab === "history") {
           const page = await api.listReleases(app.id, releaseOffset, controller.signal);
           if (!controller.signal.aborted) setReleases(page);
+        } else if (tab === "deployments") {
+          const page = await api.listDeployments(app.id, deploymentOffset, controller.signal);
+          if (!controller.signal.aborted) setDeployments(page);
         } else if (tab === "clients" || tab === "runs") {
           const items = await api.listApiClients(app.id, controller.signal);
           if (!controller.signal.aborted) { setClients(items); setSelectedClientId((current) => items.some((item) => item.id === current) ? current : items[0]?.id || ""); }
@@ -142,7 +152,7 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
     };
     void load();
     return () => controller.abort();
-  }, [app.id, tab, releaseOffset, runOffset, runStatus, runClient, refresh]);
+  }, [app.id, tab, releaseOffset, deploymentOffset, runOffset, runStatus, runClient, refresh]);
 
   useEffect(() => {
     if (tab !== "clients" || !selectedClientId) { setKeys([]); return; }
@@ -159,17 +169,13 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
     catch (failure) { setError(errorMessage(failure)); }
     finally { setBusy(false); }
   };
-  const publish = () => mutate(async () => {
-    if (!publication) return;
-    const state = await api.publishApp(app.id, { expected_config_version: publication.config_version, expected_deployment_version: publication.deployment_version });
-    setPublication(state); setNotice("发布配置已更新"); setReleaseOffset(0); setRefresh((value) => value + 1);
-  });
   const togglePublication = () => mutate(async () => {
     if (!publication) return;
     setPublication(await api.updatePublication(app.id, { enabled: !publication.enabled, expected_deployment_version: publication.deployment_version }));
   });
   const saveDraft = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!draftDirty) return;
     const form = new FormData(event.currentTarget);
     void mutate(async () => {
       const response = await api.updateApp(app.id, { expected_config_version: draft.config_version ?? 1, name: String(form.get("name") || "").trim(), description: String(form.get("description") || "").trim(), knowledge_base_id: String(form.get("knowledge_base_id") || ""), llm_model_id: String(form.get("llm_model_id") || "") || null, agent_version: form.get("agent_version") === "v1" ? "v1" : "v0", clarification_enabled: form.get("clarification_enabled") === "on" });
@@ -187,25 +193,32 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
   const endpoint = `${baseUrl}/chat/completions`;
   const publicBaseMissing = publicApiBase() === API_BASE;
   const reloadDraft = () => mutate(async () => { const latest = { ...draft, ...await api.getApp(app.id) }; setDraft(latest); setDraftDirty(false); onUpdated?.(latest); setRefresh((value) => value + 1); });
-  const activeTab = tab === "clients" ? "publication" : tab;
+  const activeTab = tab === "clients" || tab === "deployments" ? "publication" : tab;
   const switchTab = (next: Tab) => { setTab(next); setApiDetail(false); setError(null); setNotice(null); };
   const copyConnection = async (field: string, value: string) => {
     try { await navigator.clipboard.writeText(value); setCopiedField(field); }
     catch { setError("无法复制，请手动选择复制"); }
   };
   const live = Boolean(publication?.enabled && publication.dependencies_ready);
+  const inChannel = tab === "publication" || tab === "clients" || tab === "deployments";
+  const startPublish = (release: ApplicationRelease | null = null) => { setPublishRelease(release); setConfirmPublish(true); };
+  const restored = (next: Application) => {
+    const updated = { ...draft, ...next };
+    setDraft(updated); setDraftDirty(false); setInspectRelease(null); onUpdated?.(updated);
+    switchTab("draft"); setNotice("版本配置已复制到草稿"); setRefresh((value) => value + 1);
+  };
 
   return <section className="application-detail application-workspace" aria-busy={loading || busy}>
     <div className="application-breadcrumb"><button onClick={onBack} type="button"><ArrowLeft size={14} />全部 Agent</button><ChevronRight size={13} /><span>{draft.name}</span></div>
-    <div className="application-detail-heading"><span className="application-avatar"><Bot size={24} /></span><div className="application-detail-copy"><h2>{draft.name}</h2><p>{draft.description || "Agent"}</p></div><div className="section-actions"><button className="outline-button" onClick={() => onUse(app.id)} type="button"><MessageCircle size={15} />调试 Agent</button><button className="primary-button" type="button" aria-label="发布新版本" title={draftDirty ? "请先保存草稿" : !publication?.api_channel_created ? "请先创建发布渠道" : "发布新版本"} disabled={busy || loading || draftDirty || !publication?.draft_ready || !publication.api_channel_created} onClick={() => setConfirmPublish(true)}><Upload size={15} />发布新版本</button></div></div>
-    <div className="application-tabs" role="tablist" aria-label="Agent 管理">{([["draft", "Agent 配置"], ["publication", "发布渠道"], ["history", "发布历史"], ["runs", "运行日志"]] as const).map(([value, label]) => <button key={value} id={`application-tab-${value}`} type="button" role="tab" aria-controls={`application-panel-${value}`} aria-selected={activeTab === value} disabled={busy} onClick={() => switchTab(value)}>{label}</button>)}</div>
+    <div className="application-detail-heading"><span className="application-avatar"><Bot size={24} /></span><div className="application-detail-copy"><h2>{draft.name}</h2><p>{draft.description || "Agent"}</p></div><div className="section-actions"><button className="outline-button" onClick={() => onUse(app.id)} type="button"><MessageCircle size={15} />调试 Agent</button><button className="primary-button" type="button" aria-label="发布" title={!publication?.api_channel_created ? "请先创建发布渠道" : "选择版本发布"} disabled={busy || loading || !publication?.api_channel_created} onClick={() => startPublish()}><Upload size={15} />发布</button></div></div>
+    <div className="application-tabs" role="tablist" aria-label="Agent 管理">{([["draft", "Agent 配置"], ["history", "版本管理"], ["publication", "发布渠道"], ["runs", "运行日志"]] as const).map(([value, label]) => <button key={value} id={`application-tab-${value}`} type="button" role="tab" aria-controls={`application-panel-${value}`} aria-selected={activeTab === value} disabled={busy} onClick={() => switchTab(value)}>{label}</button>)}</div>
     {error && <div role="alert" className="application-error">{error}<button className="quiet-button" type="button" disabled={busy} onClick={() => { if (tab === "draft") void reloadDraft(); else setRefresh((value) => value + 1); }}>{tab === "draft" ? "刷新草稿" : "刷新"}</button></div>}
     {notice && <p role="status" className="application-notice">{notice}</p>}
-    {draftDirty && <div className="application-unsaved" role="status"><span className="application-draft-indicator">有未保存的修改</span>{tab !== "draft" && <button className="application-text-button" type="button" onClick={() => switchTab("draft")}>返回 Agent 配置<ChevronRight size={14} /></button>}</div>}
+    {draftDirty && tab !== "history" && <div className="application-unsaved" role="status"><span className="application-draft-indicator">有未保存的修改</span>{tab !== "draft" && <button className="application-text-button" type="button" onClick={() => switchTab("draft")}>返回 Agent 配置<ChevronRight size={14} /></button>}</div>}
     {loading && <p className="loading" role="status">正在加载…</p>}
 
-    {(tab === "publication" || tab === "clients") && publication && <div className="application-release-strip"><div><span className="application-strip-label">发布版本</span><strong>{publication.active_release ? `r${publication.active_release.sequence}` : "未发布"}</strong>{publication.active_release && <span className="application-muted">{timestamp(publication.active_release.created_at)}</span>}</div>{publication.has_unpublished_changes && <span className="application-draft-indicator">草稿有变更</span>}</div>}
-    {(tab === "publication" || tab === "clients") && publication && <>
+    {inChannel && publication?.api_channel_created && <div className="application-release-strip"><div><span className="application-strip-label">API 运行版本</span>{publication.active_release ? <button className="application-version-link" type="button" onClick={() => setInspectRelease(publication.active_release)}>r{publication.active_release.sequence}</button> : <strong>未发布</strong>}{publication.last_deployed_at && <span className="application-muted">发布于 {timestamp(publication.last_deployed_at)}</span>}</div>{publication.active_release && publication.has_unpublished_changes && <span className="application-draft-indicator">草稿与渠道版本不同</span>}</div>}
+    {inChannel && publication && <>
       {publication.draft_error && <p className="application-error">草稿发布：{publication.draft_error}</p>}
       {publication.active_release && publication.dependency_error && <p className="application-error">当前发布：{publication.dependency_error}</p>}
     </>}
@@ -213,12 +226,12 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
       <div className="application-section-heading"><h3>发布渠道 <span className="application-heading-count">{publication.api_channel_created ? 1 : 0}</span></h3><button className="outline-button" type="button" disabled={busy || loading || publication.api_channel_created} onClick={() => setCreateChannel(true)}><Plus size={15} />创建发布渠道</button></div>
       {publication.api_channel_created ? <div className="application-channel-table" role="table" aria-label="发布渠道">
         <div className="application-channel-row application-channel-labels" role="row"><span role="columnheader">渠道</span><span role="columnheader">接入状态</span><span role="columnheader">服务状态</span><span role="columnheader">运行版本</span><span role="columnheader">操作</span></div>
-        <div className="application-channel-row" role="row"><div className="application-channel-name" role="cell"><span className="application-channel-icon api"><Braces size={20} /></span><div><strong>API 服务</strong><small>系统与业务集成</small></div></div><div role="cell"><span className={`application-state ${publication.dependencies_ready ? "is-live" : "is-error"}`}>{publication.dependencies_ready ? "已就绪" : "依赖异常"}</span></div><div role="cell"><span className={`application-state ${live ? "is-live" : ""}`}>{!publication.active_release ? "未启用" : statusLabel(publication)}</span></div><div role="cell" className="application-channel-version">{publication.active_release ? `r${publication.active_release.sequence}` : "—"}</div><div role="cell"><button className="application-text-button" type="button" disabled={busy} onClick={() => setApiDetail(true)}>管理 API<ChevronRight size={14} /></button></div></div>
+        <div className="application-channel-row" role="row"><div className="application-channel-name" role="cell"><span className="application-channel-icon api"><Braces size={20} /></span><div><strong>API 服务</strong><small>系统与业务集成</small></div></div><div role="cell"><span className={`application-state ${publication.dependencies_ready ? "is-live" : "is-error"}`}>{publication.dependencies_ready ? "已就绪" : "依赖异常"}</span></div><div role="cell"><span className={`application-state ${live ? "is-live" : ""}`}>{!publication.active_release ? "未启用" : statusLabel(publication)}</span></div><div role="cell" className="application-channel-version">{publication.active_release ? <button className="application-version-link" type="button" onClick={() => setInspectRelease(publication.active_release)}>r{publication.active_release.sequence}</button> : "—"}</div><div role="cell" className="application-channel-actions"><button className="application-text-button" type="button" disabled={busy || loading} onClick={() => startPublish()}>切换版本</button><button className="application-text-button" type="button" disabled={busy} onClick={() => setApiDetail(true)}>管理 API<ChevronRight size={14} /></button></div></div>
       </div> : <div className="application-channel-empty"><span className="application-channel-empty-icon"><Globe size={27} /></span><h3>还没有发布渠道</h3></div>}
       <div className="application-knowledge-note"><BookOpen size={15} /><span>{knowledgeBases.find((item) => item.id === draft.knowledge_base_id)?.name || "知识库"}</span><span className="application-note-divider" /><span>自动使用最新已提交内容</span></div>
     </div>}
-    {(tab === "publication" || tab === "clients") && apiDetail && <div className="application-api-heading"><button className="icon-button" type="button" title="返回发布渠道" aria-label="返回发布渠道" disabled={busy} onClick={() => { setApiDetail(false); setTab("publication"); }}><ArrowLeft size={17} /></button><span className="application-channel-icon api"><Braces size={18} /></span><h3>API 服务</h3><span className={`application-state ${live ? "is-live" : ""}`}>{publication ? statusLabel(publication) : "读取中…"}</span>{publication?.active_release && <button className="outline-button" type="button" disabled={busy || loading || (!publication.enabled && !publication.dependencies_ready)} onClick={() => void togglePublication()}>{publication.enabled ? "停用 API" : "恢复 API"}</button>}</div>}
-    {(tab === "publication" || tab === "clients") && apiDetail && <nav className="application-api-tabs" aria-label="API 服务管理"><button className={tab === "publication" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("publication"); setError(null); setNotice(null); }}><Globe size={14} />接入配置</button><button className={tab === "clients" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("clients"); setError(null); setNotice(null); }}><Braces size={14} />客户端与密钥</button><a href={api.docsUrl()} target="_blank" rel="noreferrer">接口文档<ArrowUpRight size={14} /></a></nav>}
+    {inChannel && apiDetail && <div className="application-api-heading"><button className="icon-button" type="button" title="返回发布渠道" aria-label="返回发布渠道" disabled={busy} onClick={() => { setApiDetail(false); setTab("publication"); }}><ArrowLeft size={17} /></button><span className="application-channel-icon api"><Braces size={18} /></span><h3>API 服务</h3><span className={`application-state ${live ? "is-live" : ""}`}>{publication ? statusLabel(publication) : "读取中…"}</span>{publication?.active_release && <button className="outline-button" type="button" disabled={busy || loading || (!publication.enabled && !publication.dependencies_ready)} onClick={() => void togglePublication()}>{publication.enabled ? "停用 API" : "恢复 API"}</button>}</div>}
+    {inChannel && apiDetail && <nav className="application-api-tabs" aria-label="API 服务管理"><button className={tab === "publication" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("publication"); setError(null); setNotice(null); }}><Globe size={14} />接入配置</button><button className={tab === "clients" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("clients"); setError(null); setNotice(null); }}><Braces size={14} />客户端与密钥</button><button className={tab === "deployments" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("deployments"); setError(null); setNotice(null); }}>发布记录</button><a href={api.docsUrl()} target="_blank" rel="noreferrer">接口文档<ArrowUpRight size={14} /></a></nav>}
     {tab === "publication" && publication && apiDetail && <div role="tabpanel" id="application-panel-publication" aria-labelledby="application-tab-publication">
       <div className="application-connection-fields">{([{ label: "Base URL", value: baseUrl }, { label: "Model", value: app.id }, { label: "调用地址", value: endpoint }]).map(({ label, value }) => <div className="application-endpoint" key={label}><label>{label}</label><div><code aria-label={label}>{value}</code><button className="icon-button" type="button" title={copiedField === label ? "已复制" : `复制${label}`} aria-label={`复制${label}`} onClick={() => void copyConnection(label, value)}>{copiedField === label ? <Check size={16} /> : <Copy size={16} />}</button></div></div>)}</div>
       {publicBaseMissing && <p className="application-endpoint-hint" role="note">当前显示控制台地址，对外部署请替换为公开网关地址</p>}
@@ -226,19 +239,19 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
       <details className="application-example"><summary>cURL 调用示例</summary><pre>{`curl '${endpoint}' \\\n  -H "Authorization: Bearer $NIANLUN_APP_KEY" \\\n  -H 'Content-Type: application/json' \\\n  -d '${JSON.stringify({ model: app.id, messages: [{ role: "user", content: "请概括文档" }], stream: false })}'`}</pre></details>
       <details className="application-example"><summary>Python SDK 调用示例</summary><pre>{`import os\nfrom openai import OpenAI\n\nclient = OpenAI(\n    base_url=${JSON.stringify(baseUrl)},\n    api_key=os.environ["NIANLUN_APP_KEY"],\n)\n\nstream = client.chat.completions.create(\n    model=${JSON.stringify(app.id)},\n    messages=[{"role": "user", "content": "请概括文档"}],\n    stream=True,\n)\nfor chunk in stream:\n    if chunk.choices:\n        print(chunk.choices[0].delta.content or "", end="", flush=True)`}</pre></details>
     </div>}
-    {tab === "history" && <div role="tabpanel" id="application-panel-history" aria-labelledby="application-tab-history">
-      <div className="application-section-heading"><h3>发布历史</h3><span>{releases.total} 个版本</span></div>
-      {releases.items.length ? <div className="application-table-wrap"><table className="application-table"><thead><tr><th>版本</th><th>发布时间</th><th>配置摘要</th></tr></thead><tbody>{releases.items.map((item) => <tr key={item.id}><td>r{item.sequence}{item.id === publication?.active_release?.id && <span className="tag ready">当前</span>}</td><td>{timestamp(item.created_at)}</td><td><code>{item.config_hash.slice(0, 16)}</code><details><summary>配置</summary><pre>{JSON.stringify(item.config, null, 2)}</pre></details></td></tr>)}</tbody></table></div> : !loading && <p className="application-empty">暂无发布版本</p>}
-      <Pagination offset={releaseOffset} total={releases.total} onChange={setReleaseOffset} disabled={loading || busy} />
+    {tab === "history" && <ApplicationVersions app={draft} page={releases} active={publication?.active_release || null} enabled={publication?.enabled ?? false} draftDirty={draftDirty} knowledgeBases={knowledgeBases} loading={loading || busy} canCreate={!draftDirty && Boolean(publication?.draft_ready)} canPublish={Boolean(publication?.api_channel_created)} createDisabledReason={draftDirty ? "请先保存草稿" : publication?.draft_error || "草稿当前不可创建版本"} offset={releaseOffset} onOffset={setReleaseOffset} onCreated={() => { setReleaseOffset(0); setRefresh((value) => value + 1); setNotice("版本已创建，尚未发布到渠道"); }} onEditDraft={() => switchTab("draft")} onPublish={(release) => startPublish(release)} onRestored={restored} />}
+    {tab === "deployments" && <div role="tabpanel" id="application-panel-deployments" aria-labelledby="application-tab-publication">
+      {deployments.items.length ? <div className="application-table-wrap"><table className="application-table"><thead><tr><th>时间</th><th>操作</th><th>版本变更</th><th>服务状态</th></tr></thead><tbody>{deployments.items.map((event) => <tr key={event.id}><td>{timestamp(event.created_at)}</td><td>{event.action === "deploy" ? "发布版本" : event.action === "enable" ? "恢复 API" : "停用 API"}</td><td>{event.previous_sequence ? `r${event.previous_sequence}` : "未发布"}{event.action === "deploy" ? ` → r${event.sequence}` : ""}</td><td><span className={`application-state ${event.enabled ? "is-live" : ""}`}>{event.enabled ? "已启用" : "已停用"}</span></td></tr>)}</tbody></table></div> : !loading && <p className="application-empty">暂无发布记录</p>}
+      {deployments.total > 20 && <Pagination offset={deploymentOffset} total={deployments.total} onChange={setDeploymentOffset} disabled={loading || busy} />}
     </div>}
 
     <form className="application-draft" hidden={tab !== "draft"} id="application-panel-draft" aria-labelledby="application-tab-draft" onChange={() => setDraftDirty(true)} onSubmit={saveDraft} role="tabpanel" key={`${draft.id}-${draft.updated_at}-${draft.config_version}`}>
-      <div className="application-section-heading"><h3>Agent 配置</h3><span>草稿 v{draft.config_version ?? 1}</span></div>
+      <div className="application-section-heading"><h3>Agent 配置</h3><span>{draftDirty ? "有未保存修改" : "已保存"}</span></div>
       <fieldset disabled={busy}>
         <div className="application-form-section"><div className="application-form-section-title"><h3>基本信息</h3></div><div className="application-form-fields"><div className="field"><label htmlFor="draft-name">Agent 名称</label><input id="draft-name" name="name" defaultValue={draft.name} required maxLength={128} /></div><div className="field"><label htmlFor="draft-description">描述</label><textarea id="draft-description" name="description" defaultValue={draft.description} maxLength={2000} /></div></div></div>
-        <div className="application-form-section"><div className="application-form-section-title"><h3>模型与知识库</h3></div><div className="application-form-fields"><div className="field"><label htmlFor="draft-kb">绑定知识库</label><select id="draft-kb" name="knowledge_base_id" defaultValue={draft.knowledge_base_id} required>{!knowledgeBases.some((item) => item.id === draft.knowledge_base_id) && <option value={draft.knowledge_base_id}>当前知识库（不可用）</option>}{knowledgeBases.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div><div className="field"><label htmlFor="draft-model">LLM 模型</label><select id="draft-model" name="llm_model_id" defaultValue={draft.llm_model_id || ""}><option value="">系统默认模型</option>{draft.llm_model_id && !llmModels.some((item) => item.id === draft.llm_model_id) && <option value={draft.llm_model_id}>当前模型（不可用）</option>}{llmModels.map((item) => <option key={item.id} value={item.id}>{item.model || item.name}</option>)}</select></div></div></div>
+        <div className="application-form-section"><div className="application-form-section-title"><h3>模型与知识库</h3></div><div className="application-form-fields"><div className="field"><label htmlFor="draft-kb">绑定知识库</label><select id="draft-kb" name="knowledge_base_id" defaultValue={draft.knowledge_base_id} required>{!knowledgeBases.some((item) => item.id === draft.knowledge_base_id) && <option value={draft.knowledge_base_id}>当前知识库（不可用）</option>}{knowledgeBases.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div><div className="field"><label htmlFor="draft-model">LLM 模型</label><select id="draft-model" name="llm_model_id" defaultValue={draft.llm_model_id || ""}><option value="">系统默认模型</option>{draft.llm_model_id && !draftModels.some((item) => item.id === draft.llm_model_id) && <option value={draft.llm_model_id}>当前模型（不可用）</option>}{draftModels.map((item) => <option key={item.id} value={item.id}>{item.model || item.name}</option>)}</select></div></div></div>
         <div className="application-form-section"><div className="application-form-section-title"><h3>运行配置</h3></div><div className="application-form-fields"><div className="field"><label htmlFor="draft-version">Agent 架构</label><select id="draft-version" name="agent_version" defaultValue={draft.agent_version}><option value="v0">v0 · 一体化检索与回答</option><option value="v1">v1 · 检索与回答分离</option></select></div><label className="application-checkbox"><input type="checkbox" name="clarification_enabled" defaultChecked={draft.clarification_enabled ?? true} /><span>允许澄清问题</span></label></div></div>
-        <div className="application-form-actions"><button className="primary-button" type="submit" disabled={busy}>{busy ? "保存中…" : "保存草稿"}</button></div>
+        <div className="application-form-actions"><button className="primary-button" type="submit" disabled={busy || !draftDirty}>{busy ? "保存中…" : draftDirty ? "保存草稿" : "已保存"}</button></div>
       </fieldset>
     </form>
 
@@ -260,6 +273,7 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
     </div>}
     {keyClient && <KeyDialog appId={app.id} client={keyClient} rotationKey={rotationKey} onClose={() => setKeyClient(null)} onRegistered={(key) => setKeys((items) => [...items, key])} onRevoked={(key) => setKeys((items) => items.map((item) => item.key_id === key.key_id ? key : item))} />}
     {createChannel && publication && <ChannelDialog appId={app.id} apiCreated={publication.api_channel_created} onClose={() => setCreateChannel(false)} onCreated={(state) => { setPublication(state); setCreateChannel(false); setNotice("API 渠道已创建"); }} />}
-    {confirmPublish && publication && <Modal title="发布新版本" description={publication.active_release && !publication.enabled ? "将更新 API 服务版本，渠道保持停用。" : "将更新并启用 API 服务，已有会话保持原版本。"} onClose={() => setConfirmPublish(false)}><dl className="application-publish-summary"><div><dt>Agent</dt><dd>{draft.name}</dd></div><div><dt>草稿版本</dt><dd>v{publication.config_version}</dd></div><div><dt>更新渠道</dt><dd><Braces size={15} />API 服务</dd></div><div><dt>知识库</dt><dd>{knowledgeBases.find((item) => item.id === draft.knowledge_base_id)?.name || "当前绑定知识库"}</dd></div></dl><div className="modal-actions"><button className="outline-button" type="button" onClick={() => setConfirmPublish(false)}>取消</button><button className="primary-button" type="button" disabled={busy || loading || !publication.draft_ready} onClick={() => { setConfirmPublish(false); void publish(); }}><Upload size={15} />确认发布</button></div></Modal>}
+    {confirmPublish && publication && <ApplicationPublishPanel app={draft} publication={publication} initialRelease={publishRelease} draftDirty={draftDirty} knowledgeBases={knowledgeBases} llmModels={draftModels} onClose={() => setConfirmPublish(false)} onRefreshed={(latest, state, models) => { setPublication(state); setDraftModels(models); if (!draftDirty) { setDraft(latest); onUpdated?.(latest); } }} onVersionCreated={() => { setReleaseOffset(0); setRefresh((value) => value + 1); }} onPublished={(state) => { setPublication(state); setConfirmPublish(false); setNotice(`API 已切换至 r${state.active_release?.sequence}${!state.enabled ? "，渠道保持停用" : ""}`); setRefresh((value) => value + 1); }} />}
+    {inspectRelease && <VersionDetail app={draft} release={inspectRelease} active={publication?.active_release || null} knowledgeBases={knowledgeBases} onClose={() => setInspectRelease(null)} onRestored={restored} />}
   </section>;
 }

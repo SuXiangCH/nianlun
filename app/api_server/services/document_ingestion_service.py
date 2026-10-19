@@ -1411,7 +1411,7 @@ class DocumentIngestionService:
         thin = tree_options.subtree_folding_enabled and heading_recovery_mode == "off"
         llm = None
         if knowledge_base["summary_enabled"]:
-            llm = self.models.build_llm()
+            llm = self.models.build_llm(knowledge_base.get("llm_model_id"))
         if knowledge_base["summary_enabled"]:
             _, parsed = build_workspace_doc(
                 str(path),

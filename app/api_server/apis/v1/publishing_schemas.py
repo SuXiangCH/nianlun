@@ -74,6 +74,21 @@ class ApplicationPublishRequest(ApiSchema):
     expected_deployment_version: int = Field(ge=0)
 
 
+class ApplicationReleaseCreateRequest(ApiSchema):
+    expected_config_version: int = Field(ge=1)
+    description: str = Field(default="", max_length=500)
+
+
+class ApplicationDeployRequest(ApiSchema):
+    channel_type: Literal["api"] = "api"
+    release_id: str = Field(min_length=1, max_length=128)
+    expected_deployment_version: int = Field(ge=0)
+
+
+class ApplicationRestoreRequest(ApiSchema):
+    expected_config_version: int = Field(ge=1)
+
+
 class PublicationChannelCreateRequest(ApiSchema):
     type: Literal["api"]
 
@@ -90,6 +105,7 @@ class ApplicationReleaseResponse(ApiSchema):
     draft_config_version: int
     config_schema_version: int
     config_hash: str
+    description: str = ""
     config: PublishedConfig
     created_at: datetime
 
@@ -99,12 +115,32 @@ class ApplicationReleaseListResponse(ApiSchema):
     total: int
 
 
+class ApplicationDeploymentEventResponse(ApiSchema):
+    id: str
+    application_id: str
+    channel_type: Literal["api"]
+    action: Literal["deploy", "enable", "disable"]
+    previous_release_id: str | None
+    release_id: str | None
+    previous_sequence: int | None
+    sequence: int | None
+    enabled: bool
+    deployment_version: int
+    created_at: datetime
+
+
+class ApplicationDeploymentListResponse(ApiSchema):
+    items: list[ApplicationDeploymentEventResponse]
+    total: int
+
+
 class PublicationResponse(ApiSchema):
     application_id: str
     api_channel_created: bool
     enabled: bool
     active_release: ApplicationReleaseResponse | None
     deployment_version: int
+    last_deployed_at: datetime | None = None
     config_version: int
     has_unpublished_changes: bool
     draft_ready: bool

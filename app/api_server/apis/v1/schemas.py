@@ -145,9 +145,10 @@ class KnowledgeBaseCreateRequest(ApiSchema):
     description: str = Field(default="", max_length=2_000)
     summary_enabled: bool = True
     heading_recovery_enabled: bool = True
+    llm_model_id: str | None = Field(default=None, max_length=128)
     embedding_model_id: str | None = Field(default=None, max_length=128)
 
-    @field_validator("embedding_model_id")
+    @field_validator("embedding_model_id", "llm_model_id")
     @classmethod
     def normalize_embedding_model_id(cls, value: str | None) -> str | None:
         normalized = value.strip() if value is not None else None
@@ -158,10 +159,11 @@ class KnowledgeBaseUpdateRequest(ApiSchema):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     summary_enabled: bool | None = None
     heading_recovery_enabled: bool | None = None
+    llm_model_id: str | None = Field(default=None, max_length=128)
     embedding_model_id: str | None = Field(default=None, max_length=128)
     vector_enabled: bool | None = None
 
-    @field_validator("embedding_model_id")
+    @field_validator("embedding_model_id", "llm_model_id")
     @classmethod
     def normalize_embedding_model_id(cls, value: str | None) -> str | None:
         normalized = value.strip() if value is not None else None
@@ -308,6 +310,7 @@ class KnowledgeBaseResponse(ApiSchema):
     document_count: int
     summary_enabled: bool = True
     heading_recovery_enabled: bool = True
+    llm_model_id: str | None = None
     workspace_dir: str
     workspace_relpath: str | None = None
     content_version: int = 0

@@ -414,7 +414,7 @@ def test_pdf_uses_self_hosted_mineru_task_and_zip_pipeline(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: FakeSummaryLLM(),
+        lambda _self, _profile_id=None: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
     _configure_parser(client, api_mode="self_hosted")
@@ -451,7 +451,7 @@ def test_self_hosted_task_is_resubmitted_after_upstream_restart(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: FakeSummaryLLM(),
+        lambda _self, _profile_id=None: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
     _configure_parser(client, api_mode="self_hosted")
@@ -482,7 +482,7 @@ def test_markdown_documents_are_visible_and_pdf_uses_mineru_pipeline(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: FakeSummaryLLM(),
+        lambda _self, _profile_id=None: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
     _configure_parser(client)
@@ -843,7 +843,7 @@ def test_pdf_heading_recovery_reuses_summary_llm(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: llm,
+        lambda _self, _profile_id=None: llm,
     )
     client = TestClient(create_app(_settings(tmp_path)))
     _configure_parser(client)

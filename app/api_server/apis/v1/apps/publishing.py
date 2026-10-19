@@ -9,6 +9,9 @@ from app.api_server.apis.v1.publishing_schemas import (
     ApiClientUpdateRequest,
     ApiKeyCreateRequest,
     ApplicationPublishRequest,
+    ApplicationReleaseCreateRequest,
+    ApplicationDeployRequest,
+    ApplicationRestoreRequest,
     ApplicationUpdateRequest,
     PublicationChannelCreateRequest,
     PublicationUpdateRequest,
@@ -78,6 +81,63 @@ def list_releases(
     return success(
         _service(request)
         .list_releases(application_id, limit, offset)
+        .model_dump(mode="json")
+    )
+
+
+@router.post("/{application_id}/releases")
+def create_release(
+    application_id: str, body: ApplicationReleaseCreateRequest, request: Request
+) -> dict[str, Any]:
+    return success(
+        _service(request).create_release(application_id, body).model_dump(mode="json")
+    )
+
+
+@router.get("/{application_id}/releases/{release_id}")
+def get_release(
+    application_id: str, release_id: str, request: Request
+) -> dict[str, Any]:
+    return success(
+        _service(request)
+        .require_release(application_id, release_id)
+        .model_dump(mode="json")
+    )
+
+
+@router.post("/{application_id}/releases/{release_id}/restore")
+def restore_release(
+    application_id: str,
+    release_id: str,
+    body: ApplicationRestoreRequest,
+    request: Request,
+) -> dict[str, Any]:
+    return success(
+        _service(request)
+        .restore_release(application_id, release_id, body)
+        .model_dump(mode="json")
+    )
+
+
+@router.post("/{application_id}/deployments")
+def deploy(
+    application_id: str, body: ApplicationDeployRequest, request: Request
+) -> dict[str, Any]:
+    return success(
+        _service(request).deploy(application_id, body).model_dump(mode="json")
+    )
+
+
+@router.get("/{application_id}/deployments")
+def list_deployments(
+    application_id: str,
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    return success(
+        _service(request)
+        .list_deployments(application_id, limit, offset)
         .model_dump(mode="json")
     )
 

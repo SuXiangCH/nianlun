@@ -11,6 +11,7 @@ interface Props {
   documents: KnowledgeBaseDocument[];
   documentsLoading: boolean;
   documentsError: string | null;
+  llmModels: ModelProfile[];
   embeddingModels: ModelProfile[];
   onCreate: () => void;
   onOpen: (knowledgeBaseId: string) => void;
@@ -21,6 +22,7 @@ interface Props {
   onRebuildVector: (knowledgeBaseId: string) => Promise<void>;
   onUpdateSummary: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
   onUpdateHeadingRecovery: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
+  onUpdateLlmModel: (knowledgeBaseId: string, modelId: string | null) => Promise<void>;
   onUpdateName: (knowledgeBaseId: string, name: string) => Promise<void>;
   onUpdateEmbeddingModel: (knowledgeBaseId: string, modelId: string) => Promise<void>;
   onUpdateVectorEnabled: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
@@ -80,6 +82,7 @@ export function KnowledgeBaseView({
   documents,
   documentsLoading,
   documentsError,
+  llmModels,
   embeddingModels,
   onCreate,
   onOpen,
@@ -90,6 +93,7 @@ export function KnowledgeBaseView({
   onRebuildVector,
   onUpdateSummary,
   onUpdateHeadingRecovery,
+  onUpdateLlmModel,
   onUpdateName,
   onUpdateEmbeddingModel,
   onUpdateVectorEnabled,
@@ -108,6 +112,8 @@ export function KnowledgeBaseView({
   const [treeError, setTreeError] = useState<string | null>(null);
   const [summarySaving, setSummarySaving] = useState(false);
   const [headingRecoverySaving, setHeadingRecoverySaving] = useState(false);
+  const [llmSaving, setLlmSaving] = useState(false);
+  const [llmError, setLlmError] = useState<string | null>(null);
   const [editingItem, setEditingItem] = useState<KnowledgeBase | null>(null);
   const [nameSaving, setNameSaving] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
@@ -127,6 +133,7 @@ export function KnowledgeBaseView({
     setDocumentQuery("");
     setSettingsOpen(false);
     setOpenMenuId(null);
+    setLlmError(null);
   }, [selectedId]);
   const openUpload = (id: string) => {
     setUploadTargetId(id);
@@ -255,6 +262,19 @@ export function KnowledgeBaseView({
     if (selected.vector_enabled && !window.confirm("切换 Embedding 模型需要重新生成全部向量，可能产生模型调用费用。构建期间将暂时使用全文检索，确定继续吗？")) return;
     void onUpdateEmbeddingModel(selected.id, modelId);
   };
+  const changeLlmModel = async (value: string) => {
+    const modelId = value || null;
+    if (!selected || llmSaving || modelId === selected.llm_model_id) return;
+    setLlmSaving(true);
+    setLlmError(null);
+    try {
+      await onUpdateLlmModel(selected.id, modelId);
+    } catch (error) {
+      setLlmError(error instanceof Error ? error.message : "LLM 模型切换失败");
+    } finally {
+      setLlmSaving(false);
+    }
+  };
   const toggleSummary = async (event: ChangeEvent<HTMLInputElement>) => {
     if (!selected) return;
     setSummarySaving(true);
@@ -310,6 +330,7 @@ export function KnowledgeBaseView({
   }, [openMenuId]);
 
   if (selected) {
+    const defaultLlm = llmModels.find((profile) => profile.is_default);
     const filteredDocuments = documents.filter((document) => document.original_filename.toLocaleLowerCase().includes(documentQuery.trim().toLocaleLowerCase()));
     return (
       <section className="knowledge-workspace">
@@ -332,7 +353,10 @@ export function KnowledgeBaseView({
             <label className="field detail-vector-model"><span>Embedding 模型</span><select value={selected.embedding_model_id || ""} onChange={(event) => changeEmbeddingModel(event.target.value)}><option value="" disabled>请选择 Embedding 模型</option>{embeddingModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
             <div className="knowledge-setting-row"><label className="switch-control detail-vector-switch"><input type="checkbox" checked={selected.vector_enabled} disabled={!selected.embedding_model_id} onChange={(event) => void onUpdateVectorEnabled(selected.id, event.target.checked)} /><span>向量检索</span></label><button className="outline-button" onClick={() => confirmVectorRebuild(selected)} type="button" disabled={!selected.vector_enabled || !selected.embedding_model_id || selected.vector_status === "pending" || selected.vector_status === "building"}>{hasVectorIndex(selected) ? "重建向量索引" : "构建向量索引"}</button></div>
           </section>
-          <section><h3>文档处理</h3><label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>生成摘要</span></label><label className="switch-control detail-heading-recovery-switch" title="仅影响之后上传的 MinerU PDF"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>修复 PDF 标题</span></label></section>
+          <section><h3>文档处理</h3>
+            <label className="field detail-vector-model"><span>LLM 模型</span><select aria-label="LLM 模型" value={selected.llm_model_id || ""} disabled={llmSaving} aria-busy={llmSaving} onChange={(event) => void changeLlmModel(event.target.value)}><option value="">跟随系统默认 · {defaultLlm ? modelLabel(defaultLlm) : "未配置"}</option>{selected.llm_model_id && !llmModels.some((profile) => profile.id === selected.llm_model_id) && <option value={selected.llm_model_id} disabled>模型不可用</option>}{llmModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
+            {llmError && <div className="document-content-state is-error" role="alert">{llmError}</div>}
+            <label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>生成摘要</span></label><label className="switch-control detail-heading-recovery-switch" title="仅影响之后上传的 MinerU PDF"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>修复 PDF 标题</span></label></section>
           <div className="modal-actions"><button className="primary-button" type="button" onClick={() => setSettingsOpen(false)}>完成</button></div>
         </div></Modal>}
         {(selected.vector_status === "pending" || selected.vector_status === "building") && <div className="document-content-state">向量索引进度：{vectorProgressLabel(selected)}</div>}

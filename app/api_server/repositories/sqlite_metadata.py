@@ -48,6 +48,7 @@ def _knowledge_base_dict(item: KnowledgeBase) -> dict[str, Any]:
         "document_count": item.document_count,
         "summary_enabled": bool(item.summary_enabled),
         "heading_recovery_enabled": bool(item.heading_recovery_enabled),
+        "llm_model_id": item.llm_model_id,
         "content_version": item.content_version,
         "fts_status": item.fts_status,
         "fts_revision": item.fts_revision,
@@ -174,6 +175,7 @@ class SQLiteMetadataRepository(
             "name",
             "summary_enabled",
             "heading_recovery_enabled",
+            "llm_model_id",
             "vector_model_id",
             "vector_status",
             "vector_revision",
@@ -263,6 +265,7 @@ class SQLiteMetadataRepository(
                 heading_recovery_enabled=bool(
                     item.get("heading_recovery_enabled", True)
                 ),
+                llm_model_id=item.get("llm_model_id"),
                 content_version=int(item.get("content_version", 0)),
                 fts_status=item.get("fts_status", "disabled"),
                 fts_revision=item.get("fts_revision"),
@@ -297,6 +300,7 @@ class SQLiteMetadataRepository(
             entity.heading_recovery_enabled = bool(
                 item.get("heading_recovery_enabled", True)
             )
+            entity.llm_model_id = item.get("llm_model_id")
             entity.content_version = int(item.get("content_version", 0))
             entity.fts_status = item.get("fts_status", "disabled")
             entity.fts_revision = item.get("fts_revision")

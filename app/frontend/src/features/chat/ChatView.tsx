@@ -385,6 +385,7 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
   const latestChat = useRef({ storageKey, messages, sources });
   latestChat.current = { storageKey, messages, sources };
   useEffect(() => () => {
+    requestVersion.current += 1;
     controller.current?.abort();
     if (citationHighlightTimer.current) clearTimeout(citationHighlightTimer.current);
   }, []);
@@ -625,6 +626,16 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
     }
   };
   const resetConversation = () => { requestVersion.current += 1; controller.current?.abort(); streamSyncedConversation.current = null; setBusy(false); setMessages([]); setSources([]); onNewConversation(); };
+  const switchAgent = (id: string): void => {
+    if (!id || id === applicationId) return;
+    requestVersion.current += 1;
+    controller.current?.abort();
+    controller.current = null;
+    streamSyncedConversation.current = null;
+    setBusy(false);
+    setShowConversations(false);
+    onSelectApp(id);
+  };
   const stop = () => {
     // 终止当前回答：中止请求、保留已流出的部分文本并标记"已停止"。从未产出正文的
     // 气泡直接移除，避免留下空白的"已停止"占位。与切换会话/新对话不同，这里不清理
@@ -776,6 +787,12 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
     } catch (error) {
       if ((error as DOMException).name === "AbortError" || version !== requestVersion.current) return;
       const text = error instanceof Error ? error.message : "对话请求失败";
+      if (text === "会话不属于当前应用") {
+        resetConversation();
+        input.value = message;
+        toast("会话与当前 Agent 不匹配，已切换到新会话，请重新发送。", true);
+        return;
+      }
       setMessages((current) => current.map((entry) => entry.id === assistantId ? { ...entry, pending: false, error: true, text } : entry)); toast(text, true);
     } finally { cancelFlush(); if (version === requestVersion.current) { setBusy(false); controller.current = null; } }
   };
@@ -793,7 +810,7 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
     <section className="chat-layout">
       <div className="chat-panel">
         <div className="chat-toolbar">
-          <div className="app-picker"><div className="app-avatar" aria-hidden="true">⌘</div><select value={selected.id} onChange={(event) => { resetConversation(); onSelectApp(event.target.value); }} aria-label="选择应用">{apps.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
+          <div className="app-picker"><div className="app-avatar" aria-hidden="true">⌘</div><select value={selected.id} onChange={(event) => switchAgent(event.target.value)} aria-label="选择应用">{apps.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></div>
           <div className="toolbar-meta">
             <span className="toolbar-search-mode">{selected.search_mode || "scan"} 检索</span>
             <div className="conv-picker"><button className="quiet-button" type="button" onClick={() => setShowConversations((open) => !open)} aria-expanded={showConversations} aria-label="会话列表">会话{conversations.length ? ` (${conversations.length})` : ""} ▾</button>{showConversations && (<><div className="conv-backdrop" onClick={() => setShowConversations(false)} aria-hidden="true" /><div className="conv-popover" role="menu">{conversations.length ? conversations.map((conv) => (<div key={conv.id} className={`conv-item ${conv.id === conversationId ? "is-active" : ""}`} role="button" tabIndex={0} onClick={() => switchConversation(conv.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); switchConversation(conv.id); } }}><span className="conv-title" title={conv.title}>{conv.title}</span><span className="conv-time">{timeAgo(conv.updatedAt)}</span><button className="conv-del" type="button" aria-label="删除会话" onClick={(event) => { event.stopPropagation(); deleteConversation(conv.id); }}>×</button></div>)) : <div className="conv-empty">还没有会话</div>}</div></>)}</div>

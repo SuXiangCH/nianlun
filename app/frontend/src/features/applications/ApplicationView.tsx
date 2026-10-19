@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowUpRight, Bot, MoreHorizontal, Plus, Search, Trash2 } from "lucide-react";
+import { ArrowUpRight, Bot, MoreHorizontal, Plus, Search } from "lucide-react";
 import { api } from "../../api/client";
 import type { Application, ApplicationPublication, KnowledgeBase, ModelProfile } from "../../types";
 import { ApplicationDetail } from "./ApplicationDetail";
@@ -65,12 +65,12 @@ export function ApplicationView({ apps, knowledgeBases, llmModels, selectedAppId
           const kb = knowledgeBases.find((entry) => entry.id === item.knowledge_base_id);
           const llm = llmModels.find((entry) => entry.id === item.llm_model_id) || (!item.llm_model_id ? llmModels.find((entry) => entry.is_default) : undefined);
           const state = publications[item.id];
-          return <div className="application-list-row" role="row" key={item.id} aria-busy={deleting === item.id}>
+          return <div className="application-list-row is-clickable" role="row" key={item.id} aria-busy={deleting === item.id} onClick={() => setDetailId(item.id)}>
             <div className="application-list-identity" role="cell"><span className="application-avatar"><Bot size={20} /></span><div><button className="application-name" type="button" onClick={() => setDetailId(item.id)}>{item.name}</button><p>{item.description || "暂无描述"}</p>{item.id === selectedAppId && <span className="application-current">当前使用</span>}</div></div>
             <div className="application-list-dependencies" role="cell"><span>{kb?.name || "知识库已移除"}</span><small>{llm ? modelLabel(llm) : "模型不可用"}</small></div>
             <div role="cell"><span className={`application-state ${state?.enabled && state.dependencies_ready ? "is-live" : state === null ? "is-error" : ""}`}>{state === undefined ? "读取中…" : state === null ? "状态读取失败" : !state.active_release ? "未发布" : !state.dependencies_ready ? "依赖异常" : state.enabled ? "API 服务中" : "API 已停用"}</span></div>
             <div className="application-list-date" role="cell">{new Date(item.updated_at).toLocaleDateString("zh-CN")}</div>
-            <div className="application-row-actions" role="cell"><button className="quiet-button" onClick={() => onUse(item.id)} type="button">调试<ArrowUpRight size={14} /></button><div className="application-menu" ref={menuId === item.id ? menuRef : undefined}><button className="icon-button" type="button" aria-label={`${item.name}更多操作`} title="更多操作" aria-haspopup="menu" aria-expanded={menuId === item.id} disabled={deleting !== null} onClick={() => setMenuId(menuId === item.id ? null : item.id)}><MoreHorizontal size={18} /></button>{menuId === item.id && <div className="application-menu-popover" role="menu"><button role="menuitem" type="button" onClick={() => { setMenuId(null); setDetailId(item.id); }}>管理 Agent</button><button role="menuitem" className="danger-button" type="button" onClick={() => void remove(item.id)}><Trash2 size={14} />删除 Agent</button></div>}</div></div>
+            <div className="application-row-actions" role="cell" onClick={(event) => event.stopPropagation()}><button className="quiet-button" onClick={() => onUse(item.id)} type="button">调试<ArrowUpRight size={14} /></button><div className="application-menu" ref={menuId === item.id ? menuRef : undefined}><button className="icon-button" type="button" aria-label={`${item.name}更多操作`} title="更多操作" aria-haspopup="menu" aria-expanded={menuId === item.id} disabled={deleting !== null} onClick={() => setMenuId(menuId === item.id ? null : item.id)}><MoreHorizontal size={18} /></button>{menuId === item.id && <div className="application-menu-popover" role="menu"><button role="menuitem" className="danger-button" type="button" onClick={() => void remove(item.id)}>删除 Agent</button></div>}</div></div>
           </div>;
         })}
       </div>

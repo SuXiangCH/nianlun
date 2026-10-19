@@ -592,7 +592,6 @@ class DocumentPipelineService:
         options = WorkspaceArtifactStore.read_tree_build_options(
             Path(str(kb["workspace_dir"]))
         )
-        profile = self.repository.get_default_model_profile("llm")
         payload = EnrichmentOptions(
             summary_enabled=bool(kb["summary_enabled"]),
             heading_recovery_enabled=bool(kb.get("heading_recovery_enabled", True)),
@@ -603,10 +602,9 @@ class DocumentPipelineService:
             document_id=document_id,
             pipeline_generation=generation,
             input_sha256=input_sha256,
-            llm_profile_id=str(profile["id"]) if profile is not None else None,
-            llm_profile_updated_at=(
-                str(profile["updated_at"]) if profile is not None else None
-            ),
+            llm_profile_id=None,
+            llm_profile_updated_at=None,
+            use_knowledge_base_model=True,
             prompt_schema_version=PROMPT_SCHEMA_VERSION,
             options_json=payload.model_dump_json(),
             now=_now(),
@@ -681,7 +679,9 @@ class DocumentPipelineService:
                 limited_llm: _LimitedCachedLLM | None = None
                 llm = None
                 if options.summary_enabled:
-                    delegate = await asyncio.to_thread(self.models.build_llm)
+                    delegate = await asyncio.to_thread(
+                        self.models.build_llm, task.get("llm_profile_id")
+                    )
                     fingerprint = _sha256(
                         (
                             f"{task.get('llm_profile_id') or ''}:"

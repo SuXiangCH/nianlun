@@ -12,7 +12,7 @@ const application: Application = { id: "app-1", name: "产品助手", descriptio
 const publication = { application_id: "app-1", api_channel_created: true, enabled: false, active_release: null, deployment_version: 0, config_version: 1, has_unpublished_changes: true, dependencies_ready: true, dependency_error: null as string | null, draft_ready: true, draft_error: null as string | null };
 const client = { id: "client-1", application_id: "app-1", name: "业务后台", enabled: true, created_at: application.created_at, updated_at: application.updated_at };
 const existingKey = { key_id: "existing-key", client_id: client.id, name: "生产 Key", expires_at: null, revoked_at: null, created_at: application.created_at };
-const release = { id: "release-1", application_id: "app-1", sequence: 1, config_schema_version: 1, config_hash: "hash", config: {}, created_at: application.created_at };
+const release = { id: "release-1", application_id: "app-1", sequence: 1, draft_config_version: 1, description: "", config_schema_version: 1, config_hash: "hash", config: {}, created_at: application.created_at };
 
 describe("Application publishing", () => {
   let container: HTMLDivElement;
@@ -40,7 +40,8 @@ describe("Application publishing", () => {
         if (channelFailure) status = 409;
         else currentPublication = { ...currentPublication, api_channel_created: true };
         data = currentPublication;
-      } else if (path.endsWith("/publish")) {
+      } else if (path.endsWith("/releases") && method === "POST") data = release;
+      else if (path.endsWith("/deployments") && method === "POST") {
         if (publishFailure) { status = 409; } else currentPublication = { ...currentPublication, enabled: true, deployment_version: 1, active_release: release, has_unpublished_changes: false };
         data = currentPublication;
       } else if (path.endsWith("/publication")) {
@@ -70,7 +71,7 @@ describe("Application publishing", () => {
     await click("产品助手");
     if (apiDetail) await click("管理 API");
   };
-  const publish = async () => { await click("发布新版本"); await click("确认发布"); };
+  const publish = async () => { await click("发布"); await click("确认发布"); };
   const submit = async () => { await act(async () => { container.querySelector("[role=dialog] form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); }); };
 
   it("groups list search, count and creation in one toolbar without a duplicate heading", async () => {
@@ -103,7 +104,7 @@ describe("Application publishing", () => {
 
   it("publishes the viewed versions and stops the active entry", async () => {
     await open(); await publish();
-    expect(requests.find((item) => item.path.endsWith("/publish"))?.body).toEqual({ expected_config_version: 1, expected_deployment_version: 0 });
+    expect(requests.find((item) => item.path.endsWith("/deployments"))?.body).toEqual({ channel_type: "api", release_id: release.id, expected_deployment_version: 0 });
     expect(container.textContent).toContain("已发布");
     await click("停用 API");
     expect(requests.find((item) => item.method === "PATCH")?.body).toEqual({ enabled: false, expected_deployment_version: 1 });
@@ -152,14 +153,18 @@ describe("Application publishing", () => {
 
   it("refreshes a conflicting draft before submitting its next edit", async () => {
     await open(); await click("Agent 配置");
+    await act(async () => { container.querySelector<HTMLInputElement>("[name=clarification_enabled]")!.click(); });
     draftVersion = 3;
     await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
     expect(container.querySelector("[role=alert]")?.textContent).toContain("配置已变化");
+    expect(container.querySelector<HTMLButtonElement>(".application-form-actions button")?.disabled).toBe(false);
     await click("刷新草稿");
+    await act(async () => { container.querySelector<HTMLInputElement>("[name=clarification_enabled]")!.click(); });
     await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
     const edits = requests.filter((item) => item.method === "PATCH" && item.path.endsWith("/app-1"));
     expect(edits[1].body.expected_config_version).toBe(3);
     expect(container.textContent).toContain("草稿已保存");
+    expect(container.querySelector<HTMLButtonElement>(".application-form-actions button")?.disabled).toBe(true);
     expect(appUpdates.at(-1)?.search_mode).toBe("fts");
   });
 
@@ -180,10 +185,12 @@ describe("Application publishing", () => {
     await open(false);
     expect(container.querySelector("[aria-busy=true]")).toBeTruthy();
     expect(container.textContent).toContain("正在加载");
-    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']")?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布']")?.disabled).toBe(true);
     await act(async () => { resolve(); await publicationGate; });
-    const button = container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']");
-    expect(button?.disabled).toBe(true);
+    const button = container.querySelector<HTMLButtonElement>("[aria-label='发布']");
+    expect(button?.disabled).toBe(false);
+    await click("发布");
+    expect(container.querySelector<HTMLButtonElement>("[aria-label='确认发布']")?.disabled).toBe(true);
   });
 
   it("registers a replacement before allowing explicit revocation of the old key", async () => {
@@ -199,20 +206,20 @@ describe("Application publishing", () => {
   it("allows publishing a valid draft while an incompatible active release cannot resume", async () => {
     currentPublication = { ...currentPublication, active_release: release, dependencies_ready: false, dependency_error: "旧模型配置已变化", draft_ready: true };
     await open();
-    const button = container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']");
+    const button = container.querySelector<HTMLButtonElement>("[aria-label='发布']");
     expect(button?.disabled).toBe(false);
     const resume = Array.from(container.querySelectorAll("button")).find((item) => item.textContent === "恢复 API");
     expect(resume?.disabled).toBe(true);
     expect(container.textContent).toContain("旧模型配置已变化");
     await publish();
-    expect(requests.some((item) => item.path.endsWith("/publish"))).toBe(true);
+    expect(requests.some((item) => item.path.endsWith("/deployments"))).toBe(true);
   });
 
   it("allows restoring a valid release while a broken draft cannot publish", async () => {
     currentPublication = { ...currentPublication, active_release: release, dependencies_ready: true, draft_ready: false, draft_error: "草稿模型缺少凭据" };
     await open();
-    const publishButton = container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']");
-    expect(publishButton?.disabled).toBe(true);
+    const publishButton = container.querySelector<HTMLButtonElement>("[aria-label='发布']");
+    expect(publishButton?.disabled).toBe(false);
     expect(container.textContent).toContain("草稿模型缺少凭据");
     await click("恢复 API");
     expect(container.textContent).toContain("已发布");
@@ -241,7 +248,7 @@ describe("Application publishing", () => {
 
   it("lists only created channels and separates API settings from release history", async () => {
     await open(false);
-    expect(Array.from(container.querySelectorAll("[role=tab]")).map((item) => item.textContent)).toEqual(["Agent 配置", "发布渠道", "发布历史", "运行日志"]);
+    expect(Array.from(container.querySelectorAll("[role=tab]")).map((item) => item.textContent)).toEqual(["Agent 配置", "版本管理", "发布渠道", "运行日志"]);
     expect(container.textContent).not.toContain("企业微信");
     expect(container.textContent).not.toContain("个人微信");
     expect(container.textContent).not.toContain("调用地址");
@@ -250,17 +257,19 @@ describe("Application publishing", () => {
     expect(container.textContent).toContain("调用地址");
     await click("返回发布渠道");
     expect(container.textContent).toContain("API 服务");
-    await click("发布历史");
+    await click("版本管理");
     expect(requests.some((item) => item.path.endsWith("/releases"))).toBe(true);
-    expect(container.textContent).toContain("暂无发布版本");
+    expect(container.textContent).toContain("尚未创建版本");
   });
 
   it("creates an API channel only after choosing a supported type", async () => {
     currentPublication = { ...currentPublication, api_channel_created: false };
     await open(false);
     expect(container.textContent).toContain("还没有发布渠道");
+    expect(container.textContent).not.toContain("API 运行版本");
+    expect(container.textContent).not.toContain("草稿与渠道版本不同");
     expect(container.textContent).not.toContain("管理 API");
-    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']")?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布']")?.disabled).toBe(true);
     await click("创建发布渠道");
     const create = Array.from(container.querySelectorAll<HTMLButtonElement>("[role=dialog] button")).find((item) => item.textContent === "创建");
     expect(create?.disabled).toBe(true);
@@ -269,6 +278,9 @@ describe("Application publishing", () => {
     await click("创建");
     expect(requests.find((item) => item.path.endsWith("/channels"))?.body).toEqual({ type: "api" });
     expect(container.textContent).toContain("管理 API");
+    expect(container.textContent).toContain("API 运行版本");
+    expect(container.querySelector(".application-release-strip")?.textContent).toContain("未发布");
+    expect(container.textContent).not.toContain("草稿与渠道版本不同");
     expect(container.textContent).not.toContain("企业微信");
     expect(requests.some((item) => item.path.endsWith("/publish"))).toBe(false);
     expect(container.querySelector("[role=dialog]")).toBeNull();
@@ -279,6 +291,19 @@ describe("Application publishing", () => {
     await open(false);
     const create = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((item) => item.textContent?.trim() === "创建发布渠道");
     expect(create?.disabled).toBe(true);
+  });
+
+  it("shows an unpublished channel without a version difference", async () => {
+    await open(false);
+    expect(container.querySelector(".application-release-strip")?.textContent).toContain("未发布");
+    expect(container.textContent).not.toContain("草稿与渠道版本不同");
+  });
+
+  it.each([true, false])("compares the draft only against an existing channel version (changed: %s)", async (changed) => {
+    currentPublication = { ...currentPublication, active_release: release, has_unpublished_changes: changed };
+    await open(false);
+    expect(container.querySelector(".application-release-strip")?.textContent).toContain("r1");
+    expect(container.textContent?.includes("草稿与渠道版本不同")).toBe(changed);
   });
 
   it("asks for confirmation before revoking a key", async () => {
@@ -328,7 +353,7 @@ describe("Application publishing", () => {
   });
 
   it("requires release confirmation and cancelling makes no publication request", async () => {
-    await open(false); await click("发布新版本");
+    await open(false); await click("发布");
     expect(container.querySelector("[role=dialog]")?.textContent).toContain("API 服务");
     expect(requests.some((item) => item.path.endsWith("/publish"))).toBe(false);
     await click("取消");
@@ -338,27 +363,64 @@ describe("Application publishing", () => {
 
   it("publishes the new configuration version after saving the draft", async () => {
     await open(); await click("Agent 配置");
+    await act(async () => { container.querySelector<HTMLInputElement>("[name=clarification_enabled]")!.click(); });
     await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
     await publish();
-    expect(requests.find((item) => item.path.endsWith("/publish"))?.body.expected_config_version).toBe(2);
+    expect(requests.find((item) => item.path.endsWith("/releases") && item.method === "POST")?.body.expected_config_version).toBe(2);
+  });
+
+  it("does not resave an unchanged draft and enables saving only after an edit", async () => {
+    await open(); await click("Agent 配置");
+    let save = container.querySelector<HTMLButtonElement>(".application-form-actions button")!;
+    expect(save.textContent).toBe("已保存");
+    expect(save.disabled).toBe(true);
+    await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
+    expect(requests.some((item) => item.method === "PATCH")).toBe(false);
+    await act(async () => { container.querySelector<HTMLInputElement>("[name=clarification_enabled]")!.click(); });
+    save = container.querySelector<HTMLButtonElement>(".application-form-actions button")!;
+    expect(save.textContent).toBe("保存草稿");
+    expect(save.disabled).toBe(false);
+    await click("保存草稿");
+    expect(requests.filter((item) => item.method === "PATCH")).toHaveLength(1);
+    expect(container.querySelector(".application-form-actions button")?.textContent).toBe("已保存");
+    expect(container.querySelector<HTMLButtonElement>(".application-form-actions button")?.disabled).toBe(true);
   });
 
   it("keeps unsaved edits across tabs and prevents publishing until saved", async () => {
     await open(); await click("Agent 配置");
     await act(async () => { container.querySelector<HTMLInputElement>("[name=clarification_enabled]")!.click(); });
-    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']")?.disabled).toBe(true);
+    await click("发布");
+    expect(container.querySelector<HTMLButtonElement>("[aria-label='确认发布']")?.disabled).toBe(true);
+    await click("取消");
     await click("发布渠道"); await click("Agent 配置");
     expect(container.querySelector<HTMLInputElement>("[name=clarification_enabled]")?.checked).toBe(false);
     await act(async () => { container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
-    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布新版本']")?.disabled).toBe(false);
+    expect(container.querySelector<HTMLButtonElement>("[aria-label='发布']")?.disabled).toBe(false);
   });
 
-  it("keeps deletion in the application menu and supports dismissing it", async () => {
+  it("keeps deletion as the only menu entry and supports dismissing it", async () => {
     await open(false); await click("全部 Agent");
     expect(container.textContent).not.toContain("删除 Agent");
     await click("产品助手更多操作");
-    expect(container.querySelector("[role=menu]")?.textContent).toContain("删除 Agent");
+    expect(container.querySelector("[role=menu]")?.textContent).toBe("删除 Agent");
     await act(async () => { document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); });
     expect(container.querySelector("[role=menu]")).toBeNull();
+  });
+
+  it("opens the Agent detail by clicking anywhere on the row", async () => {
+    await open(false); await click("全部 Agent");
+    const row = container.querySelector<HTMLDivElement>(".application-list-row.is-clickable");
+    expect(row).toBeTruthy();
+    await act(async () => { row!.click(); });
+    expect(container.textContent).toContain("全部 Agent");
+    expect(container.textContent).toContain("Agent 配置");
+  });
+
+  it("keeps row actions from opening the Agent detail", async () => {
+    const onUse = vi.fn();
+    await act(async () => { root.render(<ApplicationView apps={[application]} knowledgeBases={[]} llmModels={[]} selectedAppId="app-1" onCreate={vi.fn()} onUse={onUse} onDelete={vi.fn()} onKnowledge={vi.fn()} onModels={vi.fn()} />); });
+    await act(async () => { container.querySelector<HTMLButtonElement>(".application-row-actions .quiet-button")!.click(); });
+    expect(onUse).toHaveBeenCalledWith("app-1");
+    expect(container.textContent).not.toContain("全部 Agent");
   });
 });

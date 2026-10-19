@@ -64,6 +64,9 @@ class KnowledgeBase(Base):
     heading_recovery_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("1")
     )
+    llm_model_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_profiles.id", ondelete="RESTRICT"), nullable=True
+    )
     content_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     fts_status: Mapped[str] = mapped_column(String, nullable=False, default="disabled")
     fts_revision: Mapped[int | None] = mapped_column(Integer, nullable=True)

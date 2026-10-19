@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,6 +89,234 @@ def publish(service, app_id, *, config_version=1, deployment_version=0):
             expected_deployment_version=deployment_version,
         ),
     )
+
+
+@pytest.fixture
+def management(publishing):
+    service, app_id, _ = publishing
+    app = FastAPI()
+    app.state.services = SimpleNamespace(publishing=service)
+    app.include_router(router)
+    app.add_exception_handler(ApiError, api_error_handler)
+    with TestClient(app) as client:
+        yield client, f"/api/v1/apps/{app_id}"
+
+
+def test_create_version_without_channel_and_retry_does_not_duplicate(
+    management, publishing
+):
+    client, path = management
+    service, app_id, _ = publishing
+    body = {"expected_config_version": 1, "description": "首个稳定版本"}
+    response = client.post(f"{path}/releases", json=body)
+    assert response.status_code == 200
+    release = response.json()["data"]
+    assert release["description"] == "首个稳定版本"
+    assert release["sequence"] == 1
+    assert "credential" not in response.text
+    assert not service.get_publication(app_id).api_channel_created
+    assert (
+        client.post(f"{path}/releases", json=body).json()["data"]["id"] == release["id"]
+    )
+    assert service.list_releases(app_id).total == 1
+    assert client.get(f"{path}/releases/{release['id']}").json()["data"] == release
+    assert (
+        client.post(
+            f"{path}/releases", json={**body, "expected_config_version": 2}
+        ).status_code
+        == 409
+    )
+
+
+def test_deploy_historical_version_preserves_draft_and_disabled_channel(
+    management, publishing
+):
+    client, path = management
+    service, app_id, _ = publishing
+    first = client.post(f"{path}/releases", json={"expected_config_version": 1}).json()[
+        "data"
+    ]
+    # Creating a version never implicitly creates its API channel.
+    deploy = {
+        "channel_type": "api",
+        "release_id": first["id"],
+        "expected_deployment_version": 0,
+    }
+    assert client.post(f"{path}/deployments", json=deploy).status_code == 409
+    service.create_api_channel(app_id)
+    response = client.post(f"{path}/deployments", json=deploy)
+    assert response.status_code == 200
+    assert response.json()["data"]["enabled"]
+    service.update(
+        app_id,
+        ApplicationUpdateRequest(
+            expected_config_version=1, clarification_enabled=False
+        ),
+    )
+    second = client.post(
+        f"{path}/releases", json={"expected_config_version": 2, "description": "新版"}
+    ).json()["data"]
+    response = client.post(
+        f"{path}/deployments",
+        json={**deploy, "release_id": second["id"], "expected_deployment_version": 1},
+    )
+    assert response.status_code == 200
+    state = client.post(
+        f"{path}/deployments", json={**deploy, "expected_deployment_version": 2}
+    ).json()["data"]
+    assert state["active_release"]["id"] == first["id"]
+    assert not service.applications.get(app_id).clarification_enabled
+    assert service.list_releases(app_id).total == 2
+    events = client.get(f"{path}/deployments?limit=2").json()["data"]
+    assert events["total"] == 3 and len(events["items"]) == 2
+    assert events["items"][0]["previous_release_id"] == second["id"]
+    assert events["items"][0]["release_id"] == first["id"]
+    assert events["items"][0]["channel_type"] == "api"
+    assert (
+        client.post(
+            f"{path}/deployments", json={**deploy, "expected_deployment_version": 3}
+        ).status_code
+        == 200
+    )
+    assert client.get(f"{path}/deployments").json()["data"]["total"] == 3
+    service.set_enabled(
+        app_id, PublicationUpdateRequest(enabled=False, expected_deployment_version=3)
+    )
+    state = client.post(
+        f"{path}/deployments",
+        json={**deploy, "release_id": second["id"], "expected_deployment_version": 4},
+    ).json()["data"]
+    assert not state["enabled"] and state["deployment_version"] == 5
+    assert state["active_release"]["id"] == second["id"]
+
+
+def test_deploy_conflicts_and_incompatible_dependencies_leave_entry_unchanged(
+    management, publishing
+):
+    client, path = management
+    service, app_id, repository = publishing
+    state = publish(service, app_id)
+    release_id = state.active_release.id
+    body = {"release_id": release_id, "expected_deployment_version": 0}
+    assert client.post(f"{path}/deployments", json=body).status_code == 409
+    assert (
+        client.post(
+            f"{path}/deployments",
+            json={**body, "release_id": "missing", "expected_deployment_version": 1},
+        ).status_code
+        == 404
+    )
+    other = service.applications.create(
+        ApplicationCreateRequest(name="Other", knowledge_base_id="kb")
+    )
+    service.create_api_channel(other.id)
+    assert (
+        client.post(f"/api/v1/apps/{other.id}/deployments", json=body).status_code
+        == 404
+    )
+    assert (
+        client.get(f"/api/v1/apps/{other.id}/releases/{release_id}").status_code == 404
+    )
+    with repository.factory.session_scope(write=True) as session:
+        record = session.get(ApplicationRelease, release_id)
+        config = json.loads(record.config_json)
+        config["prompt_version"] = -1
+        record.config_json = json.dumps(config)
+    assert (
+        client.post(
+            f"{path}/deployments", json={**body, "expected_deployment_version": 1}
+        ).status_code
+        == 409
+    )
+    assert service.get_publication(app_id).active_release.id == release_id
+    assert service.get_publication(app_id).deployment_version == 1
+
+
+def test_restore_version_updates_only_draft_with_optimistic_lock(
+    management, publishing
+):
+    client, path = management
+    service, app_id, _ = publishing
+    original = publish(service, app_id).active_release
+    service.update(
+        app_id,
+        ApplicationUpdateRequest(
+            expected_config_version=1, name="新名称", clarification_enabled=False
+        ),
+    )
+    endpoint = f"{path}/releases/{original.id}/restore"
+    assert client.post(endpoint, json={"expected_config_version": 1}).status_code == 409
+    response = client.post(endpoint, json={"expected_config_version": 2})
+    assert response.status_code == 200
+    assert response.json()["data"]["clarification_enabled"]
+    assert response.json()["data"]["name"] == "新名称"
+    assert response.json()["data"]["config_version"] == 3
+    assert service.get_publication(app_id).deployment_version == 1
+    assert service.list_releases(app_id).total == 1
+
+
+def test_deploy_rejects_unavailable_committed_workspace(
+    management, publishing, monkeypatch
+):
+    client, path = management
+    service, app_id, _ = publishing
+    state = publish(service, app_id)
+    monkeypatch.setattr(
+        service.applications, "knowledge_base_lookup", lambda _: {"id": "kb"}
+    )
+    response = client.post(
+        f"{path}/deployments",
+        json={
+            "release_id": state.active_release.id,
+            "expected_deployment_version": 1,
+        },
+    )
+    assert response.status_code == 503
+    assert service.repository.publication(app_id)[0]["version"] == 1
+
+
+@pytest.mark.parametrize("dependency", ["credentials", "snapshot"])
+def test_deploy_rechecks_dependencies_in_transaction(
+    management, publishing, monkeypatch, dependency
+):
+    from app.api_server.database.models import (
+        KnowledgeBaseWorkspaceRevision,
+        ModelProfile,
+    )
+
+    client, path = management
+    service, app_id, repository = publishing
+    first = publish(service, app_id).active_release
+    service.update(
+        app_id,
+        ApplicationUpdateRequest(
+            expected_config_version=1, clarification_enabled=False
+        ),
+    )
+    second_response = client.post(
+        f"{path}/releases", json={"expected_config_version": 2}
+    )
+    assert second_response.status_code == 200
+    second = second_response.json()["data"]
+    original = service.repository.deploy
+
+    def lose_dependency(*args, **kwargs):
+        with repository.factory.session_scope(write=True) as session:
+            if dependency == "credentials":
+                session.get(ModelProfile, "llm").api_key = None
+            else:
+                session.delete(session.scalar(select(KnowledgeBaseWorkspaceRevision)))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service.repository, "deploy", lose_dependency)
+    response = client.post(
+        f"{path}/deployments",
+        json={"release_id": second["id"], "expected_deployment_version": 1},
+    )
+    assert response.status_code == 503
+    deployment, release = service.repository.publication(app_id)
+    assert deployment["version"] == 1 and release["id"] == first.id
+    assert client.get(f"{path}/deployments").json()["data"]["total"] == 1
 
 
 def test_channel_creation_is_persistent_disabled_and_separate_from_publication(

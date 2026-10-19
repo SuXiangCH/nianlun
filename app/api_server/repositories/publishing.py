@@ -23,6 +23,7 @@ from app.api_server.database.models.publishing import (
     ApplicationApiClient,
     ApplicationApiKey,
     ApplicationDeployment,
+    ApplicationDeploymentEvent,
     ApplicationRelease,
 )
 
@@ -232,6 +233,163 @@ class PublishingRepository:
                 )
             )
 
+    @staticmethod
+    def _insert_release(
+        session: Session,
+        app: Application,
+        config_json: str,
+        config_hash: str,
+        description: str = "",
+    ) -> ApplicationRelease:
+        sequence = (
+            int(
+                session.scalar(
+                    select(func.max(ApplicationRelease.sequence)).where(
+                        ApplicationRelease.application_id == app.id
+                    )
+                )
+                or 0
+            )
+            + 1
+        )
+        release = ApplicationRelease(
+            id=str(uuid.uuid4()),
+            application_id=app.id,
+            sequence=sequence,
+            draft_config_version=app.config_version,
+            config_schema_version=1,
+            config_json=config_json,
+            config_hash=config_hash,
+            description=description,
+            created_at=_now(),
+        )
+        session.add(release)
+        session.flush()
+        return release
+
+    @staticmethod
+    def _deployment_event(
+        session: Session,
+        deployment: ApplicationDeployment,
+        previous: ApplicationRelease | None,
+        release: ApplicationRelease | None,
+        action: str,
+    ) -> None:
+        session.add(
+            ApplicationDeploymentEvent(
+                id=str(uuid.uuid4()),
+                application_id=deployment.application_id,
+                channel_type="api",
+                action=action,
+                previous_release_id=previous.id if previous else None,
+                release_id=release.id if release else None,
+                previous_sequence=previous.sequence if previous else None,
+                sequence=release.sequence if release else None,
+                enabled=deployment.enabled,
+                deployment_version=deployment.version,
+                created_at=_now(),
+            )
+        )
+
+    def create_release(
+        self,
+        config: PublishedConfig,
+        config_json: str,
+        config_hash: str,
+        expected_config_version: int,
+        description: str,
+    ) -> dict[str, Any]:
+        with self.factory.session_scope(write=True) as session:
+            app = self._application(session, config.application_id)
+            if app.config_version != expected_config_version:
+                raise ApiError("应用配置已变化，请刷新后重试", 409)
+            self._verify_config(session, config, draft=True)
+            latest = session.scalar(
+                select(ApplicationRelease)
+                .where(ApplicationRelease.application_id == app.id)
+                .order_by(ApplicationRelease.sequence.desc())
+                .limit(1)
+            )
+            if (
+                latest is not None
+                and latest.config_hash == config_hash
+                and latest.description == description
+            ):
+                return _record(latest)
+            return _record(
+                self._insert_release(
+                    session, app, config_json, config_hash, description
+                )
+            )
+
+    def deploy(
+        self,
+        app_id: str,
+        config: PublishedConfig,
+        release_id: str,
+        expected_version: int,
+    ) -> None:
+        with self.factory.session_scope(write=True) as session:
+            self._application(session, app_id)
+            release = session.get(ApplicationRelease, release_id)
+            if release is None or release.application_id != app_id:
+                raise ApiError("发布版本不存在", 404)
+            deployment = session.get(ApplicationDeployment, app_id)
+            if deployment is None:
+                raise ApiError("请先创建 API 发布渠道", 409)
+            if deployment.version != expected_version:
+                raise ApiError("发布状态已变化，请刷新后重试", 409)
+            if PublishedConfig.model_validate_json(release.config_json) != config:
+                raise ApiError("发布配置已变化，请刷新后重试", 409)
+            self._verify_config(session, config, draft=False)
+            if deployment.active_release_id == release.id:
+                return
+            previous = (
+                session.get(ApplicationRelease, deployment.active_release_id)
+                if deployment.active_release_id
+                else None
+            )
+            if deployment.active_release_id is None:
+                deployment.enabled = True
+            deployment.active_release_id = release.id
+            deployment.version += 1
+            self._deployment_event(session, deployment, previous, release, "deploy")
+
+    def deployment_events(
+        self,
+        app_id: str,
+        limit: int,
+        offset: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        with self.factory.session_scope() as session:
+            self._application(session, app_id)
+            statement = select(ApplicationDeploymentEvent).where(
+                ApplicationDeploymentEvent.application_id == app_id
+            )
+            total = int(
+                session.scalar(select(func.count()).select_from(statement.subquery()))
+                or 0
+            )
+            items = session.scalars(
+                statement.order_by(ApplicationDeploymentEvent.deployment_version.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            return [_record(item) for item in items], total
+
+    def last_deployed_at(self, app_id: str) -> datetime | None:
+        with self.factory.session_scope() as session:
+            value = session.scalar(
+                select(ApplicationDeploymentEvent.created_at)
+                .where(
+                    ApplicationDeploymentEvent.application_id == app_id,
+                    ApplicationDeploymentEvent.action == "deploy",
+                )
+                .order_by(ApplicationDeploymentEvent.deployment_version.desc())
+                .limit(1)
+            )
+            return datetime.fromisoformat(value) if value else None
+
     def publish(
         self,
         config: PublishedConfig,
@@ -257,29 +415,7 @@ class PublishingRepository:
             )
             if previous is not None and previous.config_hash == config_hash:
                 return
-            sequence = (
-                int(
-                    session.scalar(
-                        select(func.max(ApplicationRelease.sequence)).where(
-                            ApplicationRelease.application_id == app.id
-                        )
-                    )
-                    or 0
-                )
-                + 1
-            )
-            release = ApplicationRelease(
-                id=str(uuid.uuid4()),
-                application_id=app.id,
-                sequence=sequence,
-                draft_config_version=app.config_version,
-                config_schema_version=1,
-                config_json=config_json,
-                config_hash=config_hash,
-                created_at=_now(),
-            )
-            session.add(release)
-            session.flush()
+            release = self._insert_release(session, app, config_json, config_hash)
             if deployment is None:
                 deployment = ApplicationDeployment(
                     application_id=app.id, enabled=True, version=0
@@ -289,6 +425,7 @@ class PublishingRepository:
                 deployment.enabled = True
             deployment.active_release_id = release.id
             deployment.version += 1
+            self._deployment_event(session, deployment, previous, release, "deploy")
 
     def set_enabled(
         self,
@@ -314,6 +451,18 @@ class PublishingRepository:
                     raise ApiError("发布版本已变化，请刷新后重试", 409)
             deployment.enabled = enabled
             deployment.version += 1
+            current = (
+                session.get(ApplicationRelease, deployment.active_release_id)
+                if deployment.active_release_id
+                else None
+            )
+            self._deployment_event(
+                session,
+                deployment,
+                current,
+                current,
+                "enable" if enabled else "disable",
+            )
 
     def update_application(
         self, app_id: str, values: dict[str, Any], expected_version: int

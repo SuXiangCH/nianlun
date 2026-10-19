@@ -12,7 +12,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -24,7 +24,7 @@ def _record_current_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO schema_migrations(version, name, applied_at)
-        VALUES (?, 'application_api_publishing', CURRENT_TIMESTAMP)
+        VALUES (?, 'knowledge_base_llm_selection', CURRENT_TIMESTAMP)
         """,
         (SCHEMA_VERSION,),
     )
@@ -49,6 +49,18 @@ def _migrate_heading_recovery_enabled(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE knowledge_bases "
             "ADD COLUMN heading_recovery_enabled INTEGER NOT NULL DEFAULT 1"
+        )
+
+
+def _migrate_knowledge_base_llm(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute('PRAGMA table_info("knowledge_bases")')
+    }
+    if "llm_model_id" not in columns:
+        connection.execute(
+            "ALTER TABLE knowledge_bases ADD COLUMN llm_model_id VARCHAR NULL "
+            "REFERENCES model_profiles(id) ON DELETE RESTRICT"
         )
 
 
@@ -509,6 +521,18 @@ def _rebuild_document_artifacts_for_v2_kinds(
     )
 
 
+def _migrate_release_descriptions(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute('PRAGMA table_info("application_releases")')
+    }
+    if "description" not in columns:
+        connection.execute(
+            "ALTER TABLE application_releases "
+            "ADD COLUMN description TEXT NOT NULL DEFAULT ''"
+        )
+
+
 def _require_current_schema(connection: sqlite3.Connection) -> None:
     expected_tables = set(Base.metadata.tables)
     existing_tables = {
@@ -570,6 +594,8 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
         _migrate_parse_chunk_plan(connection)
         _migrate_application_agent_version(connection)
         _migrate_application_api(connection)
+        _migrate_release_descriptions(connection)
+        _migrate_knowledge_base_llm(connection)
         _require_current_schema(connection)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:

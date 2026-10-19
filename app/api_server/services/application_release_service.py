@@ -22,6 +22,11 @@ from app.api_server.apis.v1.publishing_schemas import (
     ApiKeyCreateRequest,
     ApiKeyResponse,
     ApplicationPublishRequest,
+    ApplicationReleaseCreateRequest,
+    ApplicationDeployRequest,
+    ApplicationRestoreRequest,
+    ApplicationDeploymentEventResponse,
+    ApplicationDeploymentListResponse,
     ApplicationReleaseListResponse,
     ApplicationReleaseResponse,
     ApplicationUpdateRequest,
@@ -202,6 +207,7 @@ class ApplicationReleaseService:
             enabled=bool(deployment and deployment["enabled"]),
             active_release=release,
             deployment_version=int(deployment["version"]) if deployment else 0,
+            last_deployed_at=self.repository.last_deployed_at(application_id),
             config_version=int(app.get("config_version", 1)),
             has_unpublished_changes=changed,
             draft_ready=draft_error is None,
@@ -253,6 +259,75 @@ class ApplicationReleaseService:
                 config,
             )
             return self.get_publication(application_id)
+
+    def create_release(
+        self, application_id: str, request: ApplicationReleaseCreateRequest
+    ) -> ApplicationReleaseResponse:
+        with self.entry_lock(application_id):
+            config = self._draft_config(application_id)
+            canonical, fingerprint = config_fingerprint(config)
+            return self._release(
+                self.repository.create_release(
+                    config,
+                    canonical,
+                    fingerprint,
+                    request.expected_config_version,
+                    request.description.strip(),
+                )
+            )
+
+    def deploy(
+        self, application_id: str, request: ApplicationDeployRequest
+    ) -> PublicationResponse:
+        with self.entry_lock(application_id):
+            release = self.require_release(application_id, request.release_id)
+            self.validate_release(release.config)
+            knowledge = self.applications.knowledge_base_lookup(
+                release.config.knowledge_base_id
+            )
+            if not knowledge.get("snapshot_relpath") or not knowledge.get(
+                "snapshot_manifest_sha256"
+            ):
+                raise ApiError("知识库 committed snapshot 尚未就绪", 503)
+            self.repository.deploy(
+                application_id,
+                release.config,
+                release.id,
+                request.expected_deployment_version,
+            )
+            return self.get_publication(application_id)
+
+    def restore_release(
+        self, application_id: str, release_id: str, request: ApplicationRestoreRequest
+    ) -> ApplicationResponse:
+        with self.entry_lock(application_id):
+            config = self.require_release(application_id, release_id).config
+            return self.update(
+                application_id,
+                ApplicationUpdateRequest(
+                    expected_config_version=request.expected_config_version,
+                    knowledge_base_id=config.knowledge_base_id,
+                    llm_model_id=config.llm_model_id,
+                    agent_version=config.agent_version,
+                    clarification_enabled=config.clarification_enabled,
+                ),
+            )
+
+    def list_deployments(
+        self, application_id: str, limit: int = 20, offset: int = 0
+    ) -> ApplicationDeploymentListResponse:
+        if not 1 <= limit <= 100 or offset < 0:
+            raise ApiError("分页参数无效", 422)
+        records, total = self.repository.deployment_events(
+            application_id, limit, offset
+        )
+        return ApplicationDeploymentListResponse(
+            items=[
+                ApplicationDeploymentEventResponse.model_validate(item)
+                for item in records
+            ],
+            total=total,
+        )
 
     def list_releases(
         self, application_id: str, limit: int = 20, offset: int = 0

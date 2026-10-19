@@ -16,6 +16,7 @@ const knowledgeBase = (overrides: Partial<KnowledgeBase>): KnowledgeBase => ({
   document_count: 1,
   summary_enabled: true,
   heading_recovery_enabled: true,
+  llm_model_id: null,
   workspace_dir: "/tmp/kb-1",
   workspace_relpath: "kb-1",
   content_version: 2,
@@ -99,6 +100,7 @@ describe("KnowledgeBaseView", () => {
       documents: [],
       documentsLoading: false,
       documentsError: null,
+      llmModels: [],
       embeddingModels: [embeddingModel],
       onCreate: vi.fn(),
       onOpen: vi.fn(),
@@ -109,6 +111,7 @@ describe("KnowledgeBaseView", () => {
       onRebuildVector: vi.fn(),
       onUpdateSummary: vi.fn(),
       onUpdateHeadingRecovery: vi.fn(),
+      onUpdateLlmModel: vi.fn().mockResolvedValue(undefined),
       onUpdateName: vi.fn(),
       onUpdateEmbeddingModel: vi.fn(),
       onUpdateVectorEnabled: vi.fn(),
@@ -124,6 +127,59 @@ describe("KnowledgeBaseView", () => {
   };
 
   const openSettings = () => act(() => container.querySelector<HTMLButtonElement>("[aria-label='知识库设置']")!.click());
+
+  it("selects a document LLM independently and can return to the system default", async () => {
+    const llm = { ...embeddingModel, id: "llm-1", kind: "llm" as const, name: "文档模型", model: "document-chat" };
+    const props = renderView({ selectedId: "kb-1", llmModels: [llm] });
+    openSettings();
+    const select = container.querySelector<HTMLSelectElement>("[aria-label='LLM 模型']");
+    expect(select).not.toBeNull();
+    expect(select!.value).toBe("");
+    expect(select!.options[0].textContent).toContain("跟随系统默认");
+    expect(select!.options[0].textContent).toContain("document-chat");
+    await act(async () => {
+      select!.value = "llm-1";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(props.onUpdateLlmModel).toHaveBeenCalledWith("kb-1", "llm-1");
+    act(() => root.render(<KnowledgeBaseView {...props} items={[knowledgeBase({ llm_model_id: "llm-1" })]} />));
+    expect(select!.value).toBe("llm-1");
+    await act(async () => {
+      select!.value = "";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(props.onUpdateLlmModel).toHaveBeenLastCalledWith("kb-1", null);
+  });
+
+  it("disables the LLM selector while saving and keeps the saved selection after failure", async () => {
+    let rejectSave!: (reason: Error) => void;
+    const save = new Promise<void>((_resolve, reject) => { rejectSave = reject; });
+    renderView({
+      selectedId: "kb-1",
+      llmModels: [{ ...embeddingModel, id: "llm-1", kind: "llm", model: "document-chat" }],
+      onUpdateLlmModel: vi.fn(() => save),
+    });
+    openSettings();
+    const select = container.querySelector<HTMLSelectElement>("[aria-label='LLM 模型']");
+    expect(select).not.toBeNull();
+    await act(async () => {
+      select!.value = "llm-1";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(select!.disabled).toBe(true);
+    await act(async () => rejectSave(new Error("模型切换失败")));
+    expect(select!.disabled).toBe(false);
+    expect(select!.value).toBe("");
+    expect(container.querySelector("[role='alert']")?.textContent).toContain("模型切换失败");
+  });
+
+  it("shows a missing default without preventing selection of another LLM", () => {
+    renderView({ selectedId: "kb-1", llmModels: [] });
+    openSettings();
+    const select = container.querySelector<HTMLSelectElement>("[aria-label='LLM 模型']");
+    expect(select).not.toBeNull();
+    expect(select!.options[0].textContent).toContain("未配置");
+  });
 
   it("uses a compact searchable list without repeated headings or placeholder descriptions", () => {
     renderView({ items: [knowledgeBase({}), knowledgeBase({ id: "kb-2", name: "财务资料" })] });
@@ -236,6 +292,7 @@ describe("KnowledgeBaseView", () => {
         documents={[]}
         documentsLoading={false}
         documentsError={null}
+        llmModels={[]}
         embeddingModels={[embeddingModel]}
         onCreate={vi.fn()}
         onOpen={vi.fn()}
@@ -246,6 +303,7 @@ describe("KnowledgeBaseView", () => {
         onRebuildVector={vi.fn()}
         onUpdateSummary={vi.fn()}
         onUpdateHeadingRecovery={vi.fn()}
+        onUpdateLlmModel={vi.fn()}
         onUpdateName={vi.fn()}
         onUpdateEmbeddingModel={vi.fn()}
         onUpdateVectorEnabled={vi.fn()}
@@ -271,6 +329,7 @@ describe("KnowledgeBaseView", () => {
         documents={[]}
         documentsLoading={false}
         documentsError={null}
+        llmModels={[]}
         embeddingModels={[embeddingModel]}
         onCreate={vi.fn()}
         onOpen={vi.fn()}
@@ -281,6 +340,7 @@ describe("KnowledgeBaseView", () => {
         onRebuildVector={vi.fn()}
         onUpdateSummary={vi.fn()}
         onUpdateHeadingRecovery={vi.fn()}
+        onUpdateLlmModel={vi.fn()}
         onUpdateName={vi.fn()}
         onUpdateEmbeddingModel={vi.fn()}
         onUpdateVectorEnabled={onUpdateVectorEnabled}

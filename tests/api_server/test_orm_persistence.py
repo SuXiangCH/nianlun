@@ -58,6 +58,7 @@ def test_orm_models_cover_all_business_tables():
     assert set(Base.metadata.tables) == {
         "application_releases",
         "application_deployments",
+        "application_deployment_events",
         "application_api_clients",
         "application_api_keys",
         "application_runs",
@@ -99,8 +100,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 9
-    assert versions == {9}
+    assert migrations.SCHEMA_VERSION == 11
+    assert versions == {11}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -124,6 +125,57 @@ def test_schema_initialization_records_current_version(tmp_path):
     finally:
         connection.close()
     assert "agent_version" in application_columns
+
+
+def test_release_management_upgrade_retains_existing_channel_and_is_repeatable(
+    tmp_path,
+):
+    from app.api_server.database.models.publishing import (
+        ApplicationDeployment,
+        ApplicationRelease,
+    )
+
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    with factory.session_scope(write=True) as session:
+        session.add(
+            ApplicationRelease(
+                id="release-existing",
+                application_id="app-1",
+                sequence=1,
+                draft_config_version=1,
+                config_schema_version=1,
+                config_json="{}",
+                config_hash="hash",
+                created_at="2026-01-01T00:00:00Z",
+            )
+        )
+        session.flush()
+        session.add(
+            ApplicationDeployment(
+                application_id="app-1",
+                enabled=True,
+                active_release_id="release-existing",
+                version=4,
+            )
+        )
+    connection = factory.connect()
+    try:
+        connection.execute("ALTER TABLE application_releases DROP COLUMN description")
+        connection.execute("DROP TABLE application_deployment_events")
+        connection.execute("UPDATE schema_migrations SET version = 9")
+        connection.commit()
+    finally:
+        connection.close()
+    initialize_database(factory)
+    initialize_database(factory)
+    with factory.session_scope() as session:
+        release = session.get(ApplicationRelease, "release-existing")
+        deployment = session.get(ApplicationDeployment, "app-1")
+        assert release.description == "" and release.config_hash == "hash"
+        assert deployment.enabled and deployment.active_release_id == release.id
+        assert deployment.version == 4
+    factory.dispose()
 
 
 def test_schema_migration_defaults_legacy_applications_to_v0(tmp_path):
@@ -218,7 +270,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {9}
+    assert versions == {11}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -280,7 +332,7 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {9}
+    assert versions == {11}
 
 
 def test_schema_migration_replaces_document_hash_constraint_with_partial_index(

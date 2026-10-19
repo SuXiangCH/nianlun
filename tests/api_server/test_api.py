@@ -136,7 +136,7 @@ def test_knowledge_base_upload_and_app_creation(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: FakeSummaryLLM(),
+        lambda _self, _profile_id=None: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
 
@@ -1210,7 +1210,7 @@ def test_document_tree_outline_serves_without_node_text(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self: FakeSummaryLLM(),
+        lambda _self, _profile_id=None: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
     knowledge_base = client.post(

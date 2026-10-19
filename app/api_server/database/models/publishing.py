@@ -23,6 +23,7 @@ class ApplicationRelease(Base):
     config_schema_version: Mapped[int] = mapped_column(Integer)
     config_json: Mapped[str] = mapped_column(Text)
     config_hash: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(Text, default="", server_default="")
     created_at: Mapped[str] = mapped_column(String(64))
 
 
@@ -37,6 +38,25 @@ class ApplicationDeployment(Base):
         ForeignKey("application_releases.id", ondelete="SET NULL"), nullable=True
     )
     version: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class ApplicationDeploymentEvent(Base):
+    __tablename__ = "application_deployment_events"
+    __table_args__ = (UniqueConstraint("application_id", "deployment_version"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    application_id: Mapped[str] = mapped_column(
+        ForeignKey("applications.id", ondelete="CASCADE"), index=True
+    )
+    channel_type: Mapped[str] = mapped_column(String(16), default="api")
+    action: Mapped[str] = mapped_column(String(16))
+    previous_release_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    release_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    previous_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean)
+    deployment_version: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[str] = mapped_column(String(64))
 
 
 class ApplicationApiClient(Base):

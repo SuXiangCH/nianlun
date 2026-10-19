@@ -565,6 +565,56 @@ def test_conversation_pins_release_but_reads_latest_knowledge(runtime, monkeypat
     assert fresh.release_id == publication.active_release.id != first.release_id
 
 
+def test_rollback_keeps_existing_conversation_on_its_original_release(runtime):
+    import asyncio
+    from app.api_server.apis.v1.publishing_schemas import (
+        ApplicationDeployRequest,
+        ApplicationUpdateRequest,
+    )
+    from app.api_server.apis.v1.runtime_schemas import PublicChatRequest
+
+    publication = runtime.publication
+    first = publication.require_release(runtime.app_id)
+    publication.update(
+        runtime.app_id,
+        ApplicationUpdateRequest(
+            expected_config_version=1,
+            clarification_enabled=False,
+        ),
+    )
+    second = publish(
+        publication, runtime.app_id, config_version=2, deployment_version=1
+    ).active_release
+
+    def turn(key, conversation_id=None):
+        return asyncio.run(
+            runtime.service.wait(
+                runtime.service.prepare(
+                    runtime.principal,
+                    PublicChatRequest(
+                        message=key, user_id="u", conversation_id=conversation_id
+                    ),
+                    key,
+                )
+            )
+        )
+
+    conversation = turn("before-rollback")
+    assert conversation.release_id == second.id
+    publication.deploy(
+        runtime.app_id,
+        ApplicationDeployRequest(
+            release_id=first.id,
+            expected_deployment_version=2,
+        ),
+    )
+    assert (
+        turn("continue-after-rollback", conversation.conversation_id).release_id
+        == second.id
+    )
+    assert turn("new-after-rollback").release_id == first.id
+
+
 def test_failure_is_atomic_sanitized_and_replayed_without_model(runtime, monkeypatch):
     import asyncio
     from app.api_server.apis.v1.runtime_schemas import PublicChatRequest

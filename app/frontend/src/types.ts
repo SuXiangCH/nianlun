@@ -36,6 +36,7 @@ export interface ApplicationRelease {
   draft_config_version: number;
   config_schema_version: number;
   config_hash: string;
+  description: string;
   config: PublishedApplicationConfig;
   created_at: string;
 }
@@ -82,12 +83,27 @@ export interface ApplicationPublication {
   enabled: boolean;
   active_release: ApplicationRelease | null;
   deployment_version: number;
+  last_deployed_at?: string | null;
   config_version: number;
   has_unpublished_changes: boolean;
   dependencies_ready: boolean;
   dependency_error: string | null;
   draft_ready: boolean;
   draft_error: string | null;
+}
+
+export interface ApplicationDeploymentEvent {
+  id: string;
+  application_id: string;
+  channel_type: "api";
+  action: "deploy" | "enable" | "disable";
+  previous_release_id: string | null;
+  release_id: string | null;
+  previous_sequence: number | null;
+  sequence: number | null;
+  enabled: boolean;
+  deployment_version: number;
+  created_at: string;
 }
 
 export interface ApplicationApiClient {
@@ -151,6 +167,7 @@ export interface KnowledgeBase {
   document_count: number;
   summary_enabled: boolean;
   heading_recovery_enabled: boolean;
+  llm_model_id: string | null;
   workspace_dir: string;
   workspace_relpath: string | null;
   content_version: number;

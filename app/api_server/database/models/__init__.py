@@ -6,6 +6,7 @@ from .application_runs import ApplicationRun
 from .publishing import (
     ApplicationRelease,
     ApplicationDeployment,
+    ApplicationDeploymentEvent,
     ApplicationApiClient,
     ApplicationApiKey,
 )
@@ -35,6 +36,7 @@ __all__ = [
     "ApplicationRun",
     "ApplicationRelease",
     "ApplicationDeployment",
+    "ApplicationDeploymentEvent",
     "ApplicationApiClient",
     "ApplicationApiKey",
     "Base",
