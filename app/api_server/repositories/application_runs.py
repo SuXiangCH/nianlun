@@ -8,6 +8,7 @@ from typing import Any
 import uuid
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.api_server.common.errors import ApiError
 from app.api_server.database.connection import SQLiteConnectionFactory
@@ -18,6 +19,7 @@ from app.api_server.database.models.publishing import (
     ApplicationApiKey,
     ApplicationDeployment,
     ApplicationRelease,
+    ApplicationWecomChannel,
 )
 from app.api_server.repositories.sqlite_chat import SQLiteChatRepository
 
@@ -50,13 +52,19 @@ class ApplicationRunRepository:
             return run_dict(row) if row else None
 
     def conversation(
-        self, app_id: str, client_id: str, user_id: str, conversation_id: str
+        self,
+        app_id: str,
+        client_id: str,
+        user_id: str,
+        conversation_id: str,
+        *,
+        channel: str = "api",
     ) -> dict[str, Any]:
         with self.factory.session_scope() as session:
             item = session.get(Conversation, conversation_id)
             if (
                 item is None
-                or item.channel != "api"
+                or item.channel != channel
                 or item.application_id != app_id
                 or item.api_client_id != client_id
                 or item.external_user_id != user_id
@@ -76,10 +84,52 @@ class ApplicationRunRepository:
                 raise ApiError("会话正忙", 409)
             return {"id": item.id, "release_id": item.release_id}
 
+    def latest_channel_conversation(
+        self, app_id: str, user_key: str
+    ) -> dict[str, Any] | None:
+        with self.factory.session_scope() as session:
+            item = session.scalar(
+                select(Conversation)
+                .where(
+                    Conversation.application_id == app_id,
+                    Conversation.channel == "wecom",
+                    Conversation.external_user_id == user_key,
+                    Conversation.status == "active",
+                )
+                .order_by(Conversation.updated_at.desc())
+                .limit(1)
+            )
+            if item is None:
+                return None
+            return {
+                "id": item.id,
+                "release_id": item.release_id,
+                "context_state": item.context_state,
+                "expires_at": item.expires_at,
+            }
+
+    def has_active_run(self, conversation_id: str) -> bool:
+        with self.factory.session_scope() as session:
+            return (
+                session.scalar(
+                    select(ApplicationRun.id).where(
+                        ApplicationRun.conversation_id == conversation_id,
+                        ApplicationRun.status.in_(["running", "cancelling"]),
+                    )
+                )
+                is not None
+            )
+
+    def archive_conversation(self, conversation_id: str) -> None:
+        with self.factory.session_scope(write=True) as session:
+            item = session.get(Conversation, conversation_id)
+            if item is not None and item.status == "active":
+                item.status = "archived"
+
     def interrupt_context(self, conversation_id: str) -> None:
         with self.factory.session_scope(write=True) as session:
             item = session.get(Conversation, conversation_id)
-            if item and item.channel == "api":
+            if item and item.status != "deleted":
                 item.context_state = "interrupted"
 
     def admit(
@@ -211,6 +261,133 @@ class ApplicationRunRepository:
             session.flush()
             return run_dict(row)
 
+    def admit_channel(
+        self,
+        *,
+        app_id: str,
+        channel_id: str,
+        revision: int,
+        user_key: str,
+        release_id: str,
+        conversation_id: str | None,
+        message: str,
+        key: str,
+        fingerprint: str,
+        content_version: int,
+        request_id: str | None,
+        retention_days: int,
+    ) -> dict[str, Any]:
+        now = utcnow()
+        client_id = f"wecom:{channel_id}"
+        try:
+            with self.factory.session_scope(write=True) as session:
+                channel = session.get(ApplicationWecomChannel, channel_id)
+                if channel is None or channel.application_id != app_id:
+                    raise ApiError("渠道不存在", 404)
+                if not channel.enabled:
+                    raise ApiError("企业微信渠道已停用", 403)
+                if channel.expires_at and (
+                    datetime.fromisoformat(channel.expires_at) <= now
+                ):
+                    raise ApiError("企业微信渠道已过期", 403)
+                if channel.config_revision != revision:
+                    raise ApiError("渠道配置已变化，请重试", 409)
+                release = session.get(ApplicationRelease, release_id)
+                if release is None or release.application_id != app_id:
+                    raise ApiError("发布版本不存在", 404)
+                if session.scalar(
+                    select(ApplicationRun.id).where(
+                        ApplicationRun.application_id == app_id,
+                        ApplicationRun.client_id == client_id,
+                        ApplicationRun.user_id == user_key,
+                        ApplicationRun.idempotency_key == key,
+                    )
+                ):
+                    raise ApiError(
+                        "调用已被受理，请查询结果",
+                        409,
+                        headers={"Retry-After": "1"},
+                    )
+                if conversation_id is None:
+                    if channel.active_release_id != release_id:
+                        raise ApiError("发布入口已变化，请重试", 409)
+                    conversation_id = str(uuid.uuid4())
+                    session.add(
+                        Conversation(
+                            id=conversation_id,
+                            application_id=app_id,
+                            title=message[:40],
+                            channel="wecom",
+                            api_client_id=None,
+                            external_user_id=user_key,
+                            release_id=release_id,
+                            context_state="ready",
+                            status="active",
+                            created_at=now.isoformat(),
+                            updated_at=now.isoformat(),
+                            expires_at=(
+                                now + timedelta(days=retention_days)
+                            ).isoformat(),
+                        )
+                    )
+                    session.flush()
+                else:
+                    item = session.get(Conversation, conversation_id)
+                    if (
+                        item is None
+                        or item.channel != "wecom"
+                        or item.application_id != app_id
+                        or item.external_user_id != user_key
+                        or item.release_id != release_id
+                        or item.status != "active"
+                    ):
+                        raise ApiError("会话不可继续，请稍后重试", 409)
+                    if item.context_state != "ready" or (
+                        item.expires_at
+                        and datetime.fromisoformat(item.expires_at) <= now
+                    ):
+                        raise ApiError("会话上下文不可继续", 409)
+                    if session.scalar(
+                        select(ApplicationRun.id).where(
+                            ApplicationRun.conversation_id == conversation_id,
+                            ApplicationRun.status.in_(["running", "cancelling"]),
+                        )
+                    ):
+                        raise ApiError("会话正忙", 409)
+                    item.expires_at = (now + timedelta(days=retention_days)).isoformat()
+                message_id = str(uuid.uuid4())
+                self.chat.begin_turn(
+                    application_id=app_id,
+                    conversation_id=conversation_id,
+                    user_message_id=str(uuid.uuid4()),
+                    assistant_message_id=message_id,
+                    user_content=message,
+                    now=now,
+                    session=session,
+                    channel="wecom",
+                )
+                row = ApplicationRun(
+                    id=str(uuid.uuid4()),
+                    application_id=app_id,
+                    client_id=client_id,
+                    user_id=user_key,
+                    conversation_id=conversation_id,
+                    release_id=release_id,
+                    message_id=message_id,
+                    idempotency_key=key,
+                    request_fingerprint=fingerprint,
+                    status="running",
+                    knowledge_base_content_version=content_version,
+                    request_id=request_id,
+                    created_at=now.isoformat(),
+                    updated_at=now.isoformat(),
+                )
+                session.add(row)
+                session.flush()
+                return run_dict(row)
+        except IntegrityError as exc:
+            raise ApiError("会话正忙，请稍后重试", 409) from exc
+
     def complete(
         self,
         run_id: str,
@@ -291,7 +468,9 @@ class ApplicationRunRepository:
         if checkpoint_missing:
             with self.factory.session_scope(write=True) as session:
                 for item in session.scalars(
-                    select(Conversation).where(Conversation.channel == "api")
+                    select(Conversation).where(
+                        Conversation.channel.in_(("api", "wecom"))
+                    )
                 ):
                     item.context_state = "interrupted"
 
@@ -337,7 +516,7 @@ class ApplicationRunRepository:
         with self.factory.session_scope() as session:
             return int(session.scalar(query) or 0)
 
-    def checkpoint_cleanup_candidates(self) -> list[str]:
+    def checkpoint_cleanup_candidates(self) -> list[tuple[str, str]]:
         with self.factory.session_scope(write=True) as session:
             active = select(ApplicationRun.conversation_id).where(
                 ApplicationRun.status.in_(["running", "cancelling"])
@@ -345,7 +524,7 @@ class ApplicationRunRepository:
             rows = session.scalars(
                 select(Conversation)
                 .where(
-                    Conversation.channel == "api",
+                    Conversation.channel.in_(("api", "wecom")),
                     Conversation.expires_at <= utcnow().isoformat(),
                     Conversation.context_state != "expired",
                     ~Conversation.id.in_(active),
@@ -354,7 +533,7 @@ class ApplicationRunRepository:
             ).all()
             for row in rows:
                 row.context_state = "cleanup_pending"
-            return [row.id for row in rows]
+            return [(row.id, row.channel) for row in rows]
 
     def checkpoint_cleaned(self, conversation_id: str) -> None:
         with self.factory.session_scope(write=True) as session:
@@ -362,14 +541,15 @@ class ApplicationRunRepository:
             if item and item.context_state == "cleanup_pending":
                 item.context_state = "expired"
 
-    def conversation_ids_for_application(self, application_id: str) -> list[str]:
-        """API conversation ids bound to an application, for checkpoint cleanup."""
+    def conversation_ids_for_application(
+        self, application_id: str
+    ) -> list[tuple[str, str]]:
+        """Conversation ids and channels bound to an application."""
         with self.factory.session_scope() as session:
-            return list(
-                session.scalars(
-                    select(Conversation.id).where(
-                        Conversation.application_id == application_id,
-                        Conversation.channel == "api",
-                    )
+            rows = session.execute(
+                select(Conversation.id, Conversation.channel).where(
+                    Conversation.application_id == application_id,
+                    Conversation.channel.in_(("api", "wecom")),
                 )
             )
+            return [(str(row[0]), str(row[1])) for row in rows]

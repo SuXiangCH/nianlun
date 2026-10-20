@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from nianlun.config import PROJECT_ROOT
 
@@ -73,6 +74,13 @@ class ApiServerSettings:
     application_api_requests_per_minute: int = 60
     application_api_timeout_seconds: float = 300.0
     application_api_retention_days: int = 30
+    internal_token: str | None = None
+    gateway_control_urls: tuple[str, ...] = ()
+    gateway_control_token: str | None = None
+    gateway_control_timeout_seconds: float = 2.0
+    wecom_max_concurrent: int = 32
+    wecom_run_timeout_seconds: float = 120.0
+    wecom_conversation_retention_days: int = 30
 
     def __post_init__(self) -> None:
         api_limits = (
@@ -131,6 +139,35 @@ class ApiServerSettings:
             raise ValueError("向量索引构建 worker 数必须至少为 1")
         if self.embedding_dim is not None and self.embedding_dim <= 0:
             raise ValueError("embedding 维度必须是正整数")
+        if self.internal_token is not None and (
+            len(self.internal_token) < 32
+            or self.internal_token != self.internal_token.strip()
+        ):
+            raise ValueError(
+                "NIANLUN_INTERNAL_TOKEN 长度必须至少为 32 且不能包含首尾空白"
+            )
+        if self.gateway_control_urls:
+            if (
+                self.gateway_control_token is None
+                or len(self.gateway_control_token) < 32
+            ):
+                raise ValueError("配置网关控制地址时必须设置至少 32 字符的控制令牌")
+            if self.gateway_control_token != self.gateway_control_token.strip():
+                raise ValueError("NIANLUN_GATEWAY_CONTROL_TOKEN 不能包含首尾空白")
+            for url in self.gateway_control_urls:
+                parsed = urlsplit(url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError("网关控制地址必须是 http 或 https URL")
+                if parsed.username is not None or parsed.password is not None:
+                    raise ValueError("网关控制地址不能包含用户名或密码")
+        if self.gateway_control_timeout_seconds <= 0:
+            raise ValueError("网关控制超时时间必须大于 0")
+        if (
+            self.wecom_max_concurrent <= 0
+            or self.wecom_run_timeout_seconds <= 0
+            or self.wecom_conversation_retention_days <= 0
+        ):
+            raise ValueError("企业微信并发、超时和保留期必须大于 0")
 
     def resolve_provider(self, provider: str) -> ProviderConfig:
         if provider == "default":
@@ -187,6 +224,24 @@ class ApiServerSettings:
             ),
             application_api_retention_days=int(
                 os.environ.get("NIANLUN_API_APPLICATION_RETENTION_DAYS", "30")
+            ),
+            internal_token=os.environ.get("NIANLUN_INTERNAL_TOKEN") or None,
+            gateway_control_urls=_csv(
+                os.environ.get("NIANLUN_GATEWAY_CONTROL_URLS", "")
+            ),
+            gateway_control_token=os.environ.get("NIANLUN_GATEWAY_CONTROL_TOKEN")
+            or None,
+            gateway_control_timeout_seconds=float(
+                os.environ.get("NIANLUN_GATEWAY_CONTROL_TIMEOUT_SECONDS", "2")
+            ),
+            wecom_max_concurrent=int(
+                os.environ.get("NIANLUN_WECOM_MAX_CONCURRENT", "32")
+            ),
+            wecom_run_timeout_seconds=float(
+                os.environ.get("NIANLUN_WECOM_RUN_TIMEOUT_SECONDS", "120")
+            ),
+            wecom_conversation_retention_days=int(
+                os.environ.get("NIANLUN_WECOM_CONVERSATION_RETENTION_DAYS", "30")
             ),
             host=os.environ.get("NIANLUN_API_HOST", cls.host),
             port=int(os.environ.get("NIANLUN_API_PORT", str(cls.port))),

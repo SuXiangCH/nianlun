@@ -381,13 +381,15 @@ class SQLiteChatRepository:
             )
         )
 
-    def list_conversations(self, application_id: str) -> list[dict[str, Any]]:
+    def list_conversations(
+        self, application_id: str, channel: str = "console"
+    ) -> list[dict[str, Any]]:
         with self.factory.session_scope() as session:
             conversations = session.scalars(
                 select(Conversation)
                 .where(
                     Conversation.application_id == application_id,
-                    Conversation.channel == "console",
+                    Conversation.channel == channel,
                     Conversation.status != "deleted",
                 )
                 .order_by(Conversation.updated_at.desc())
@@ -409,6 +411,8 @@ class SQLiteChatRepository:
                         "updated_at": conversation.updated_at,
                         "last_message_at": conversation.last_message_at,
                         "message_count": int(message_count or 0),
+                        "channel": conversation.channel,
+                        "external_user_id": conversation.external_user_id,
                     }
                 )
             return result
@@ -421,7 +425,6 @@ class SQLiteChatRepository:
                 select(Conversation).where(
                     Conversation.id == conversation_id,
                     Conversation.application_id == application_id,
-                    Conversation.channel == "console",
                     Conversation.status != "deleted",
                 )
             )
@@ -469,7 +472,6 @@ class SQLiteChatRepository:
                     Message.id == message_id,
                     Conversation.id == conversation_id,
                     Conversation.application_id == application_id,
-                    Conversation.channel == "console",
                 )
             )
             return _source_dict(source) if source is not None else None

@@ -629,6 +629,11 @@ def test_chat_history_endpoints_return_persisted_messages_and_sources(tmp_path):
     conversations = client.get("/api/v1/apps/app-1/conversations")
     assert conversations.status_code == 200
     assert conversations.json()["data"][0]["id"] == "conversation-1"
+    assert conversations.json()["data"][0]["channel"] == "console"
+    assert conversations.json()["data"][0]["external_user_id"] is None
+    assert (
+        client.get("/api/v1/apps/app-1/conversations?channel=api").json()["data"] == []
+    )
 
     messages = client.get("/api/v1/apps/app-1/conversations/conversation-1/messages")
     assert messages.status_code == 200

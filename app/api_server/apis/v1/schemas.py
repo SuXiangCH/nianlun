@@ -101,6 +101,8 @@ class ConversationResponse(ApiSchema):
     updated_at: datetime
     last_message_at: datetime | None = None
     message_count: int = 0
+    channel: Literal["console", "api", "wecom"] = "console"
+    external_user_id: str | None = None
 
 
 class MessageSourceResponse(ApiSchema):

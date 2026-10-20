@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ArrowLeft, ArrowUpRight, BookOpen, Bot, Braces, Building2, Check, ChevronLeft, ChevronRight, Copy, Globe, MessageCircle, Plus, RefreshCw, Upload } from "lucide-react";
+import { ArrowLeft, ArrowUpRight, BookOpen, Bot, Braces, Building2, Check, ChevronLeft, ChevronRight, Copy, Globe, History, MessageCircle, Plus, RefreshCw, Upload } from "lucide-react";
 import { api, API_BASE, publicApiBase } from "../../api/client";
 import { Modal } from "../../components/Modal";
-import type { Application, ApplicationApiClient, ApplicationApiKey, ApplicationDeploymentEvent, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, KnowledgeBase, ModelProfile } from "../../types";
-import { ApplicationVersions, VersionDetail } from "./ApplicationVersions";
+import type { Application, ApplicationApiClient, ApplicationApiKey, ApplicationDeploymentEvent, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, KnowledgeBase, ModelProfile, WecomChannelState } from "../../types";
+import { ApplicationVersions, VersionDetail, type ReleaseChannel } from "./ApplicationVersions";
 import { ApplicationPublishPanel } from "./ApplicationPublishPanel";
+import { ApplicationConversations } from "./ApplicationConversations";
+import { isWecomExpired, useWecomNow, WecomChannelDialog, WecomChannelFields, WecomStatusBadge, wecomCreateBody } from "./ApplicationWecomChannel";
 
 interface Props {
   app: Application;
@@ -15,7 +17,8 @@ interface Props {
   onUse: (id: string) => void;
   onUpdated?: (app: Application) => void;
 }
-type Tab = "publication" | "draft" | "clients" | "history" | "runs" | "deployments";
+type Tab = "publication" | "draft" | "clients" | "history" | "runs" | "deployments" | "conversations";
+type PublishChannel = "api" | "wecom";
 const timestamp = (value: string): string => new Date(value).toLocaleString();
 const errorMessage = (error: unknown): string => error instanceof Error ? error.message : "请求失败，请重试";
 const statusLabel = (publication: ApplicationPublication): string => !publication.active_release ? "未发布" : publication.enabled ? "已发布" : "已停用";
@@ -27,26 +30,33 @@ function Pagination({ offset, total, onChange, disabled }: { offset: number; tot
   return <div className="application-pagination"><span>共 {total} 条 · 第 {Math.floor(offset / 20) + 1} 页</span><button className="icon-button" title="上一页" aria-label="上一页" disabled={disabled || offset === 0} onClick={() => onChange(offset - 20)}><ChevronLeft size={16} /></button><button className="icon-button" title="下一页" aria-label="下一页" disabled={disabled || offset + 20 >= total} onClick={() => onChange(offset + 20)}><ChevronRight size={16} /></button></div>;
 }
 
-function ChannelDialog({ appId, apiCreated, onClose, onCreated }: { appId: string; apiCreated: boolean; onClose: () => void; onCreated: (publication: ApplicationPublication) => void }) {
-  const [selected, setSelected] = useState<"api" | "">("");
+function ChannelDialog({ appId, apiCreated, wecomCreated, onClose, onCreated }: { appId: string; apiCreated: boolean; wecomCreated: boolean; onClose: () => void; onCreated: (publication: ApplicationPublication, channel: PublishChannel) => void }) {
+  const [selected, setSelected] = useState<PublishChannel | "">("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const alreadyCreated = selected === "api" ? apiCreated : selected === "wecom" ? wecomCreated : false;
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!selected || busy || apiCreated) return;
+    if (!selected || busy || alreadyCreated) return;
     setBusy(true); setError(null);
-    try { onCreated(await api.createPublicationChannel(appId, selected)); }
-    catch (failure) { setError(errorMessage(failure)); setBusy(false); }
+    try {
+      const state = selected === "wecom"
+        ? await api.createWecomChannel(appId, wecomCreateBody(new FormData(event.currentTarget)))
+        : await api.createPublicationChannel(appId, selected);
+      onCreated(state, selected);
+    } catch (failure) { setError(errorMessage(failure)); setBusy(false); }
   };
   return <Modal title="创建发布渠道" description="" onClose={() => { if (!busy) onClose(); }}>
     <form onSubmit={(event) => void submit(event)}>
       <fieldset className="application-channel-options" disabled={busy}>
         <legend>渠道类型</legend>
         <label className={`application-channel-option ${selected === "api" ? "is-selected" : ""} ${apiCreated ? "is-unavailable" : ""}`}><input type="radio" name="channel_type" value="api" checked={selected === "api"} disabled={apiCreated} onChange={() => setSelected("api")} /><span className="application-channel-icon api"><Braces size={20} /></span><span className="application-channel-option-copy"><strong>API 服务</strong><small>系统与业务集成</small></span><span className={apiCreated ? "application-planned-label" : "application-state is-live"}>{apiCreated ? "已创建" : "可用"}</span></label>
-        {([{ name: "企业微信", type: "wecom", label: "企业应用 / 微信客服", icon: Building2 }, { name: "个人微信", type: "wechat", label: "微信账号接入", icon: MessageCircle }]).map(({ name, type, label, icon: Icon }) => <label className="application-channel-option is-unavailable" key={type}><input type="radio" name="channel_type" value={type} disabled /><span className="application-channel-icon"><Icon size={20} /></span><span className="application-channel-option-copy"><strong>{name}</strong><small>{label}</small></span><span className="application-planned-label">即将支持</span></label>)}
+        <label className={`application-channel-option ${selected === "wecom" ? "is-selected" : ""} ${wecomCreated ? "is-unavailable" : ""}`}><input type="radio" name="channel_type" value="wecom" checked={selected === "wecom"} disabled={wecomCreated} onChange={() => setSelected("wecom")} /><span className="application-channel-icon wecom"><Building2 size={20} /></span><span className="application-channel-option-copy"><strong>企业微信</strong><small>智能机器人长连接</small></span><span className={wecomCreated ? "application-planned-label" : "application-state is-live"}>{wecomCreated ? "已创建" : "可用"}</span></label>
+        <label className="application-channel-option is-unavailable"><input type="radio" name="channel_type" value="wechat" disabled /><span className="application-channel-icon"><MessageCircle size={20} /></span><span className="application-channel-option-copy"><strong>个人微信</strong><small>微信账号接入</small></span><span className="application-planned-label">即将支持</span></label>
       </fieldset>
+      {selected === "wecom" && <div className="form-grid application-channel-create-fields"><WecomChannelFields disabled={busy} /></div>}
       {error && <p className="application-error" role="alert">{error}</p>}
-      <div className="modal-actions"><button type="button" className="outline-button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={!selected || busy || apiCreated}>{busy ? "创建中…" : "创建"}</button></div>
+      <div className="modal-actions"><button type="button" className="outline-button" disabled={busy} onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={!selected || busy || alreadyCreated}>{busy ? "创建中…" : "创建"}</button></div>
     </form>
   </Modal>;
 }
@@ -101,14 +111,18 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
   const [apiDetail, setApiDetail] = useState(false);
   const [confirmPublish, setConfirmPublish] = useState(false);
   const [publishRelease, setPublishRelease] = useState<ApplicationRelease | null>(null);
+  const [publishChannel, setPublishChannel] = useState<PublishChannel>("api");
   const [inspectRelease, setInspectRelease] = useState<ApplicationRelease | null>(null);
   const [createChannel, setCreateChannel] = useState(false);
+  const [wecomConfig, setWecomConfig] = useState(false);
   const [copiedField, setCopiedField] = useState<string | null>(null);
   const [publication, setPublication] = useState<ApplicationPublication | null>(null);
+  const [publicationRefreshError, setPublicationRefreshError] = useState<string | null>(null);
   const [releases, setReleases] = useState<ApplicationPage<ApplicationRelease>>({ items: [], total: 0 });
   const [releaseOffset, setReleaseOffset] = useState(0);
   const [deployments, setDeployments] = useState<ApplicationPage<ApplicationDeploymentEvent>>({ items: [], total: 0 });
   const [deploymentOffset, setDeploymentOffset] = useState(0);
+  const [deploymentChannel, setDeploymentChannel] = useState<PublishChannel>("api");
   const [clients, setClients] = useState<ApplicationApiClient[]>([]);
   const [selectedClientId, setSelectedClientId] = useState("");
   const [keys, setKeys] = useState<ApplicationApiKey[]>([]);
@@ -125,6 +139,9 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
   const [notice, setNotice] = useState<string | null>(null);
   const [refresh, setRefresh] = useState(0);
   const selectedClient = clients.find((item) => item.id === selectedClientId);
+  const wecomVisible = tab === "publication" && !apiDetail && Boolean(publication?.wecom_channel);
+  const wecomNow = useWecomNow(publication?.wecom_channel, wecomVisible || tab === "history");
+  const pollPublication = wecomVisible && !loading && !busy && !wecomConfig && !createChannel && !confirmPublish && !inspectRelease;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -137,7 +154,7 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
           const page = await api.listReleases(app.id, releaseOffset, controller.signal);
           if (!controller.signal.aborted) setReleases(page);
         } else if (tab === "deployments") {
-          const page = await api.listDeployments(app.id, deploymentOffset, controller.signal);
+          const page = await api.listDeployments(app.id, deploymentChannel, deploymentOffset, controller.signal);
           if (!controller.signal.aborted) setDeployments(page);
         } else if (tab === "clients" || tab === "runs") {
           const items = await api.listApiClients(app.id, controller.signal);
@@ -152,7 +169,23 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
     };
     void load();
     return () => controller.abort();
-  }, [app.id, tab, releaseOffset, deploymentOffset, runOffset, runStatus, runClient, refresh]);
+  }, [app.id, tab, releaseOffset, deploymentOffset, deploymentChannel, runOffset, runStatus, runClient, refresh]);
+
+  useEffect(() => {
+    setPublicationRefreshError(null);
+    if (!pollPublication) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const load = async () => {
+      try {
+        const state = await api.getPublication(app.id, controller.signal);
+        if (!controller.signal.aborted) { setPublication(state); setPublicationRefreshError(null); }
+      } catch (failure) { if (!controller.signal.aborted) setPublicationRefreshError(errorMessage(failure)); }
+      finally { if (!controller.signal.aborted) timer = setTimeout(() => void load(), 5_000); }
+    };
+    timer = setTimeout(() => void load(), 5_000);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [app.id, pollPublication]);
 
   useEffect(() => {
     if (tab !== "clients" || !selectedClientId) { setKeys([]); return; }
@@ -172,6 +205,15 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
   const togglePublication = () => mutate(async () => {
     if (!publication) return;
     setPublication(await api.updatePublication(app.id, { enabled: !publication.enabled, expected_deployment_version: publication.deployment_version }));
+  });
+  const toggleWecom = (channel: WecomChannelState) => mutate(async () => {
+    setPublication(await api.setWecomEnabled(app.id, { enabled: !channel.enabled, expected_deployment_version: channel.deployment_version }));
+    setNotice(channel.enabled ? "企业微信渠道已停用" : "企业微信渠道已启用");
+  });
+  const connectWecom = () => mutate(async () => {
+    const result = await api.connectWecomChannel(app.id);
+    setPublication(await api.getPublication(app.id));
+    setNotice(result.status === "online" ? "企业微信已连接" : result.status === "error" ? `企业微信连接失败${result.error_code ? ` · ${result.error_code}` : ""}` : "已请求网关连接企业微信");
   });
   const saveDraft = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -201,7 +243,15 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
   };
   const live = Boolean(publication?.enabled && publication.dependencies_ready);
   const inChannel = tab === "publication" || tab === "clients" || tab === "deployments";
-  const startPublish = (release: ApplicationRelease | null = null) => { setPublishRelease(release); setConfirmPublish(true); };
+  const channelCount = (publication?.api_channel_created ? 1 : 0) + (publication?.wecom_channel ? 1 : 0);
+  const startPublish = (release: ApplicationRelease | null = null, channel: PublishChannel = publication?.api_channel_created ? "api" : "wecom") => { setPublishRelease(release); setPublishChannel(channel); setConfirmPublish(true); };
+  const openDeploymentHistory = (channel: PublishChannel) => {
+    setDeploymentChannel(channel); setDeploymentOffset(0); setDeployments({ items: [], total: 0 });
+    setApiDetail(channel === "api"); setTab("deployments"); setError(null); setNotice(null);
+  };
+  const releaseChannels: ReleaseChannel[] = [];
+  if (publication?.api_channel_created) releaseChannels.push({ type: "api", active: publication.active_release, enabled: publication.enabled, canPublish: true });
+  if (publication?.wecom_channel) releaseChannels.push({ type: "wecom", active: publication.wecom_channel.active_release, enabled: publication.wecom_channel.enabled, canPublish: !isWecomExpired(publication.wecom_channel, wecomNow) });
   const restored = (next: Application) => {
     const updated = { ...draft, ...next };
     setDraft(updated); setDraftDirty(false); setInspectRelease(null); onUpdated?.(updated);
@@ -210,9 +260,9 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
 
   return <section className="application-detail application-workspace" aria-busy={loading || busy}>
     <div className="application-breadcrumb"><button onClick={onBack} type="button"><ArrowLeft size={14} />全部 Agent</button><ChevronRight size={13} /><span>{draft.name}</span></div>
-    <div className="application-detail-heading"><span className="application-avatar"><Bot size={24} /></span><div className="application-detail-copy"><h2>{draft.name}</h2><p>{draft.description || "Agent"}</p></div><div className="section-actions"><button className="outline-button" onClick={() => onUse(app.id)} type="button"><MessageCircle size={15} />调试 Agent</button><button className="primary-button" type="button" aria-label="发布" title={!publication?.api_channel_created ? "请先创建发布渠道" : "选择版本发布"} disabled={busy || loading || !publication?.api_channel_created} onClick={() => startPublish()}><Upload size={15} />发布</button></div></div>
-    <div className="application-tabs" role="tablist" aria-label="Agent 管理">{([["draft", "Agent 配置"], ["history", "版本管理"], ["publication", "发布渠道"], ["runs", "运行日志"]] as const).map(([value, label]) => <button key={value} id={`application-tab-${value}`} type="button" role="tab" aria-controls={`application-panel-${value}`} aria-selected={activeTab === value} disabled={busy} onClick={() => switchTab(value)}>{label}</button>)}</div>
-    {error && <div role="alert" className="application-error">{error}<button className="quiet-button" type="button" disabled={busy} onClick={() => { if (tab === "draft") void reloadDraft(); else setRefresh((value) => value + 1); }}>{tab === "draft" ? "刷新草稿" : "刷新"}</button></div>}
+    <div className="application-detail-heading"><span className="application-avatar"><Bot size={24} /></span><div className="application-detail-copy"><h2>{draft.name}</h2><p>{draft.description || "Agent"}</p></div><div className="section-actions"><button className="outline-button" onClick={() => onUse(app.id)} type="button"><MessageCircle size={15} />调试 Agent</button><button className="primary-button" type="button" aria-label="发布" title={!channelCount ? "请先创建发布渠道" : "选择版本发布"} disabled={busy || loading || !channelCount} onClick={() => startPublish()}><Upload size={15} />发布</button></div></div>
+    <div className="application-tabs" role="tablist" aria-label="Agent 管理">{([["draft", "Agent 配置"], ["history", "版本管理"], ["publication", "发布渠道"], ["conversations", "会话"], ["runs", "运行日志"]] as const).map(([value, label]) => <button key={value} id={`application-tab-${value}`} type="button" role="tab" aria-controls={`application-panel-${value}`} aria-selected={activeTab === value} disabled={busy} onClick={() => switchTab(value)}>{label}</button>)}</div>
+    {(error || publicationRefreshError) && <div role="alert" className="application-error">{error || publicationRefreshError}<button className="quiet-button" type="button" disabled={busy} onClick={() => { if (tab === "draft") void reloadDraft(); else setRefresh((value) => value + 1); }}>{tab === "draft" ? "刷新草稿" : "刷新"}</button></div>}
     {notice && <p role="status" className="application-notice">{notice}</p>}
     {draftDirty && tab !== "history" && <div className="application-unsaved" role="status"><span className="application-draft-indicator">有未保存的修改</span>{tab !== "draft" && <button className="application-text-button" type="button" onClick={() => switchTab("draft")}>返回 Agent 配置<ChevronRight size={14} /></button>}</div>}
     {loading && <p className="loading" role="status">正在加载…</p>}
@@ -223,15 +273,21 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
       {publication.active_release && publication.dependency_error && <p className="application-error">当前发布：{publication.dependency_error}</p>}
     </>}
     {tab === "publication" && publication && !apiDetail && <div role="tabpanel" id="application-panel-publication" aria-labelledby="application-tab-publication">
-      <div className="application-section-heading"><h3>发布渠道 <span className="application-heading-count">{publication.api_channel_created ? 1 : 0}</span></h3><button className="outline-button" type="button" disabled={busy || loading || publication.api_channel_created} onClick={() => setCreateChannel(true)}><Plus size={15} />创建发布渠道</button></div>
-      {publication.api_channel_created ? <div className="application-channel-table" role="table" aria-label="发布渠道">
+      <div className="application-section-heading"><h3>发布渠道 <span className="application-heading-count">{channelCount}</span></h3><button className="outline-button" type="button" disabled={busy || loading || (publication.api_channel_created && Boolean(publication.wecom_channel))} onClick={() => setCreateChannel(true)}><Plus size={15} />创建发布渠道</button></div>
+      {channelCount ? <div className="application-channel-table" role="table" aria-label="发布渠道">
         <div className="application-channel-row application-channel-labels" role="row"><span role="columnheader">渠道</span><span role="columnheader">接入状态</span><span role="columnheader">服务状态</span><span role="columnheader">运行版本</span><span role="columnheader">操作</span></div>
-        <div className="application-channel-row" role="row"><div className="application-channel-name" role="cell"><span className="application-channel-icon api"><Braces size={20} /></span><div><strong>API 服务</strong><small>系统与业务集成</small></div></div><div role="cell"><span className={`application-state ${publication.dependencies_ready ? "is-live" : "is-error"}`}>{publication.dependencies_ready ? "已就绪" : "依赖异常"}</span></div><div role="cell"><span className={`application-state ${live ? "is-live" : ""}`}>{!publication.active_release ? "未启用" : statusLabel(publication)}</span></div><div role="cell" className="application-channel-version">{publication.active_release ? <button className="application-version-link" type="button" onClick={() => setInspectRelease(publication.active_release)}>r{publication.active_release.sequence}</button> : "—"}</div><div role="cell" className="application-channel-actions"><button className="application-text-button" type="button" disabled={busy || loading} onClick={() => startPublish()}>切换版本</button><button className="application-text-button" type="button" disabled={busy} onClick={() => setApiDetail(true)}>管理 API<ChevronRight size={14} /></button></div></div>
+        {publication.api_channel_created && <div className="application-channel-row" role="row"><div className="application-channel-name" role="cell"><span className="application-channel-icon api"><Braces size={20} /></span><div><strong>API 服务</strong><small>系统与业务集成</small></div></div><div role="cell"><span className={`application-state ${publication.dependencies_ready ? "is-live" : "is-error"}`}>{publication.dependencies_ready ? "已就绪" : "依赖异常"}</span></div><div role="cell"><span className={`application-state ${live ? "is-live" : ""}`}>{!publication.active_release ? "未启用" : statusLabel(publication)}</span></div><div role="cell" className="application-channel-version">{publication.active_release ? <button className="application-version-link" type="button" onClick={() => setInspectRelease(publication.active_release)}>r{publication.active_release.sequence}</button> : "—"}</div><div role="cell" className="application-channel-actions"><button className="application-text-button" type="button" disabled={busy || loading} onClick={() => startPublish(null, "api")}>切换版本</button><button className="icon-button" type="button" aria-label="API 发布记录" title="API 发布记录" disabled={busy || loading} onClick={() => openDeploymentHistory("api")}><History size={15} /></button><button className="application-text-button" type="button" disabled={busy} onClick={() => setApiDetail(true)}>管理 API<ChevronRight size={14} /></button></div></div>}
+        {publication.wecom_channel && (() => {
+          const wecom = publication.wecom_channel;
+          const expired = isWecomExpired(wecom, wecomNow);
+          const connectDisabled = busy || loading || expired || !wecom.enabled || !wecom.active_release;
+          return <div className="application-channel-row" role="row"><div className="application-channel-name" role="cell"><span className="application-channel-icon wecom"><Building2 size={20} /></span><div><strong>企业微信</strong><small>智能机器人长连接</small></div></div><div role="cell"><span className={`application-state ${wecom.dependencies_ready ? "is-live" : "is-error"}`} title={wecom.dependency_error || undefined}>{wecom.dependencies_ready ? "已就绪" : "依赖异常"}</span></div><div role="cell">{expired ? <span className="application-state is-error">已过期</span> : !wecom.active_release ? <span className="application-state">未发布</span> : !wecom.enabled ? <span className="application-state">已停用</span> : <WecomStatusBadge channel={wecom} now={wecomNow} />}</div><div role="cell" className="application-channel-version">{wecom.active_release ? <button className="application-version-link" type="button" onClick={() => setInspectRelease(wecom.active_release)}>r{wecom.active_release.sequence}</button> : "—"}</div><div role="cell" className="application-channel-actions"><button className="application-text-button" type="button" aria-label="切换到企业微信版本" title="切换版本" disabled={busy || loading || expired} onClick={() => startPublish(null, "wecom")}>版本</button><button className="application-text-button" type="button" aria-label="连接企业微信" disabled={connectDisabled} title={expired ? "渠道已过期" : !wecom.active_release ? "请先发布版本" : !wecom.enabled ? "请先启用渠道" : "连接企业微信网关"} onClick={() => void connectWecom()}>连接</button><button className="application-text-button" type="button" aria-label={wecom.enabled ? "停用企业微信" : "启用企业微信"} disabled={busy || loading || (!wecom.enabled && (expired || !wecom.active_release))} title={!wecom.enabled && expired ? "渠道已过期" : !wecom.enabled && !wecom.active_release ? "请先发布版本" : undefined} onClick={() => void toggleWecom(wecom)}>{wecom.enabled ? "停用" : "启用"}</button><button className="icon-button" type="button" aria-label="企业微信发布记录" title="企业微信发布记录" disabled={busy || loading} onClick={() => openDeploymentHistory("wecom")}><History size={15} /></button><button className="application-text-button" type="button" aria-label="配置企业微信" disabled={busy} onClick={() => setWecomConfig(true)}>配置<ChevronRight size={14} /></button></div></div>;
+        })()}
       </div> : <div className="application-channel-empty"><span className="application-channel-empty-icon"><Globe size={27} /></span><h3>还没有发布渠道</h3></div>}
       <div className="application-knowledge-note"><BookOpen size={15} /><span>{knowledgeBases.find((item) => item.id === draft.knowledge_base_id)?.name || "知识库"}</span><span className="application-note-divider" /><span>自动使用最新已提交内容</span></div>
     </div>}
     {inChannel && apiDetail && <div className="application-api-heading"><button className="icon-button" type="button" title="返回发布渠道" aria-label="返回发布渠道" disabled={busy} onClick={() => { setApiDetail(false); setTab("publication"); }}><ArrowLeft size={17} /></button><span className="application-channel-icon api"><Braces size={18} /></span><h3>API 服务</h3><span className={`application-state ${live ? "is-live" : ""}`}>{publication ? statusLabel(publication) : "读取中…"}</span>{publication?.active_release && <button className="outline-button" type="button" disabled={busy || loading || (!publication.enabled && !publication.dependencies_ready)} onClick={() => void togglePublication()}>{publication.enabled ? "停用 API" : "恢复 API"}</button>}</div>}
-    {inChannel && apiDetail && <nav className="application-api-tabs" aria-label="API 服务管理"><button className={tab === "publication" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("publication"); setError(null); setNotice(null); }}><Globe size={14} />接入配置</button><button className={tab === "clients" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("clients"); setError(null); setNotice(null); }}><Braces size={14} />客户端与密钥</button><button className={tab === "deployments" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("deployments"); setError(null); setNotice(null); }}>发布记录</button><a href={api.docsUrl()} target="_blank" rel="noreferrer">接口文档<ArrowUpRight size={14} /></a></nav>}
+    {inChannel && apiDetail && <nav className="application-api-tabs" aria-label="API 服务管理"><button className={tab === "publication" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("publication"); setError(null); setNotice(null); }}><Globe size={14} />接入配置</button><button className={tab === "clients" ? "is-active" : ""} type="button" disabled={busy} onClick={() => { setTab("clients"); setError(null); setNotice(null); }}><Braces size={14} />客户端与密钥</button><button className={tab === "deployments" ? "is-active" : ""} type="button" disabled={busy} onClick={() => openDeploymentHistory("api")}>发布记录</button><a href={api.docsUrl()} target="_blank" rel="noreferrer">接口文档<ArrowUpRight size={14} /></a></nav>}
     {tab === "publication" && publication && apiDetail && <div role="tabpanel" id="application-panel-publication" aria-labelledby="application-tab-publication">
       <div className="application-connection-fields">{([{ label: "Base URL", value: baseUrl }, { label: "Model", value: app.id }, { label: "调用地址", value: endpoint }]).map(({ label, value }) => <div className="application-endpoint" key={label}><label>{label}</label><div><code aria-label={label}>{value}</code><button className="icon-button" type="button" title={copiedField === label ? "已复制" : `复制${label}`} aria-label={`复制${label}`} onClick={() => void copyConnection(label, value)}>{copiedField === label ? <Check size={16} /> : <Copy size={16} />}</button></div></div>)}</div>
       {publicBaseMissing && <p className="application-endpoint-hint" role="note">当前显示控制台地址，对外部署请替换为公开网关地址</p>}
@@ -239,11 +295,13 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
       <details className="application-example"><summary>cURL 调用示例</summary><pre>{`curl '${endpoint}' \\\n  -H "Authorization: Bearer $NIANLUN_APP_KEY" \\\n  -H 'Content-Type: application/json' \\\n  -d '${JSON.stringify({ model: app.id, messages: [{ role: "user", content: "请概括文档" }], stream: false })}'`}</pre></details>
       <details className="application-example"><summary>Python SDK 调用示例</summary><pre>{`import os\nfrom openai import OpenAI\n\nclient = OpenAI(\n    base_url=${JSON.stringify(baseUrl)},\n    api_key=os.environ["NIANLUN_APP_KEY"],\n)\n\nstream = client.chat.completions.create(\n    model=${JSON.stringify(app.id)},\n    messages=[{"role": "user", "content": "请概括文档"}],\n    stream=True,\n)\nfor chunk in stream:\n    if chunk.choices:\n        print(chunk.choices[0].delta.content or "", end="", flush=True)`}</pre></details>
     </div>}
-    {tab === "history" && <ApplicationVersions app={draft} page={releases} active={publication?.active_release || null} enabled={publication?.enabled ?? false} draftDirty={draftDirty} knowledgeBases={knowledgeBases} loading={loading || busy} canCreate={!draftDirty && Boolean(publication?.draft_ready)} canPublish={Boolean(publication?.api_channel_created)} createDisabledReason={draftDirty ? "请先保存草稿" : publication?.draft_error || "草稿当前不可创建版本"} offset={releaseOffset} onOffset={setReleaseOffset} onCreated={() => { setReleaseOffset(0); setRefresh((value) => value + 1); setNotice("版本已创建，尚未发布到渠道"); }} onEditDraft={() => switchTab("draft")} onPublish={(release) => startPublish(release)} onRestored={restored} />}
+    {tab === "history" && <ApplicationVersions app={draft} page={releases} channels={releaseChannels} draftDirty={draftDirty} knowledgeBases={knowledgeBases} loading={loading || busy} canCreate={!draftDirty && Boolean(publication?.draft_ready)} createDisabledReason={draftDirty ? "请先保存草稿" : publication?.draft_error || "草稿当前不可创建版本"} offset={releaseOffset} onOffset={setReleaseOffset} onCreated={() => { setReleaseOffset(0); setRefresh((value) => value + 1); setNotice("版本已创建，尚未发布到渠道"); }} onEditDraft={() => switchTab("draft")} onPublish={(release, channel) => startPublish(release, channel)} onRestored={restored} />}
     {tab === "deployments" && <div role="tabpanel" id="application-panel-deployments" aria-labelledby="application-tab-publication">
-      {deployments.items.length ? <div className="application-table-wrap"><table className="application-table"><thead><tr><th>时间</th><th>操作</th><th>版本变更</th><th>服务状态</th></tr></thead><tbody>{deployments.items.map((event) => <tr key={event.id}><td>{timestamp(event.created_at)}</td><td>{event.action === "deploy" ? "发布版本" : event.action === "enable" ? "恢复 API" : "停用 API"}</td><td>{event.previous_sequence ? `r${event.previous_sequence}` : "未发布"}{event.action === "deploy" ? ` → r${event.sequence}` : ""}</td><td><span className={`application-state ${event.enabled ? "is-live" : ""}`}>{event.enabled ? "已启用" : "已停用"}</span></td></tr>)}</tbody></table></div> : !loading && <p className="application-empty">暂无发布记录</p>}
+      <div className="application-section-heading"><div className="section-actions">{!apiDetail && <button className="icon-button" type="button" title="返回发布渠道" aria-label="返回发布渠道" disabled={busy} onClick={() => switchTab("publication")}><ArrowLeft size={17} /></button>}<h3>发布记录</h3></div><div className="application-run-filters"><div className="field"><label htmlFor="deployment-channel">渠道</label><select id="deployment-channel" value={deploymentChannel} disabled={loading} onChange={(event) => { setDeployments({ items: [], total: 0 }); setDeploymentChannel(event.target.value === "wecom" ? "wecom" : "api"); setDeploymentOffset(0); }}><option value="api">API 服务</option><option value="wecom">企业微信</option></select></div></div></div>
+      {deployments.items.length ? <div className="application-table-wrap"><table className="application-table"><thead><tr><th>时间</th><th>渠道</th><th>操作</th><th>版本变更</th><th>服务状态</th></tr></thead><tbody>{deployments.items.map((event) => <tr key={event.id}><td>{timestamp(event.created_at)}</td><td>{event.channel_type === "wecom" ? "企业微信" : "API 服务"}</td><td>{event.action === "deploy" ? "发布版本" : event.action === "enable" ? "启用渠道" : "停用渠道"}</td><td>{event.previous_sequence ? `r${event.previous_sequence}` : "未发布"}{event.action === "deploy" ? ` → r${event.sequence}` : ""}</td><td><span className={`application-state ${event.enabled ? "is-live" : ""}`}>{event.enabled ? "已启用" : "已停用"}</span></td></tr>)}</tbody></table></div> : !loading && <p className="application-empty">暂无发布记录</p>}
       {deployments.total > 20 && <Pagination offset={deploymentOffset} total={deployments.total} onChange={setDeploymentOffset} disabled={loading || busy} />}
     </div>}
+    {tab === "conversations" && <ApplicationConversations appId={app.id} />}
 
     <form className="application-draft" hidden={tab !== "draft"} id="application-panel-draft" aria-labelledby="application-tab-draft" onChange={() => setDraftDirty(true)} onSubmit={saveDraft} role="tabpanel" key={`${draft.id}-${draft.updated_at}-${draft.config_version}`}>
       <div className="application-section-heading"><h3>Agent 配置</h3><span>{draftDirty ? "有未保存修改" : "已保存"}</span></div>
@@ -272,8 +330,9 @@ export function ApplicationDetail({ app, knowledgeBases, llmModels, onBack, onUs
       <Pagination offset={runOffset} total={runs.total} onChange={setRunOffset} disabled={loading} />
     </div>}
     {keyClient && <KeyDialog appId={app.id} client={keyClient} rotationKey={rotationKey} onClose={() => setKeyClient(null)} onRegistered={(key) => setKeys((items) => [...items, key])} onRevoked={(key) => setKeys((items) => items.map((item) => item.key_id === key.key_id ? key : item))} />}
-    {createChannel && publication && <ChannelDialog appId={app.id} apiCreated={publication.api_channel_created} onClose={() => setCreateChannel(false)} onCreated={(state) => { setPublication(state); setCreateChannel(false); setNotice("API 渠道已创建"); }} />}
-    {confirmPublish && publication && <ApplicationPublishPanel app={draft} publication={publication} initialRelease={publishRelease} draftDirty={draftDirty} knowledgeBases={knowledgeBases} llmModels={draftModels} onClose={() => setConfirmPublish(false)} onRefreshed={(latest, state, models) => { setPublication(state); setDraftModels(models); if (!draftDirty) { setDraft(latest); onUpdated?.(latest); } }} onVersionCreated={() => { setReleaseOffset(0); setRefresh((value) => value + 1); }} onPublished={(state) => { setPublication(state); setConfirmPublish(false); setNotice(`API 已切换至 r${state.active_release?.sequence}${!state.enabled ? "，渠道保持停用" : ""}`); setRefresh((value) => value + 1); }} />}
-    {inspectRelease && <VersionDetail app={draft} release={inspectRelease} active={publication?.active_release || null} knowledgeBases={knowledgeBases} onClose={() => setInspectRelease(null)} onRestored={restored} />}
+    {createChannel && publication && <ChannelDialog appId={app.id} apiCreated={publication.api_channel_created} wecomCreated={Boolean(publication.wecom_channel)} onClose={() => setCreateChannel(false)} onCreated={(state, channel) => { setPublication(state); setCreateChannel(false); setNotice(channel === "wecom" ? "企业微信渠道已创建" : "API 渠道已创建"); }} />}
+    {wecomConfig && publication?.wecom_channel && <WecomChannelDialog appId={app.id} channel={publication.wecom_channel} onClose={() => setWecomConfig(false)} onUpdated={(state) => { setPublication(state); setWecomConfig(false); setNotice("企业微信渠道配置已保存"); }} />}
+    {confirmPublish && publication && <ApplicationPublishPanel app={draft} publication={publication} initialRelease={publishRelease} initialChannel={publishChannel} draftDirty={draftDirty} knowledgeBases={knowledgeBases} llmModels={draftModels} onClose={() => setConfirmPublish(false)} onRefreshed={(latest, state, models) => { setPublication(state); setDraftModels(models); if (!draftDirty) { setDraft(latest); onUpdated?.(latest); } }} onVersionCreated={() => { setReleaseOffset(0); setRefresh((value) => value + 1); }} onPublished={(state, channel) => { setPublication(state); setConfirmPublish(false); const release = channel === "wecom" ? state.wecom_channel?.active_release : state.active_release; const enabled = channel === "wecom" ? state.wecom_channel?.enabled : state.enabled; setNotice(`${channel === "wecom" ? "企业微信" : "API 服务"}已切换至 r${release?.sequence}${!enabled ? "，渠道保持停用" : ""}`); setRefresh((value) => value + 1); }} />}
+    {inspectRelease && <VersionDetail app={draft} release={inspectRelease} channels={releaseChannels} knowledgeBases={knowledgeBases} onClose={() => setInspectRelease(null)} onRestored={restored} />}
   </section>;
 }

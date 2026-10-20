@@ -4,6 +4,7 @@
 
 使用一个后端进程、一个 worker。后端监听 `127.0.0.1:8000`，或限制在私有网络。
 控制台及 `/api/v1/apps`、模型、知识库、上传、`/docs`、OpenAPI 必须通过私有入口访问。
+`/internal/*`（网关快照、状态和运行接口）只允许独立渠道网关从私有网络访问，不得对外暴露。
 不要直接将后端端口映射到公网。应用 Key 不具有管理员权限，也不能保护已有的管理接口。
 
 `deploy/application-api.nginx.conf` 提供只允许公开调用路径的网关配置；将其包含在 nginx 的 http 配置内，
@@ -17,18 +18,21 @@
 ## 控制台
 
 进入 Agent 管理，确认 Agent 配置中的知识库和模型后，打开“发布渠道”，点击“创建发布渠道”，
-选择“API 服务”并创建。渠道列表只显示已创建的渠道；企业微信和个人微信目前仅在选择器中显示“即将支持”。
-每个 Agent 当前支持一个 API 渠道，多个接入系统通过不同客户端及 Key 区分。
+选择“API 服务”或“企业微信”并创建。渠道列表只显示已创建的渠道；个人微信暂未支持。
+每个 Agent 可同时创建一个 API 渠道和一个企业微信渠道，多个 API 接入系统通过不同客户端及 Key 区分。
+企业微信需要单独运行长连接网关，配置与启动方式见 `docs/wecom_channel.md`。
 创建渠道只保存接入入口，不生成发布版本或启用调用。发布首个版本后启用 API，再创建接入客户端及 Key。
 已停用渠道重新发布仍保持停用，需要显式恢复。
 
-管理接口 `POST /api/v1/apps/{app_id}/channels` 接收 `{"type":"api"}`，返回现有 JSON envelope 中的发布状态。
-`api_channel_created` 表示 API 渠道是否已创建；重复创建返回 409，未支持的渠道类型返回 422。
+管理接口 `POST /api/v1/apps/{app_id}/channels` 接收 `{"type":"api"}` 或
+`{"type":"wecom","bot_id":...,"secret":...,"default_response":...}`，返回现有 JSON envelope 中的发布状态。
+`api_channel_created` 表示 API 渠道是否已创建，`wecom_channel` 表示企业微信渠道状态；重复创建返回 409，
+未支持的渠道类型返回 422。企业微信 `secret` 只写不读，响应中仅返回 `has_secret`。
 创建状态复用持久化的 API deployment，已有 API 发布自动视为已创建，旧发布接口保持兼容。
 Key 在浏览器本地生成，服务端只接收写入并保存摘要；注册成功后立即保存在接入系统的秘密存储中，关闭窗口后不能找回。
 不要把 Key 放在网页前端、URL、代码仓库或日志中。轮换时先添加同客户端的新 Key，验证接入后撤销旧 Key。
 
-详情页将“Agent 配置”“版本管理”“发布渠道”“运行日志”分开。保存草稿不会修改线上版本；
+详情页将“Agent 配置”“版本管理”“发布渠道”“会话”“运行日志”分开。保存草稿不会修改线上版本；
 新建 Agent 已保存初始草稿，无需重复保存；修改配置后才启用保存操作。
 “版本管理”顶部始终显示当前草稿及保存状态，下方单独列出已创建的版本。
 在“版本管理”创建带说明的不可变版本，查看配置差异，也可确认后将历史配置复制回草稿。
@@ -42,8 +46,13 @@ Key 在浏览器本地生成，服务端只接收写入并保存摘要；注册�
 | --- | --- |
 | `POST /releases` | `expected_config_version`、可选 `description`（最多 500 字）；仅创建版本 |
 | `GET /releases/{release_id}` | 获取指定版本配置 |
-| `POST /deployments` | `channel_type: "api"`、`release_id`、`expected_deployment_version`；部署指定版本 |
-| `GET /deployments?limit=20&offset=0` | 分页查看部署、启用、停用记录 |
+| `POST /channels` | `type: "api"`，或企业微信 `bot_id`、`secret`、`default_response`、可选 `expires_at` |
+| `GET/PUT /channels/wecom` | 获取或更新企业微信配置；更新需 `expected_config_revision`，`secret` 可省略 |
+| `PATCH /channels/wecom` | `enabled`、`expected_deployment_version`；启用或停用企业微信渠道 |
+| `POST /channels/wecom/connect` | 请求网关立即连接企业微信 |
+| `POST /deployments` | `channel_type: "api" \| "wecom"`、`release_id`、`expected_deployment_version`；部署指定版本 |
+| `GET /deployments?limit=20&offset=0&channel_type=api` | 按渠道分页查看部署、启用、停用记录 |
+| `GET /conversations?channel=console\|api\|wecom` | 按渠道列出会话；企业微信会话只读且只含脱敏标识 |
 | `POST /releases/{release_id}/restore` | `expected_config_version`；复制模型、知识库与运行配置到草稿，保留名称和描述 |
 
 部署要求渠道已创建，且目标版本与当前程序、模型配置和知识库兼容；冲突返回 409，不覆盖他人更新。

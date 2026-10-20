@@ -10,6 +10,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api_server.apis.internal.router import (
+    InternalNoStoreMiddleware,
+    internal_router,
+)
 from app.api_server.apis.v1.router import v1_router
 from app.api_server.common.errors import (
     ApiError,
@@ -67,7 +71,9 @@ def create_app(
         allow_headers=["*"],
     )
     app.add_middleware(RequestTrackingMiddleware)
+    app.add_middleware(InternalNoStoreMiddleware)
     app.include_router(v1_router)
+    app.include_router(internal_router)
     return app
 
 

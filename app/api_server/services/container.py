@@ -16,9 +16,11 @@ from app.api_server.services.application_release_service import (
 from app.api_server.services.application_invocation_service import (
     ApplicationInvocationService,
 )
+from app.api_server.services.application_wecom_service import ApplicationWecomService
 from app.api_server.services.chat_service import ChatService
 from app.api_server.services.document_ingestion_service import DocumentIngestionService
 from app.api_server.services.fts_index_service import FTSIndexService
+from app.api_server.services.gateway_control import GatewayControlClient
 from app.api_server.services.knowledge_base_service import KnowledgeBaseService
 from app.api_server.services.model_config_service import ModelConfigService
 from app.api_server.services.vector_index_service import VectorIndexService
@@ -26,6 +28,7 @@ from app.api_server.services.workspace_snapshot import (
     reconcile_workspace_revisions,
     reconcile_workspace_storage,
 )
+from app.api_server.repositories.wecom_channels import WecomChannelRepository
 
 
 @dataclass
@@ -39,6 +42,7 @@ class ApiServices:
     models: ModelConfigService
     publishing: ApplicationReleaseService
     invocations: ApplicationInvocationService
+    wecom: ApplicationWecomService | None = None
 
 
 def build_services(settings: ApiServerSettings) -> ApiServices:
@@ -109,6 +113,17 @@ def build_services(settings: ApiServerSettings) -> ApiServices:
     invocations = ApplicationInvocationService(
         publishing, applications, factory, settings
     )
+    wecom = ApplicationWecomService(
+        WecomChannelRepository(factory),
+        publishing,
+        applications,
+        settings,
+        GatewayControlClient(
+            settings.gateway_control_urls,
+            settings.gateway_control_token,
+            settings.gateway_control_timeout_seconds,
+        ),
+    )
     return ApiServices(
         knowledge_bases=knowledge_bases,
         documents=documents,
@@ -119,6 +134,7 @@ def build_services(settings: ApiServerSettings) -> ApiServices:
         models=models,
         publishing=publishing,
         invocations=invocations,
+        wecom=wecom,
     )
 
 

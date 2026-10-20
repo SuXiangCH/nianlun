@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import ConfigDict, Field, field_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.api_server.apis.v1.schemas import ApiSchema
 
@@ -80,7 +80,7 @@ class ApplicationReleaseCreateRequest(ApiSchema):
 
 
 class ApplicationDeployRequest(ApiSchema):
-    channel_type: Literal["api"] = "api"
+    channel_type: Literal["api", "wecom"] = "api"
     release_id: str = Field(min_length=1, max_length=128)
     expected_deployment_version: int = Field(ge=0)
 
@@ -89,8 +89,94 @@ class ApplicationRestoreRequest(ApiSchema):
     expected_config_version: int = Field(ge=1)
 
 
-class PublicationChannelCreateRequest(ApiSchema):
+class ApiChannelCreateRequest(ApiSchema):
     type: Literal["api"]
+
+
+class WecomChannelCreateRequest(ApiSchema):
+    type: Literal["wecom"]
+    bot_id: str = Field(min_length=1, max_length=256)
+    secret: str = Field(repr=False, min_length=1, max_length=512)
+    default_response: str = Field(
+        default="暂时无法回答，请稍后再试。", min_length=1, max_length=1000
+    )
+    expires_at: datetime | None = None
+
+    @field_validator("bot_id", "default_response")
+    @classmethod
+    def trim_required_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("字段不能为空")
+        return normalized
+
+    @field_validator("secret")
+    @classmethod
+    def nonblank_secret(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("secret 不能为空")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def timezone_required(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("到期时间必须包含时区")
+        return value
+
+
+class WecomChannelUpdateRequest(ApiSchema):
+    expected_config_revision: int = Field(ge=1)
+    bot_id: str | None = Field(default=None, min_length=1, max_length=256)
+    secret: str | None = Field(default=None, repr=False, min_length=1, max_length=512)
+    default_response: str | None = Field(default=None, min_length=1, max_length=1000)
+    expires_at: datetime | None = None
+
+    @field_validator("bot_id", "default_response")
+    @classmethod
+    def trim_required_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("字段不能为空")
+        return normalized
+
+    @field_validator("secret")
+    @classmethod
+    def nonblank_secret(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("secret 不能为空")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def timezone_required(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("到期时间必须包含时区")
+        return value
+
+
+PublicationChannelCreateRequest = Annotated[
+    ApiChannelCreateRequest | WecomChannelCreateRequest,
+    Field(discriminator="type"),
+]
+
+
+class WecomStatusRequest(ApiSchema):
+    revision: int = Field(ge=1)
+    status: Literal["offline", "online", "error"]
+    error_code: (
+        Literal["AUTH_FAILED", "NETWORK_ERROR", "CONNECTION_CONFLICT"] | None
+    ) = None
+
+    @model_validator(mode="after")
+    def validate_error_code(self) -> WecomStatusRequest:
+        if self.status == "error" and self.error_code is None:
+            raise ValueError("error 状态必须提供 error_code")
+        if self.status != "error" and self.error_code is not None:
+            raise ValueError("非 error 状态不能提供 error_code")
+        return self
 
 
 class PublicationUpdateRequest(ApiSchema):
@@ -115,10 +201,29 @@ class ApplicationReleaseListResponse(ApiSchema):
     total: int
 
 
+class WecomChannelState(ApiSchema):
+    id: str
+    bot_id: str
+    has_secret: bool
+    default_response: str
+    enabled: bool
+    active_release: ApplicationReleaseResponse | None
+    deployment_version: int
+    config_revision: int
+    status: Literal["offline", "online", "error"]
+    error_code: Literal["AUTH_FAILED", "NETWORK_ERROR", "CONNECTION_CONFLICT"] | None
+    expires_at: datetime | None
+    has_unpublished_changes: bool
+    dependencies_ready: bool
+    dependency_error: str | None
+    last_deployed_at: datetime | None
+    last_reported_at: datetime | None
+
+
 class ApplicationDeploymentEventResponse(ApiSchema):
     id: str
     application_id: str
-    channel_type: Literal["api"]
+    channel_type: Literal["api", "wecom"]
     action: Literal["deploy", "enable", "disable"]
     previous_release_id: str | None
     release_id: str | None
@@ -147,6 +252,7 @@ class PublicationResponse(ApiSchema):
     draft_error: str | None = None
     dependencies_ready: bool
     dependency_error: str | None = None
+    wecom_channel: WecomChannelState | None = None
 
 
 class ApiClientCreateRequest(ApiSchema):
