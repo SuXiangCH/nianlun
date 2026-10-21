@@ -32,16 +32,24 @@ class Conversation(Base):
             "application_id",
             text("updated_at DESC"),
         ),
+        Index(
+            "idx_conversations_channel_peer",
+            "application_id",
+            "channel",
+            "external_user_id",
+            "status",
+        ),
         CheckConstraint(
             "status IN ('active', 'archived', 'deleted')",
             name="ck_conversations_status",
         ),
         CheckConstraint(
-            "channel IN ('console', 'api')", name="ck_conversations_channel"
+            "channel IN ('console', 'api', 'wecom')", name="ck_conversations_channel"
         ),
         CheckConstraint(
             "(channel = 'console' AND api_client_id IS NULL AND external_user_id IS NULL AND release_id IS NULL) OR "
-            "(channel = 'api' AND api_client_id IS NOT NULL AND external_user_id IS NOT NULL AND length(trim(external_user_id)) > 0 AND release_id IS NOT NULL)",
+            "(channel = 'api' AND api_client_id IS NOT NULL AND external_user_id IS NOT NULL AND length(trim(external_user_id)) > 0 AND release_id IS NOT NULL) OR "
+            "(channel = 'wecom' AND api_client_id IS NULL AND external_user_id IS NOT NULL AND length(trim(external_user_id)) > 0 AND release_id IS NOT NULL)",
             name="ck_conversations_api_owner",
         ),
         CheckConstraint(

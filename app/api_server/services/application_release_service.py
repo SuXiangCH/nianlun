@@ -87,7 +87,7 @@ class ApplicationReleaseService:
         with self._locks_guard:
             return self._locks.setdefault(application_id, threading.RLock())
 
-    def _draft_config(self, app_id: str) -> PublishedConfig:
+    def draft_config(self, app_id: str) -> PublishedConfig:
         app = self.applications.require_record(app_id)
         knowledge = self.applications.knowledge_base_lookup(app["knowledge_base_id"])
         if not knowledge.get("snapshot_relpath") or not knowledge.get(
@@ -181,7 +181,7 @@ class ApplicationReleaseService:
         error: str | None = None
         changed = True
         try:
-            config = self._draft_config(application_id)
+            config = self.draft_config(application_id)
             changed = (
                 release is None or config_fingerprint(config)[1] != release.config_hash
             )
@@ -225,7 +225,7 @@ class ApplicationReleaseService:
         self, application_id: str, request: ApplicationPublishRequest
     ) -> PublicationResponse:
         with self.entry_lock(application_id):
-            config = self._draft_config(application_id)
+            config = self.draft_config(application_id)
             canonical, fingerprint = config_fingerprint(config)
             self.repository.publish(
                 config,
@@ -264,7 +264,7 @@ class ApplicationReleaseService:
         self, application_id: str, request: ApplicationReleaseCreateRequest
     ) -> ApplicationReleaseResponse:
         with self.entry_lock(application_id):
-            config = self._draft_config(application_id)
+            config = self.draft_config(application_id)
             canonical, fingerprint = config_fingerprint(config)
             return self._release(
                 self.repository.create_release(
@@ -314,12 +314,17 @@ class ApplicationReleaseService:
             )
 
     def list_deployments(
-        self, application_id: str, limit: int = 20, offset: int = 0
+        self,
+        application_id: str,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        channel_type: str = "api",
     ) -> ApplicationDeploymentListResponse:
         if not 1 <= limit <= 100 or offset < 0:
             raise ApiError("分页参数无效", 422)
         records, total = self.repository.deployment_events(
-            application_id, limit, offset
+            application_id, limit, offset, channel_type=channel_type
         )
         return ApplicationDeploymentListResponse(
             items=[

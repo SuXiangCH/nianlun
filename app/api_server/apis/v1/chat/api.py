@@ -1,9 +1,9 @@
 """Blocking and Server-Sent Events chat routes."""
 
 import logging
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.api_server.apis.v1.schemas import ChatRequest
@@ -96,8 +96,12 @@ async def chat(
 
 
 @router.get("/{application_id}/conversations")
-def list_conversations(application_id: str, request: Request) -> dict[str, Any]:
-    items = _services(request).chat.list_conversations(application_id)
+def list_conversations(
+    application_id: str,
+    request: Request,
+    channel: Literal["console", "api", "wecom"] = Query(default="console"),
+) -> dict[str, Any]:
+    items = _services(request).chat.list_conversations(application_id, channel)
     return success([item.model_dump(mode="json") for item in items])
 
 

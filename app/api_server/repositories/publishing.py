@@ -25,6 +25,7 @@ from app.api_server.database.models.publishing import (
     ApplicationDeployment,
     ApplicationDeploymentEvent,
     ApplicationRelease,
+    ApplicationWecomChannel,
 )
 
 
@@ -51,10 +52,16 @@ class PublishingRepository:
                 ApplicationDeployment.active_release_id.is_not(None),
             )
         )
+        enabled_wecom = session.scalars(
+            select(ApplicationWecomChannel.active_release_id).where(
+                ApplicationWecomChannel.enabled.is_(True),
+                ApplicationWecomChannel.active_release_id.is_not(None),
+            )
+        )
         retained = session.scalars(
             select(Conversation.release_id)
             .where(
-                Conversation.channel == "api",
+                Conversation.channel.in_(("api", "wecom")),
                 Conversation.status != "deleted",
                 or_(
                     Conversation.expires_at.is_(None), Conversation.expires_at > _now()
@@ -72,7 +79,7 @@ class PublishingRepository:
         )
         return {
             release_id
-            for release_id in [*enabled, *retained, *running]
+            for release_id in [*enabled, *enabled_wecom, *retained, *running]
             if release_id is not None
         }
 
@@ -101,11 +108,21 @@ class PublishingRepository:
         deployment = session.get(ApplicationDeployment, app_id)
         if deployment is not None and deployment.enabled:
             raise ApiError("应用 API 已启用，请先停用后删除", 409)
+        wecom_enabled = session.scalar(
+            select(ApplicationWecomChannel.id)
+            .where(
+                ApplicationWecomChannel.application_id == app_id,
+                ApplicationWecomChannel.enabled.is_(True),
+            )
+            .limit(1)
+        )
+        if wecom_enabled is not None:
+            raise ApiError("企业微信渠道已启用，请先停用后删除", 409)
         retained = session.scalar(
             select(Conversation.id)
             .where(
                 Conversation.application_id == app_id,
-                Conversation.channel == "api",
+                Conversation.channel.in_(("api", "wecom")),
                 Conversation.status != "deleted",
                 or_(
                     Conversation.expires_at.is_(None), Conversation.expires_at > _now()
@@ -114,7 +131,7 @@ class PublishingRepository:
             .limit(1)
         )
         if retained is not None:
-            raise ApiError("应用仍有未过期 API 会话，暂不能删除", 409)
+            raise ApiError("应用仍有未过期会话，暂不能删除", 409)
         running = session.scalar(
             select(ApplicationRun.id)
             .where(
@@ -124,7 +141,7 @@ class PublishingRepository:
             .limit(1)
         )
         if running is not None:
-            raise ApiError("应用仍有执行中的 API 调用，暂不能删除", 409)
+            raise ApiError("应用仍有执行中的调用，暂不能删除", 409)
 
     @staticmethod
     def _application(session: Session, app_id: str) -> Application:
@@ -268,25 +285,32 @@ class PublishingRepository:
         return release
 
     @staticmethod
-    def _deployment_event(
+    def record_deployment_event(
         session: Session,
-        deployment: ApplicationDeployment,
+        deployment: Any,
         previous: ApplicationRelease | None,
         release: ApplicationRelease | None,
         action: str,
+        *,
+        channel_type: str = "api",
+        deployment_version: int | None = None,
     ) -> None:
         session.add(
             ApplicationDeploymentEvent(
                 id=str(uuid.uuid4()),
                 application_id=deployment.application_id,
-                channel_type="api",
+                channel_type=channel_type,
                 action=action,
                 previous_release_id=previous.id if previous else None,
                 release_id=release.id if release else None,
                 previous_sequence=previous.sequence if previous else None,
                 sequence=release.sequence if release else None,
                 enabled=deployment.enabled,
-                deployment_version=deployment.version,
+                deployment_version=(
+                    deployment_version
+                    if deployment_version is not None
+                    else deployment.version
+                ),
                 created_at=_now(),
             )
         )
@@ -353,18 +377,23 @@ class PublishingRepository:
                 deployment.enabled = True
             deployment.active_release_id = release.id
             deployment.version += 1
-            self._deployment_event(session, deployment, previous, release, "deploy")
+            self.record_deployment_event(
+                session, deployment, previous, release, "deploy"
+            )
 
     def deployment_events(
         self,
         app_id: str,
         limit: int,
         offset: int,
+        *,
+        channel_type: str = "api",
     ) -> tuple[list[dict[str, Any]], int]:
         with self.factory.session_scope() as session:
             self._application(session, app_id)
             statement = select(ApplicationDeploymentEvent).where(
-                ApplicationDeploymentEvent.application_id == app_id
+                ApplicationDeploymentEvent.application_id == app_id,
+                ApplicationDeploymentEvent.channel_type == channel_type,
             )
             total = int(
                 session.scalar(select(func.count()).select_from(statement.subquery()))
@@ -377,12 +406,15 @@ class PublishingRepository:
             )
             return [_record(item) for item in items], total
 
-    def last_deployed_at(self, app_id: str) -> datetime | None:
+    def last_deployed_at(
+        self, app_id: str, *, channel_type: str = "api"
+    ) -> datetime | None:
         with self.factory.session_scope() as session:
             value = session.scalar(
                 select(ApplicationDeploymentEvent.created_at)
                 .where(
                     ApplicationDeploymentEvent.application_id == app_id,
+                    ApplicationDeploymentEvent.channel_type == channel_type,
                     ApplicationDeploymentEvent.action == "deploy",
                 )
                 .order_by(ApplicationDeploymentEvent.deployment_version.desc())
@@ -425,7 +457,9 @@ class PublishingRepository:
                 deployment.enabled = True
             deployment.active_release_id = release.id
             deployment.version += 1
-            self._deployment_event(session, deployment, previous, release, "deploy")
+            self.record_deployment_event(
+                session, deployment, previous, release, "deploy"
+            )
 
     def set_enabled(
         self,
@@ -456,7 +490,7 @@ class PublishingRepository:
                 if deployment.active_release_id
                 else None
             )
-            self._deployment_event(
+            self.record_deployment_event(
                 session,
                 deployment,
                 current,

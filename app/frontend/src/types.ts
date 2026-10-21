@@ -77,6 +77,47 @@ export interface PublishedApplicationConfig {
   v1_prompt_hash: string;
 }
 
+export interface WecomChannelState {
+  id: string;
+  bot_id: string;
+  has_secret: boolean;
+  default_response: string;
+  enabled: boolean;
+  active_release: ApplicationRelease | null;
+  deployment_version: number;
+  config_revision: number;
+  status: "offline" | "online" | "error";
+  error_code: "AUTH_FAILED" | "NETWORK_ERROR" | "CONNECTION_CONFLICT" | null;
+  expires_at: string | null;
+  has_unpublished_changes: boolean;
+  dependencies_ready: boolean;
+  dependency_error: string | null;
+  last_deployed_at: string | null;
+  last_reported_at: string | null;
+}
+
+export interface WecomChannelCreateInput {
+  bot_id: string;
+  secret: string;
+  default_response?: string;
+  expires_at?: string | null;
+}
+
+export interface WecomChannelUpdateInput {
+  expected_config_revision: number;
+  bot_id?: string;
+  secret?: string;
+  default_response?: string;
+  expires_at?: string | null;
+}
+
+export interface WecomConnectResult {
+  channel_id: string;
+  revision: number;
+  status: "offline" | "online" | "error";
+  error_code: string | null;
+}
+
 export interface ApplicationPublication {
   application_id: string;
   api_channel_created: boolean;
@@ -90,12 +131,13 @@ export interface ApplicationPublication {
   dependency_error: string | null;
   draft_ready: boolean;
   draft_error: string | null;
+  wecom_channel: WecomChannelState | null;
 }
 
 export interface ApplicationDeploymentEvent {
   id: string;
   application_id: string;
-  channel_type: "api";
+  channel_type: "api" | "wecom";
   action: "deploy" | "enable" | "disable";
   previous_release_id: string | null;
   release_id: string | null;
@@ -473,6 +515,8 @@ export interface ConversationRecord {
   updated_at: string;
   last_message_at: string | null;
   message_count: number;
+  channel: "console" | "api" | "wecom";
+  external_user_id: string | null;
 }
 
 export interface ConversationMessageRecord {

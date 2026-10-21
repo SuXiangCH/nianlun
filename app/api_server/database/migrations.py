@@ -12,7 +12,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -24,7 +24,7 @@ def _record_current_schema(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO schema_migrations(version, name, applied_at)
-        VALUES (?, 'llm_vision_capability', CURRENT_TIMESTAMP)
+        VALUES (?, 'wecom_channel', CURRENT_TIMESTAMP)
         """,
         (SCHEMA_VERSION,),
     )
@@ -544,6 +544,93 @@ def _migrate_release_descriptions(connection: sqlite3.Connection) -> None:
         )
 
 
+def _rebuild_conversations_wecom_constraints(
+    connection: sqlite3.Connection,
+) -> None:
+    """Extend the conversation ownership checks with the WeCom channel."""
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversations'"
+    ).fetchone()
+    if table_sql is not None and "'wecom'" in str(table_sql[0]):
+        return
+
+    dependent_definitions = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = 'conversations' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        )
+    ]
+    replacement_metadata = MetaData()
+    Base.metadata.tables["applications"].to_metadata(replacement_metadata)
+    source = Base.metadata.tables["conversations"]
+    replacement = source.to_metadata(replacement_metadata, name="conversations_v13")
+    dialect = sqlite_dialect()
+    connection.execute(str(CreateTable(replacement).compile(dialect=dialect)))
+    columns = ", ".join(f'"{column.name}"' for column in source.columns)
+    connection.execute(
+        f"INSERT INTO conversations_v13 ({columns}) SELECT {columns} FROM conversations"
+    )
+    connection.execute("DROP TABLE conversations")
+    connection.execute("ALTER TABLE conversations_v13 RENAME TO conversations")
+    for definition in dependent_definitions:
+        connection.execute(definition)
+    for index in source.indexes:
+        connection.execute(
+            str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect))
+        )
+
+
+def _rebuild_deployment_event_channel_unique(
+    connection: sqlite3.Connection,
+) -> None:
+    """Make deployment versions independent per channel."""
+    table_sql = connection.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'application_deployment_events'"
+    ).fetchone()
+    if table_sql is not None:
+        definition = str(table_sql[0])
+        if (
+            "channel_type, deployment_version" in definition
+            and "ck_application_deployment_channel_type" in definition
+        ):
+            return
+
+    dependent_definitions = [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE tbl_name = 'application_deployment_events' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        )
+    ]
+    replacement_metadata = MetaData()
+    Base.metadata.tables["applications"].to_metadata(replacement_metadata)
+    source = Base.metadata.tables["application_deployment_events"]
+    replacement = source.to_metadata(
+        replacement_metadata, name="application_deployment_events_v13"
+    )
+    dialect = sqlite_dialect()
+    connection.execute(str(CreateTable(replacement).compile(dialect=dialect)))
+    columns = ", ".join(f'"{column.name}"' for column in source.columns)
+    connection.execute(
+        "INSERT INTO application_deployment_events_v13 "
+        f"({columns}) SELECT {columns} FROM application_deployment_events"
+    )
+    connection.execute("DROP TABLE application_deployment_events")
+    connection.execute(
+        "ALTER TABLE application_deployment_events_v13 "
+        "RENAME TO application_deployment_events"
+    )
+    for definition in dependent_definitions:
+        connection.execute(definition)
+    for index in source.indexes:
+        connection.execute(
+            str(CreateIndex(index, if_not_exists=True).compile(dialect=dialect))
+        )
+
+
 def _require_current_schema(connection: sqlite3.Connection) -> None:
     expected_tables = set(Base.metadata.tables)
     existing_tables = {
@@ -605,6 +692,8 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
         _migrate_parse_chunk_plan(connection)
         _migrate_application_agent_version(connection)
         _migrate_application_api(connection)
+        _rebuild_conversations_wecom_constraints(connection)
+        _rebuild_deployment_event_channel_unique(connection)
         _migrate_release_descriptions(connection)
         _migrate_knowledge_base_llm(connection)
         _migrate_llm_vision_capability(connection)

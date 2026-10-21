@@ -14,6 +14,8 @@ from app.api_server.database import (
 from app.api_server.database import migrations
 from app.api_server.database.models import (
     Application,
+    ApplicationDeploymentEvent,
+    ApplicationWecomChannel,
     Conversation,
     Document,
     KnowledgeBase,
@@ -61,6 +63,8 @@ def test_orm_models_cover_all_business_tables():
         "application_deployment_events",
         "application_api_clients",
         "application_api_keys",
+        "application_wecom_channels",
+        "application_wecom_bot_revisions",
         "application_runs",
         "knowledge_bases",
         "applications",
@@ -100,8 +104,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 12
-    assert versions == {12}
+    assert migrations.SCHEMA_VERSION == 13
+    assert versions == {13}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -270,7 +274,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {12}
+    assert versions == {13}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -332,7 +336,7 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {12}
+    assert versions == {13}
 
 
 def test_schema_migration_replaces_document_hash_constraint_with_partial_index(
@@ -990,4 +994,343 @@ def test_application_delete_cascades_conversations_and_messages(tmp_path):
                 select(MessageSource).where(MessageSource.message_id == "assistant-1")
             )
             is None
+        )
+
+
+def test_wecom_channel_schema_and_constraints(tmp_path):
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    metadata = SQLiteMetadataRepository(factory)
+    now = datetime.now(timezone.utc).isoformat()
+    metadata.put(
+        "applications",
+        "app-2",
+        {
+            "id": "app-2",
+            "name": "第二个应用",
+            "knowledge_base_id": "kb-1",
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+
+    def channel(channel_id: str, application_id: str, **overrides):
+        values = {
+            "id": channel_id,
+            "application_id": application_id,
+            "bot_id": f"bot-{channel_id}",
+            "secret": "secret",
+            "default_response": "fallback",
+            "enabled": False,
+            "active_release_id": None,
+            "deployment_version": 0,
+            "config_revision": 1,
+            "status": "offline",
+            "error_code": None,
+            "expires_at": None,
+            "last_reported_at": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        values.update(overrides)
+        return ApplicationWecomChannel(**values)
+
+    with factory.session_scope(write=True) as session:
+        session.add(channel("wc-1", "app-1"))
+
+    with factory.session_scope() as session:
+        stored = session.get(ApplicationWecomChannel, "wc-1")
+        assert stored is not None
+        assert stored.config_revision == 1
+        assert stored.status == "offline"
+
+    connection = factory.connect()
+    try:
+        conversation_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'conversations'"
+            ).fetchone()[0]
+        )
+        event_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'application_deployment_events'"
+            ).fetchone()[0]
+        )
+        conversation_indexes = {
+            str(row[1])
+            for row in connection.execute('PRAGMA index_list("conversations")')
+        }
+    finally:
+        connection.close()
+    assert "'wecom'" in conversation_sql
+    assert "idx_conversations_channel_peer" in conversation_indexes
+    assert "application_id, channel_type, deployment_version" in event_sql
+
+    for overrides in (
+        {"status": "bogus"},
+        {"status": "error"},
+        {"status": "online", "error_code": "AUTH_FAILED"},
+    ):
+        with pytest.raises(IntegrityError):
+            with factory.session_scope(write=True) as session:
+                session.add(channel("wc-invalid", "app-1", **overrides))
+
+    with pytest.raises(IntegrityError):
+        with factory.session_scope(write=True) as session:
+            session.add(channel("wc-duplicate-bot", "app-2", bot_id="bot-wc-1"))
+
+    with factory.session_scope(write=True) as session:
+        session.add(
+            Conversation(
+                id="conversation-wecom",
+                application_id="app-1",
+                title="群聊",
+                status="active",
+                created_at=now,
+                updated_at=now,
+                channel="wecom",
+                api_client_id=None,
+                external_user_id="wc_" + "a" * 32,
+                release_id="release-1",
+                context_state="ready",
+            )
+        )
+    with pytest.raises(IntegrityError):
+        with factory.session_scope(write=True) as session:
+            session.add(
+                Conversation(
+                    id="conversation-wecom-owner",
+                    application_id="app-1",
+                    title="非法群聊",
+                    status="active",
+                    created_at=now,
+                    updated_at=now,
+                    channel="wecom",
+                    api_client_id="client-1",
+                    external_user_id="wc_" + "b" * 32,
+                    release_id="release-1",
+                    context_state="ready",
+                )
+            )
+
+    def event(event_id: str, channel_type: str, version: int, action: str = "deploy"):
+        return ApplicationDeploymentEvent(
+            id=event_id,
+            application_id="app-1",
+            channel_type=channel_type,
+            action=action,
+            previous_release_id=None,
+            release_id=None,
+            previous_sequence=None,
+            sequence=None,
+            enabled=False,
+            deployment_version=version,
+            created_at=now,
+        )
+
+    with factory.session_scope(write=True) as session:
+        session.add(event("event-api", "api", 1))
+        session.add(event("event-wecom", "wecom", 1))
+    with pytest.raises(IntegrityError):
+        with factory.session_scope(write=True) as session:
+            session.add(event("event-duplicate", "wecom", 1))
+    with pytest.raises(IntegrityError):
+        with factory.session_scope(write=True) as session:
+            session.add(event("event-invalid-channel", "console", 2))
+
+
+def test_wecom_channel_migration_upgrades_v12_schema_repeatably(tmp_path):
+    factory = SQLiteConnectionFactory(tmp_path / "legacy-wecom.sqlite3")
+    now = "2026-01-01T00:00:00+00:00"
+    connection = factory.connect()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            CREATE TABLE applications (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                name VARCHAR NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                knowledge_base_id VARCHAR NOT NULL,
+                model VARCHAR NULL,
+                provider VARCHAR NOT NULL DEFAULT 'default',
+                search_mode VARCHAR NOT NULL DEFAULT 'fts',
+                config_version INTEGER NOT NULL DEFAULT 1,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO applications "
+            "(id, name, knowledge_base_id, created_at, updated_at) "
+            "VALUES ('app-legacy', '旧应用', 'kb-legacy', ?, ?)",
+            (now, now),
+        )
+        connection.execute(
+            """
+            CREATE TABLE conversations (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                application_id VARCHAR NOT NULL,
+                title TEXT NOT NULL,
+                status VARCHAR NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                updated_at VARCHAR(64) NOT NULL,
+                last_message_at VARCHAR(64) NULL,
+                channel VARCHAR NOT NULL DEFAULT 'console',
+                api_client_id VARCHAR NULL,
+                external_user_id VARCHAR NULL,
+                release_id VARCHAR NULL,
+                context_state VARCHAR NOT NULL DEFAULT 'ready',
+                expires_at VARCHAR(64) NULL,
+                CONSTRAINT ck_conversations_status CHECK (
+                    status IN ('active', 'archived', 'deleted')
+                ),
+                CONSTRAINT ck_conversations_channel CHECK (
+                    channel IN ('console', 'api')
+                ),
+                CONSTRAINT ck_conversations_api_owner CHECK (
+                    (channel = 'console' AND api_client_id IS NULL
+                     AND external_user_id IS NULL AND release_id IS NULL) OR
+                    (channel = 'api' AND api_client_id IS NOT NULL
+                     AND external_user_id IS NOT NULL
+                     AND length(trim(external_user_id)) > 0
+                     AND release_id IS NOT NULL)
+                ),
+                CONSTRAINT ck_conversations_context_state CHECK (
+                    context_state IN (
+                        'ready', 'interrupted', 'cleanup_pending', 'expired'
+                    )
+                ),
+                FOREIGN KEY(application_id) REFERENCES applications (id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX idx_conversations_application_updated "
+            "ON conversations(application_id, updated_at DESC)"
+        )
+        connection.execute(
+            "INSERT INTO conversations "
+            "(id, application_id, title, status, created_at, updated_at, channel) "
+            "VALUES ('conversation-legacy', 'app-legacy', '旧会话', 'active', ?, ?, "
+            "'console')",
+            (now, now),
+        )
+        connection.execute(
+            """
+            CREATE TABLE application_deployment_events (
+                id VARCHAR NOT NULL PRIMARY KEY,
+                application_id VARCHAR NOT NULL,
+                channel_type VARCHAR(16) NOT NULL,
+                action VARCHAR(16) NOT NULL,
+                previous_release_id VARCHAR NULL,
+                release_id VARCHAR NULL,
+                previous_sequence INTEGER NULL,
+                sequence INTEGER NULL,
+                enabled BOOLEAN NOT NULL,
+                deployment_version INTEGER NOT NULL,
+                created_at VARCHAR(64) NOT NULL,
+                UNIQUE (application_id, deployment_version),
+                FOREIGN KEY(application_id) REFERENCES applications (id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX ix_application_deployment_events_application_id "
+            "ON application_deployment_events(application_id)"
+        )
+        connection.execute(
+            "INSERT INTO application_deployment_events "
+            "(id, application_id, channel_type, action, enabled, "
+            "deployment_version, created_at) "
+            "VALUES ('event-legacy', 'app-legacy', 'api', 'deploy', 1, 1, ?)",
+            (now,),
+        )
+        connection.execute(
+            """
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_migrations(version, name, applied_at) "
+            "VALUES (12, 'application_api', CURRENT_TIMESTAMP)"
+        )
+        connection.execute("COMMIT")
+    finally:
+        connection.close()
+
+    initialize_database(factory)
+    initialize_database(factory)
+
+    connection = factory.connect()
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        conversation_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'conversations'"
+            ).fetchone()[0]
+        )
+        event_sql = str(
+            connection.execute(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'application_deployment_events'"
+            ).fetchone()[0]
+        )
+        conversation_indexes = {
+            str(row[1])
+            for row in connection.execute('PRAGMA index_list("conversations")')
+        }
+        violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+        versions = {
+            int(row[0])
+            for row in connection.execute("SELECT version FROM schema_migrations")
+        }
+    finally:
+        connection.close()
+
+    assert {"application_wecom_channels", "application_wecom_bot_revisions"} <= tables
+    assert "'wecom'" in conversation_sql
+    assert "application_id, channel_type, deployment_version" in event_sql
+    assert "idx_conversations_channel_peer" in conversation_indexes
+    assert "idx_conversations_application_updated" in conversation_indexes
+    assert violations == []
+    assert versions == {13}
+
+    with factory.session_scope() as session:
+        conversation = session.get(Conversation, "conversation-legacy")
+        event = session.get(ApplicationDeploymentEvent, "event-legacy")
+        assert conversation is not None and conversation.title == "旧会话"
+        assert conversation.channel == "console"
+        assert event is not None and event.channel_type == "api"
+
+    with factory.session_scope(write=True) as session:
+        session.add(
+            ApplicationDeploymentEvent(
+                id="event-wecom",
+                application_id="app-legacy",
+                channel_type="wecom",
+                action="deploy",
+                previous_release_id=None,
+                release_id=None,
+                previous_sequence=None,
+                sequence=None,
+                enabled=True,
+                deployment_version=1,
+                created_at=now,
+            )
         )

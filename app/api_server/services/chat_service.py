@@ -318,11 +318,13 @@ class ChatService:
             if worker.done():
                 worker.result()
 
-    def list_conversations(self, application_id: str) -> list[ConversationResponse]:
+    def list_conversations(
+        self, application_id: str, channel: str = "console"
+    ) -> list[ConversationResponse]:
         self.applications.require_record(application_id)
         return [
             ConversationResponse.model_validate(item)
-            for item in self.repository.list_conversations(application_id)
+            for item in self.repository.list_conversations(application_id, channel)
         ]
 
     def messages(

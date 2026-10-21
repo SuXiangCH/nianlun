@@ -9,6 +9,8 @@ from .publishing import (
     ApplicationDeploymentEvent,
     ApplicationApiClient,
     ApplicationApiKey,
+    ApplicationWecomChannel,
+    ApplicationWecomBotRevision,
 )
 from .documents import Document, DocumentArtifact, DocumentParseTask
 from .knowledge_bases import (
@@ -39,6 +41,8 @@ __all__ = [
     "ApplicationDeploymentEvent",
     "ApplicationApiClient",
     "ApplicationApiKey",
+    "ApplicationWecomChannel",
+    "ApplicationWecomBotRevision",
     "Base",
     "Conversation",
     "Document",

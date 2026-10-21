@@ -54,6 +54,7 @@ app/frontend/node_modules/
 docs/*
 !docs/usage.md
 !docs/application_api.md
+!docs/wecom_channel.md
 !docs/architecture/
 docs/architecture/*
 !docs/architecture/evaluation.md
@@ -62,3 +63,5 @@ docs/architecture/*
 !docs/architecture/document_processing_pipeline_design.md
 !docs/architecture/application_api_publishing_design.md
 !docs/architecture/application_api_publishing_plan.md
+!docs/architecture/wecom_channel_design.md
+!docs/architecture/wecom_channel_plan.md

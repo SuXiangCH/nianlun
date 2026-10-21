@@ -210,12 +210,11 @@ def test_atomic_completion_replay_scope_and_persistent_checkpoint(runtime):
     assert service.prepare(runtime.principal, request, "key").replay == first
     assert len(runtime.calls) == 1
     assert "private/path" not in first.model_dump_json()
-    assert (
-        SQLiteChatRepository(runtime.metadata.factory).get_messages(
-            runtime.app_id, first.conversation_id
-        )
-        is None
+    messages = SQLiteChatRepository(runtime.metadata.factory).get_messages(
+        runtime.app_id, first.conversation_id
     )
+    assert [item["role"] for item in messages] == ["user", "assistant"]
+    assert [item["content"] for item in messages] == ["first", "turn 1"]
     with pytest.raises(ApiError) as error:
         service.prepare(
             runtime.principal, PublicChatRequest(message="changed", user_id="u"), "key"
@@ -961,7 +960,7 @@ def test_real_http_completed_replay_finishes(runtime):
     assert not worker.is_alive()
 
 
-def test_console_repository_cannot_access_api_conversation(tmp_path):
+def test_repository_reads_api_conversation_across_channels(tmp_path):
     from app.api_server.database import SQLiteConnectionFactory, initialize_database
     from app.api_server.database.models import Conversation
     from app.api_server.repositories import SQLiteChatRepository
@@ -1009,7 +1008,10 @@ def test_console_repository_cannot_access_api_conversation(tmp_path):
         )
     repository = SQLiteChatRepository(factory)
     assert repository.list_conversations("app-1") == []
-    assert repository.get_messages("app-1", "api-c") is None
+    api_items = repository.list_conversations("app-1", "api")
+    assert [(item["id"], item["channel"]) for item in api_items] == [("api-c", "api")]
+    assert api_items[0]["external_user_id"] == "user"
+    assert repository.get_messages("app-1", "api-c") == []
     assert not repository.delete_conversation("app-1", "api-c")
     with pytest.raises(ValueError):
         repository.begin_turn(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from collections.abc import AsyncIterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,12 +35,22 @@ from app.api_server.services.application_release_service import (
     ApiPrincipal,
     ApplicationReleaseService,
 )
+from app.api_server.repositories.wecom_channels import WecomChannelRepository
 from app.api_server.services.application_service import ApplicationService
 from nianlun.agent.lead_agent.runtime import iter_agent_stream_events
 from nianlun.agent.middleware import HistoryOverCapacityError
 from nianlun.agent.retrieval_answer.input_messages import validate_public_messages
 
 logger = logging.getLogger(__name__)
+
+_CHANNEL_STREAM_END = object()
+_CHANNEL_MAX_MESSAGE_BYTES = 64 * 1024
+
+
+def checkpoint_thread_id(channel: str, conversation_id: str) -> str:
+    if channel not in {"api", "wecom"}:
+        raise ValueError("unsupported conversation channel")
+    return f"{channel}:{conversation_id}"
 
 
 def _public_clarification(raw: Any) -> PublicClarification | None:
@@ -76,7 +87,11 @@ class PreparedInvocation:
     cancellation: threading.Event | None = None
     started: float = 0.0
     replay: PublicChatResponse | None = None
-    deltas: queue.Queue[str] | None = None
+    deltas: queue.Queue[Any] | None = None
+    channel: str = "api"
+    timeout_seconds: float = 300.0
+    retention_days: int = 30
+    duplicate: bool = False
 
 
 def public_run(
@@ -133,18 +148,20 @@ class ApplicationInvocationService:
             settings,
         )
         self.repository = ApplicationRunRepository(factory)
+        self.channels = WecomChannelRepository(factory)
         self._guard = threading.RLock()
-        self._active: dict[str, tuple[str, str, PreparedInvocation]] = {}
+        self._active: dict[str, tuple[str, str, str, PreparedInvocation]] = {}
         self._rates: dict[str, deque[float]] = {}
         self._closed = False
         self._next_cleanup = time.monotonic() + 60
         self._executor = ThreadPoolExecutor(
-            max_workers=settings.application_api_max_concurrent,
+            max_workers=settings.application_api_max_concurrent
+            + settings.wecom_max_concurrent,
             thread_name_prefix="nianlun-public",
         )
         self._checkpoint_connection: sqlite3.Connection | None = None
         self.checkpointer: SqliteSaver | None = None
-        if settings.application_api_enabled:
+        if settings.application_api_enabled or settings.internal_token is not None:
             path = settings.data_dir / "application_checkpoints.sqlite3"
             missing = not path.exists()
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -249,7 +266,9 @@ class ApplicationInvocationService:
                     checkpoint = self.checkpointer.get_tuple(
                         {
                             "configurable": {
-                                "thread_id": f"api:{body.conversation_id}",
+                                "thread_id": checkpoint_thread_id(
+                                    "api", body.conversation_id
+                                ),
                                 "checkpoint_ns": "",
                             }
                         }
@@ -299,8 +318,11 @@ class ApplicationInvocationService:
                         cancellation=threading.Event(),
                         started=admitted_at,
                         deltas=queue.Queue(maxsize=256) if stream_output else None,
+                        channel="api",
+                        timeout_seconds=self.settings.application_api_timeout_seconds,
+                        retention_days=self.settings.application_api_retention_days,
                     )
-                    self._active[row["id"]] = (app_id, client_id, prepared)
+                    self._active[row["id"]] = (app_id, client_id, "api", prepared)
                     prepared.future = self._executor.submit(
                         self._execute,
                         prepared,
@@ -335,6 +357,284 @@ class ApplicationInvocationService:
                 self.applications.release_runtime_resources(runtime)
                 raise
 
+    @staticmethod
+    def _channel_fingerprint(user_key: str, text: str) -> str:
+        payload = {
+            "message": text,
+            "user_key": user_key,
+            "protocol_version": 1,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
+        ).hexdigest()
+
+    @staticmethod
+    def _valid_user_key(user_key: str) -> bool:
+        return (
+            len(user_key) == 35
+            and user_key.startswith("wc_")
+            and all(character in "0123456789abcdef" for character in user_key[3:])
+        )
+
+    def _channel_record(self, channel_id: str) -> dict[str, Any]:
+        channel = self.channels.by_channel_id(channel_id)
+        if channel is None:
+            raise ApiError("渠道不存在", 404)
+        return channel
+
+    @staticmethod
+    def _validate_channel(channel: dict[str, Any], revision: int) -> None:
+        if not channel["enabled"]:
+            raise ApiError("企业微信渠道已停用", 403)
+        expires_at = channel["expires_at"]
+        if expires_at and datetime.fromisoformat(expires_at) <= datetime.now(
+            timezone.utc
+        ):
+            raise ApiError("企业微信渠道已过期", 403)
+        if channel["config_revision"] != revision:
+            raise ApiError("渠道配置已变化，请重试", 409)
+
+    @staticmethod
+    def _conversation_usable(
+        conversation: dict[str, Any], checkpointer: SqliteSaver
+    ) -> bool:
+        expires_at = conversation["expires_at"]
+        if conversation["context_state"] != "ready":
+            return False
+        if expires_at and datetime.fromisoformat(expires_at) <= datetime.now(
+            timezone.utc
+        ):
+            return False
+        return (
+            checkpointer.get_tuple(
+                {
+                    "configurable": {
+                        "thread_id": checkpoint_thread_id("wecom", conversation["id"]),
+                        "checkpoint_ns": "",
+                    }
+                }
+            )
+            is not None
+        )
+
+    def prepare_channel(
+        self,
+        channel_id: str,
+        revision: int,
+        user_key: str,
+        text: str,
+        key: str,
+        request_id: str | None,
+        started: float,
+    ) -> PreparedInvocation:
+        if not key.strip() or len(key) > 128:
+            raise ApiError("Idempotency-Key 必填且最多 128 字符", 422)
+        if not self._valid_user_key(user_key):
+            raise ApiError("会话标识无效", 422)
+        message = text.strip()
+        if not message:
+            raise ApiError("消息不能为空", 422)
+        if len(message.encode("utf-8")) > _CHANNEL_MAX_MESSAGE_BYTES:
+            raise ApiError("消息过长", 413)
+        channel = self._channel_record(channel_id)
+        app_id = channel["application_id"]
+        client_id = f"wecom:{channel_id}"
+        fingerprint = self._channel_fingerprint(user_key, message)
+        timeout = self.settings.wecom_run_timeout_seconds
+        with self.publishing.entry_lock(app_id):
+            with self._guard:
+                if self._closed or self.checkpointer is None:
+                    raise ApiError("运行服务不可用", 503)
+                if time.monotonic() >= self._next_cleanup:
+                    self.cleanup_expired_checkpoints()
+                    self._next_cleanup = time.monotonic() + 60
+                channel = self._channel_record(channel_id)
+                if channel["application_id"] != app_id:
+                    raise ApiError("渠道不存在", 404)
+                self._validate_channel(channel, revision)
+                existing = self.repository.find(app_id, client_id, user_key, key)
+                if existing:
+                    prepared = self._replay(existing, fingerprint)
+                    prepared.channel = "wecom"
+                    prepared.timeout_seconds = timeout
+                    prepared.retention_days = (
+                        self.settings.wecom_conversation_retention_days
+                    )
+                    prepared.duplicate = prepared.replay is not None
+                    return prepared
+                conversation = self.repository.latest_channel_conversation(
+                    app_id, user_key
+                )
+                conversation_id: str | None = None
+                release = None
+                if conversation is not None:
+                    if self.repository.has_active_run(conversation["id"]):
+                        raise ApiError("会话正忙", 409)
+                    usable = self._conversation_usable(conversation, self.checkpointer)
+                    if usable:
+                        try:
+                            release = self.publishing.require_release(
+                                app_id, conversation["release_id"]
+                            )
+                        except ApiError:
+                            usable = False
+                    if usable:
+                        conversation_id = conversation["id"]
+                    else:
+                        self.repository.interrupt_context(conversation["id"])
+                        self.repository.archive_conversation(conversation["id"])
+                if conversation_id is None:
+                    release_id = channel["active_release_id"]
+                    if not release_id:
+                        raise ApiError("应用尚未发布", 403)
+                    release = self.publishing.require_release(app_id, release_id)
+                assert release is not None
+                self.publishing.validate_release(release.config)
+                knowledge = self.applications.knowledge_base_lookup(
+                    release.config.knowledge_base_id
+                )
+                if not knowledge.get("snapshot_relpath") or not knowledge.get(
+                    "snapshot_manifest_sha256"
+                ):
+                    raise ApiError("知识库 committed snapshot 尚未就绪", 503)
+            record = self.applications.knowledge_base_lookup(
+                release.config.knowledge_base_id
+            )
+            runtime = self.applications.release_runtime(
+                release.config, self.checkpointer, record
+            )
+            prepared: PreparedInvocation | None = None
+            try:
+                if time.monotonic() - started >= timeout:
+                    raise ApiError("调用超时", 504)
+                with self._guard:
+                    if self._closed:
+                        raise ApiError("运行服务不可用", 503)
+                    if self._wecom_limits_exceeded():
+                        raise ApiError(
+                            "企业微信调用超过并发上限",
+                            429,
+                            headers={"Retry-After": "1"},
+                        )
+                    row = self.repository.admit_channel(
+                        app_id=app_id,
+                        channel_id=channel_id,
+                        revision=revision,
+                        user_key=user_key,
+                        release_id=release.id,
+                        conversation_id=conversation_id,
+                        message=message,
+                        key=key,
+                        fingerprint=fingerprint,
+                        content_version=int(record.get("content_version", 0)),
+                        request_id=request_id,
+                        retention_days=self.settings.wecom_conversation_retention_days,
+                    )
+                    prepared = PreparedInvocation(
+                        row=row,
+                        cancellation=threading.Event(),
+                        started=started,
+                        deltas=queue.Queue(maxsize=256),
+                        channel="wecom",
+                        timeout_seconds=timeout,
+                        retention_days=self.settings.wecom_conversation_retention_days,
+                    )
+                    self._active[row["id"]] = (
+                        app_id,
+                        client_id,
+                        "wecom",
+                        prepared,
+                    )
+                    prepared.future = self._executor.submit(
+                        self._execute,
+                        prepared,
+                        runtime,
+                        message,
+                        release.config.clarification_enabled,
+                        None,
+                    )
+                    return prepared
+            except BaseException:
+                if prepared is not None:
+                    with self._guard:
+                        self._active.pop(prepared.row["id"], None)
+                    try:
+                        self.repository.cancel(
+                            prepared.row["id"],
+                            "failed",
+                            502,
+                            "调用未能启动",
+                            exited=True,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "application.submit_failure_cleanup_failed run_id=%s",
+                            prepared.row["id"],
+                            exc_info=True,
+                        )
+                self.applications.release_runtime_resources(runtime)
+                raise
+
+    async def stream_channel(
+        self, prepared: PreparedInvocation
+    ) -> AsyncIterator[dict[str, Any]]:
+        if prepared.duplicate:
+            return
+        identity = {
+            "run_id": prepared.row["id"],
+            "conversation_id": prepared.row["conversation_id"],
+            "release_id": prepared.row["release_id"],
+        }
+        if prepared.replay is not None:
+            yield {"type": "start", **identity}
+            yield {
+                "type": "done",
+                "content": prepared.replay.answer,
+                "run_id": prepared.row["id"],
+            }
+            return
+        task = asyncio.create_task(self.wait(prepared))
+        try:
+            yield {"type": "start", **identity}
+            while not task.done() or (
+                prepared.deltas is not None and not prepared.deltas.empty()
+            ):
+                if prepared.deltas is not None:
+                    try:
+                        item = prepared.deltas.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        if item is _CHANNEL_STREAM_END:
+                            break
+                        yield {"type": "chunk", "content": item}
+                        continue
+                await asyncio.sleep(0.01)
+            result = await task
+            yield {"type": "done", "content": result.answer, "run_id": result.run_id}
+        except ApiError as exc:
+            yield {
+                "type": "error",
+                "code": exc.status_code,
+                "message": exc.message,
+            }
+        except Exception:
+            logger.warning(
+                "application.channel_stream_failed run_id=%s",
+                prepared.row["id"],
+                exc_info=True,
+            )
+            yield {
+                "type": "error",
+                "code": 500,
+                "message": "模型调用失败",
+            }
+        finally:
+            if not task.done():
+                self.cancel(prepared)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
     def _limits_exceeded(self, app_id: str, client_id: str, now: float) -> bool:
         """Prune the rate window and report whether admission would exceed limits.
 
@@ -345,7 +645,7 @@ class ApplicationInvocationService:
             window.popleft()
         if not window:
             self._rates.pop(client_id, None)
-        active = list(self._active.values())
+        active = [item for item in self._active.values() if item[2] == "api"]
         return (
             len(active) >= self.settings.application_api_max_concurrent
             or sum(item[0] == app_id for item in active)
@@ -353,6 +653,13 @@ class ApplicationInvocationService:
             or sum(item[1] == client_id for item in active)
             >= self.settings.application_api_client_concurrent
             or len(window) >= self.settings.application_api_requests_per_minute
+        )
+
+    def _wecom_limits_exceeded(self) -> bool:
+        """WeCom runs have their own global budget and no per-caller RPM window."""
+        return (
+            sum(item[2] == "wecom" for item in self._active.values())
+            >= self.settings.wecom_max_concurrent
         )
 
     def _execute(
@@ -364,12 +671,13 @@ class ApplicationInvocationService:
         input_messages: list[dict[str, str]] | None = None,
     ) -> PublicChatResponse:
         row = prepared.row
+        thread_id = checkpoint_thread_id(prepared.channel, row["conversation_id"])
         try:
             raw = None
             events = (
                 runtime.iter_public_events(
                     input_messages,
-                    thread_id=f"api:{row['conversation_id']}",
+                    thread_id=thread_id,
                     clarification_enabled=clarification_enabled,
                     cancellation_event=prepared.cancellation,
                 )
@@ -377,7 +685,7 @@ class ApplicationInvocationService:
                 else iter_agent_stream_events(
                     runtime,
                     message,
-                    thread_id=f"api:{row['conversation_id']}",
+                    thread_id=thread_id,
                     clarification_enabled=clarification_enabled,
                     cancellation_event=prepared.cancellation,
                 )
@@ -431,7 +739,7 @@ class ApplicationInvocationService:
                 row["id"],
                 response.model_dump(mode="json"),
                 raw,
-                self.settings.application_api_retention_days,
+                prepared.retention_days,
             ):
                 raise ApiError("调用已终止", 409)
             return response
@@ -477,18 +785,27 @@ class ApplicationInvocationService:
             try:
                 self.applications.release_runtime_resources(runtime)
             finally:
-                with self._guard:
-                    self._active.pop(row["id"], None)
-                if input_messages is not None and self.checkpointer is not None:
-                    # Caller-owned transcripts are stateless: reclaim the thread so
-                    # repeated calls cannot accumulate checkpoints on disk.
-                    try:
-                        self.checkpointer.delete_thread(f"api:{row['conversation_id']}")
-                    except sqlite3.Error:
-                        logger.warning(
-                            "application.ephemeral_checkpoint_cleanup_failed conversation_id=%s",
-                            row["conversation_id"],
-                        )
+                try:
+                    with self._guard:
+                        self._active.pop(row["id"], None)
+                    if input_messages is not None and self.checkpointer is not None:
+                        # Caller-owned transcripts are stateless: reclaim the thread so
+                        # repeated calls cannot accumulate checkpoints on disk.
+                        try:
+                            self.checkpointer.delete_thread(thread_id)
+                        except sqlite3.Error:
+                            logger.warning(
+                                "application.ephemeral_checkpoint_cleanup_failed conversation_id=%s",
+                                row["conversation_id"],
+                            )
+                finally:
+                    # Channel streaming waits on this marker instead of polling the
+                    # shared queue; public SSE consumers never receive it.
+                    if prepared.channel == "wecom" and prepared.deltas is not None:
+                        try:
+                            prepared.deltas.put_nowait(_CHANNEL_STREAM_END)
+                        except queue.Full:
+                            pass
 
     def cancel(self, prepared: PreparedInvocation, *, timed_out: bool = False) -> None:
         if prepared.cancellation is not None:
@@ -508,9 +825,7 @@ class ApplicationInvocationService:
         if prepared.replay is not None:
             return prepared.replay
         assert prepared.future is not None
-        remaining = self.settings.application_api_timeout_seconds - (
-            time.monotonic() - prepared.started
-        )
+        remaining = prepared.timeout_seconds - (time.monotonic() - prepared.started)
         future = asyncio.wrap_future(prepared.future)
 
         def observe_completion(completed: asyncio.Future[PublicChatResponse]) -> None:
@@ -576,9 +891,11 @@ class ApplicationInvocationService:
         self.applications.delete(application_id)
         if self.checkpointer is None:
             return
-        for conversation_id in conversation_ids:
+        for conversation_id, channel in conversation_ids:
             try:
-                self.checkpointer.delete_thread(f"api:{conversation_id}")
+                self.checkpointer.delete_thread(
+                    checkpoint_thread_id(channel, conversation_id)
+                )
             except sqlite3.Error:
                 logger.warning(
                     "application.checkpoint_cleanup_failed conversation_id=%s",
@@ -589,9 +906,14 @@ class ApplicationInvocationService:
         if self.checkpointer is None:
             return
         with self._guard:
-            for conversation_id in self.repository.checkpoint_cleanup_candidates():
+            for (
+                conversation_id,
+                channel,
+            ) in self.repository.checkpoint_cleanup_candidates():
                 try:
-                    self.checkpointer.delete_thread(f"api:{conversation_id}")
+                    self.checkpointer.delete_thread(
+                        checkpoint_thread_id(channel, conversation_id)
+                    )
                 except sqlite3.Error:
                     logger.warning(
                         "application.checkpoint_cleanup_failed conversation_id=%s",
@@ -609,7 +931,7 @@ class ApplicationInvocationService:
     def close(self) -> None:
         with self._guard:
             self._closed = True
-            pending = [item[2] for item in self._active.values()]
+            pending = [item[3] for item in self._active.values()]
         for prepared in pending:
             self.cancel(prepared)
         self._executor.shutdown(wait=True)

@@ -8,6 +8,14 @@ export const versionError = (error: unknown): string => error instanceof Error ?
 const date = (value: string): string => new Date(value).toLocaleString();
 const mergeVersions = (items: ApplicationRelease[]): ApplicationRelease[] => Array.from(new Map(items.map((item) => [item.id, item])).values()).sort((a, b) => b.sequence - a.sequence);
 
+export interface ReleaseChannel {
+  type: "api" | "wecom";
+  active: ApplicationRelease | null;
+  enabled: boolean;
+  canPublish: boolean;
+}
+const channelLabel = (channel: ReleaseChannel): string => channel.type === "api" ? "API" : "企业微信";
+
 export function useReleaseOptions(appId: string, seed: ApplicationRelease | null) {
   const [items, setItems] = useState<ApplicationRelease[]>(seed ? [seed] : []);
   const [offset, setOffset] = useState(0);
@@ -53,13 +61,14 @@ export function VersionSettings({ config, previous, knowledgeBases }: { config: 
   })}</dl>;
 }
 
-export function VersionDetail({ app, release, active, knowledgeBases, onClose, onRestored }: { app: Application; release: ApplicationRelease; active: ApplicationRelease | null; knowledgeBases: KnowledgeBase[]; onClose: () => void; onRestored: (app: Application) => void }) {
+export function VersionDetail({ app, release, channels, knowledgeBases, onClose, onRestored }: { app: Application; release: ApplicationRelease; channels: ReleaseChannel[]; knowledgeBases: KnowledgeBase[]; onClose: () => void; onRestored: (app: Application) => void }) {
   const options = useReleaseOptions(app.id, release);
-  const [compareId, setCompareId] = useState(active && active.id !== release.id ? active.id : "");
+  const activeReleases = channels.flatMap((channel) => channel.active ? [channel.active] : []);
+  const [compareId, setCompareId] = useState(activeReleases.find((item) => item.id !== release.id)?.id || "");
   const [confirmRestore, setConfirmRestore] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const compare = options.items.find((item) => item.id === compareId) || (active?.id === compareId ? active : null);
+  const compare = options.items.find((item) => item.id === compareId) || activeReleases.find((item) => item.id === compareId);
   const restore = async () => {
     setBusy(true); setError("");
     try { onRestored(await api.restoreRelease(app.id, release.id, app.config_version ?? 1)); }
@@ -68,9 +77,9 @@ export function VersionDetail({ app, release, active, knowledgeBases, onClose, o
   };
   return <Modal title={`版本 r${release.sequence}`} description="" onClose={() => { if (!busy) onClose(); }}>
     <div className="application-version-detail">
-      <div className="application-version-meta"><span>{date(release.created_at)}</span>{release.id === active?.id && <span className="application-state is-live">API 使用中</span>}</div>
+      <div className="application-version-meta"><span>{date(release.created_at)}</span>{channels.filter((channel) => channel.active?.id === release.id).map((channel) => <span key={channel.type} className={`application-state ${channel.enabled ? "is-live" : ""}`}>{channelLabel(channel)}{channel.enabled ? " 使用中" : " · 停用"}</span>)}</div>
       {release.description && <p className="application-version-description">{release.description}</p>}
-      <label className="application-version-compare"><GitCompareArrows size={16} /><span>比较版本</span><select aria-label="比较版本" disabled={busy} value={compareId} onChange={(event) => setCompareId(event.target.value)}><option value="">仅查看配置</option>{mergeVersions([...options.items, ...(active ? [active] : [])]).filter((item) => item.id !== release.id).map((item) => <option key={item.id} value={item.id}>r{item.sequence}{active?.id === item.id ? " · API 当前版本" : ""}</option>)}</select></label>
+      <label className="application-version-compare"><GitCompareArrows size={16} /><span>比较版本</span><select aria-label="比较版本" disabled={busy} value={compareId} onChange={(event) => setCompareId(event.target.value)}><option value="">仅查看配置</option>{mergeVersions([...options.items, ...activeReleases]).filter((item) => item.id !== release.id).map((item) => <option key={item.id} value={item.id}>r{item.sequence}{channels.filter((channel) => channel.active?.id === item.id).map((channel) => ` · ${channelLabel(channel)} 当前版本`).join("")}</option>)}</select></label>
       {options.hasMore && <button className="application-text-button" type="button" disabled={options.loading} onClick={options.loadMore}>加载更多版本</button>}
       {options.error && <p className="application-error" role="alert">{options.error}<button type="button" className="quiet-button" onClick={options.retry}>重试</button></p>}
       {compare && <p className="application-comparison-label">r{compare.sequence}<ArrowRight size={13} />r{release.sequence}</p>}
@@ -99,23 +108,21 @@ function CreateVersion({ app, onClose, onCreated }: { app: Application; onClose:
 interface Props {
   app: Application;
   page: ApplicationPage<ApplicationRelease>;
-  active: ApplicationRelease | null;
+  channels: ReleaseChannel[];
   knowledgeBases: KnowledgeBase[];
   loading: boolean;
   canCreate: boolean;
-  canPublish: boolean;
-  enabled: boolean;
   draftDirty: boolean;
   createDisabledReason: string;
   offset: number;
   onOffset: (offset: number) => void;
   onCreated: () => void;
   onEditDraft: () => void;
-  onPublish: (release: ApplicationRelease) => void;
+  onPublish: (release: ApplicationRelease, channel: ReleaseChannel["type"]) => void;
   onRestored: (app: Application) => void;
 }
 
-export function ApplicationVersions({ app, page, active, knowledgeBases, loading, canCreate, canPublish, enabled, draftDirty, createDisabledReason, offset, onOffset, onCreated, onEditDraft, onPublish, onRestored }: Props) {
+export function ApplicationVersions({ app, page, channels, knowledgeBases, loading, canCreate, draftDirty, createDisabledReason, offset, onOffset, onCreated, onEditDraft, onPublish, onRestored }: Props) {
   const [creating, setCreating] = useState(false);
   const [viewing, setViewing] = useState<ApplicationRelease | null>(null);
   return <div role="tabpanel" id="application-panel-history" aria-labelledby="application-tab-history" className="application-versions">
@@ -125,9 +132,14 @@ export function ApplicationVersions({ app, page, active, knowledgeBases, loading
       <div className="application-version-draft-actions"><button className="icon-button" type="button" title="编辑草稿" aria-label="编辑草稿" disabled={loading} onClick={onEditDraft}><Pencil size={16} /></button><button className="outline-button" type="button" disabled={!canCreate || loading} title={!canCreate ? createDisabledReason : undefined} onClick={() => setCreating(true)}><Plus size={15} />创建版本</button></div>
     </div>
     <div className="application-section-heading"><h3>版本记录</h3><span className="application-muted">{page.total} 个版本</span></div>
-    {page.items.length ? <div className="application-table-wrap"><table className="application-table application-version-table"><thead><tr><th>版本</th><th>版本说明</th><th>创建时间</th><th>使用渠道</th><th>操作</th></tr></thead><tbody>{page.items.map((release) => <tr key={release.id}><td><button className="application-version-link" type="button" onClick={() => setViewing(release)}>r{release.sequence}</button></td><td><span className="application-version-description">{release.description || "—"}</span><small className="application-secondary">{release.config.model} · {release.config.agent_version}</small></td><td className="application-muted">{date(release.created_at)}</td><td>{active?.id === release.id ? <span className={`application-state ${enabled ? "is-live" : ""}`}>API{!enabled ? " · 停用" : ""}</span> : <span className="application-muted">未使用</span>}</td><td><div className="application-version-actions"><button className="icon-button" type="button" title="查看与比较配置" aria-label={`查看 r${release.sequence}`} onClick={() => setViewing(release)}><Eye size={16} /></button><button className="application-text-button" type="button" aria-label={`发布 r${release.sequence}`} disabled={!canPublish || loading || active?.id === release.id} title={active?.id === release.id ? "渠道已使用此版本" : !canPublish ? "请先创建发布渠道" : undefined} onClick={() => onPublish(release)}><Upload size={14} />发布</button></div></td></tr>)}</tbody></table></div> : !loading && <p className="application-version-empty">尚未创建版本</p>}
+    {page.items.length ? <div className="application-table-wrap"><table className="application-table application-version-table"><thead><tr><th>版本</th><th>版本说明</th><th>创建时间</th><th>使用渠道</th><th>操作</th></tr></thead><tbody>{page.items.map((release) => {
+      const usages = channels.filter((channel) => channel.active?.id === release.id);
+      const target = channels.find((channel) => channel.canPublish && channel.active?.id !== release.id);
+      const disabledReason = !channels.length ? "请先创建发布渠道" : channels.every((channel) => channel.active?.id === release.id) ? "渠道已使用此版本" : "暂无可发布的渠道";
+      return <tr key={release.id}><td><button className="application-version-link" type="button" onClick={() => setViewing(release)}>r{release.sequence}</button></td><td><span className="application-version-description">{release.description || "—"}</span><small className="application-secondary">{release.config.model} · {release.config.agent_version}</small></td><td className="application-muted">{date(release.created_at)}</td><td>{usages.length ? usages.map((channel) => <span key={channel.type} className={`application-state ${channel.enabled ? "is-live" : ""}`}>{channelLabel(channel)}{!channel.enabled ? " · 停用" : ""}</span>) : <span className="application-muted">未使用</span>}</td><td><div className="application-version-actions"><button className="icon-button" type="button" title="查看与比较配置" aria-label={`查看 r${release.sequence}`} onClick={() => setViewing(release)}><Eye size={16} /></button><button className="application-text-button" type="button" aria-label={`发布 r${release.sequence}`} disabled={!target || loading} title={!target ? disabledReason : undefined} onClick={() => { if (target) onPublish(release, target.type); }}><Upload size={14} />发布</button></div></td></tr>;
+    })}</tbody></table></div> : !loading && <p className="application-version-empty">尚未创建版本</p>}
     {page.total > 20 && <div className="application-pagination"><span>共 {page.total} 个 · 第 {Math.floor(offset / 20) + 1} 页</span><button className="icon-button" type="button" title="上一页" aria-label="上一页" disabled={loading || offset === 0} onClick={() => onOffset(offset - 20)}><ChevronLeft size={16} /></button><button className="icon-button" type="button" title="下一页" aria-label="下一页" disabled={loading || offset + 20 >= page.total} onClick={() => onOffset(offset + 20)}><ChevronRight size={16} /></button></div>}
     {creating && <CreateVersion app={app} onClose={() => setCreating(false)} onCreated={() => { setCreating(false); onCreated(); }} />}
-    {viewing && <VersionDetail app={app} release={viewing} active={active} knowledgeBases={knowledgeBases} onClose={() => setViewing(null)} onRestored={(next) => { setViewing(null); onRestored(next); }} />}
+    {viewing && <VersionDetail app={app} release={viewing} channels={channels} knowledgeBases={knowledgeBases} onClose={() => setViewing(null)} onRestored={(next) => { setViewing(null); onRestored(next); }} />}
   </div>;
 }
