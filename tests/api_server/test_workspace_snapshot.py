@@ -210,9 +210,7 @@ def test_uncommitted_snapshot_is_quarantined_to_free_its_version_slot(
     uncommitted.mkdir()
     (uncommitted / "manifest.json").write_text("{}", encoding="utf-8")
 
-    quarantine_uncommitted_snapshot(
-        repository, workspace, "kb-1", 1
-    )
+    quarantine_uncommitted_snapshot(repository, workspace, "kb-1", 1)
 
     assert not uncommitted.exists()
     assert list((workspace / "snapshots").glob(".orphan-r1-*"))
@@ -228,7 +226,10 @@ def test_startup_quarantines_fresh_untracked_snapshot_before_retention(
     untracked.mkdir()
     (untracked / "manifest.json").write_text("{}", encoding="utf-8")
 
-    assert reconcile_knowledge_base_workspace(repository, "kb-1", workspace, now=NOW) == "ok"
+    assert (
+        reconcile_knowledge_base_workspace(repository, "kb-1", workspace, now=NOW)
+        == "ok"
+    )
 
     assert not untracked.exists()
     assert list((workspace / "snapshots").glob(".orphan-r1-*"))
@@ -818,19 +819,21 @@ def test_generation_artifact_gc_respects_current_task_and_allocation_refs(
             "updated_at": NOW,
         }
     )
-    repository.create_parse_task(
-        {
-            "id": "parse-g3",
-            "document_id": "doc-1",
-            "attempt": 1,
-            "pipeline_generation": 3,
-            "data_id": "doc-1:g3:c0000",
-            "model_version": "vlm",
-            "state": "pending",
-            "created_at": NOW,
-            "updated_at": NOW,
-        }
-    )
+    # Seed a legacy cross-generation reference that new task creation rejects.
+    with repository.factory.session_scope(write=True) as session:
+        session.add(
+            DocumentParseTask(
+                id="parse-g3",
+                document_id="doc-1",
+                attempt=1,
+                pipeline_generation=3,
+                data_id="doc-1:g3:c0000",
+                model_version="vlm",
+                state="pending",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
     assert repository.reserve_staging_bytes(
         document_id="doc-1",
         pipeline_generation=4,

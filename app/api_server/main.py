@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -25,7 +26,11 @@ from app.api_server.common.errors import (
 from app.api_server.common.logging import configure_logging
 from app.api_server.config import ApiServerSettings, get_settings
 from app.api_server.middleware import RequestTrackingMiddleware
-from app.api_server.services.container import ApiServices, build_services
+from app.api_server.services.container import (
+    ApiServices,
+    build_services,
+    shutdown_services,
+)
 from nianlun import __version__
 
 
@@ -45,15 +50,20 @@ def create_app(
         try:
             yield
         finally:
-            invocations = getattr(active_services, "invocations", None)
-            if invocations is not None:
-                invocations.close()
-            for service_name in ("chat", "documents", "fts", "vector"):
-                service = getattr(active_services, service_name)
-                try:
-                    service.shutdown()
-                except Exception:
-                    logger.exception("service.shutdown_failed service=%s", service_name)
+            shutdown_services(active_services)
+
+    try:
+        return _configure_app(active_settings, active_services, lifespan)
+    except BaseException:
+        shutdown_services(active_services)
+        raise
+
+
+def _configure_app(
+    active_settings: ApiServerSettings,
+    active_services: ApiServices,
+    lifespan: Any,
+) -> FastAPI:
 
     configure_logging(active_settings.log_level)
     app = FastAPI(title="Nianlun API", version=__version__, lifespan=lifespan)
@@ -69,6 +79,7 @@ def create_app(
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=["Location", "X-Request-Id"],
     )
     app.add_middleware(RequestTrackingMiddleware)
     app.add_middleware(InternalNoStoreMiddleware)
@@ -84,7 +95,7 @@ if __name__ == "__main__":
     import uvicorn
 
     settings = get_settings()
-    uvicorn.run(app, host=settings.host, port=settings.port)
+    uvicorn.run(app, host=settings.host, port=settings.port, access_log=False)
 
 
 __all__ = ["app", "create_app"]

@@ -400,7 +400,7 @@ async def recover_heading_levels_with_llm(
     for attempt in range(1, attempts + 1):
         try:
             response = await asyncio.wait_for(
-                llm.ainvoke(prompt, temperature=0),
+                llm.ainvoke(prompt),
                 resolved_config.llm_timeout_seconds,
             )
         except Exception as error:

@@ -1,8 +1,11 @@
 export type View = "chat" | "knowledge" | "applications" | "models";
 export type KnowledgeBaseStatus = "creating" | "ready" | "indexing" | "error";
 export type AgentVersion = "v0" | "v1";
+export type ReasoningEffort = "low" | "medium" | "high";
+export type ReasoningEffortOverride = ReasoningEffort | "inherit" | "default";
 
 export interface Application {
+  reasoning_effort?: ReasoningEffortOverride;
   id: string;
   name: string;
   description: string;
@@ -20,6 +23,7 @@ export interface Application {
 }
 
 export interface ApplicationUpdateRequest {
+  reasoning_effort?: ReasoningEffortOverride;
   expected_config_version: number;
   name: string;
   description: string;
@@ -42,6 +46,8 @@ export interface ApplicationRelease {
 }
 
 export interface PublishedApplicationConfig {
+  sampling_config_version?: 1 | 2;
+  reasoning_effort?: ReasoningEffort | null;
   schema_version: 1;
   application_id: string;
   agent_version: AgentVersion;
@@ -53,7 +59,7 @@ export interface PublishedApplicationConfig {
   knowledge_base_id: string;
   knowledge_update_policy: "latest_committed";
   clarification_enabled: boolean;
-  temperature: number;
+  temperature: number | null;
   thinking: boolean | null;
   loop_guard: {
     enabled: boolean;
@@ -201,7 +207,20 @@ export interface PublicChatResponse {
 
 export interface ApplicationPage<T> { items: T[]; total: number; }
 
+export interface KnowledgeBaseTreeBuildOptions {
+  subtree_folding_enabled: boolean;
+  min_subtree_tokens: number;
+}
+
+export interface KnowledgeBaseParserOptions {
+  is_ocr: boolean | null;
+  enable_table: boolean | null;
+  enable_formula: boolean | null;
+  language: string | null;
+}
+
 export interface KnowledgeBase {
+  reasoning_effort?: ReasoningEffortOverride;
   id: string;
   name: string;
   description: string;
@@ -209,6 +228,9 @@ export interface KnowledgeBase {
   document_count: number;
   summary_enabled: boolean;
   heading_recovery_enabled: boolean;
+  subtree_folding_enabled: boolean;
+  min_subtree_tokens: number | null;
+  parser_options: KnowledgeBaseParserOptions;
   llm_model_id: string | null;
   workspace_dir: string;
   workspace_relpath: string | null;
@@ -325,6 +347,23 @@ export interface DocumentIndexTree {
   structure: DocumentIndexNode[];
 }
 
+export interface DocumentPreviewImage {
+  id: string;
+  caption: string;
+  status: "available" | "unavailable";
+  url: string | null;
+  width: number | null;
+  height: number | null;
+  orientation: number;
+}
+
+export interface DocumentPreview {
+  content: string;
+  rendered_content: string;
+  content_version: number;
+  images: DocumentPreviewImage[];
+}
+
 export interface BatchUploadFileResult {
   filename: string;
   ok: boolean;
@@ -342,6 +381,8 @@ export interface BatchUploadResult {
 export type ModelTestTarget = "llm" | "embedding" | "parser";
 
 export interface ModelConfigTestRequest {
+  temperature?: number | null;
+  reasoning_effort?: ReasoningEffort | null;
   target: ModelTestTarget;
   model?: string | null;
   base_url?: string | null;
@@ -365,6 +406,8 @@ export interface ModelConfigTestResult {
 export type ModelKind = ModelTestTarget;
 
 export interface ModelProfile {
+  temperature?: number | null;
+  reasoning_effort?: ReasoningEffort | null;
   id: string;
   kind: ModelKind;
   name: string;
@@ -388,6 +431,8 @@ export interface ModelProfile {
 }
 
 export interface ModelProfileRequest {
+  temperature?: number | null;
+  reasoning_effort?: ReasoningEffort | null;
   kind: ModelKind;
   name: string;
   model: string | null;
@@ -408,6 +453,7 @@ export interface ModelProfileRequest {
 }
 
 export interface SourceSnippet {
+  image_attachment_ids?: string[];
   message_id?: string;
   source_order?: number;
   citation_id?: number;
@@ -456,7 +502,27 @@ export type AgentTraceStep =
   | { kind: "status"; event: string; message: string }
   | { kind: "agent_message"; message: string; round?: number; transitionName?: string };
 
+export interface AnswerImageAttachment {
+  id: string;
+  ref_ids: string[];
+  citation_ids: number[];
+  caption: string;
+  display_in_answer: boolean;
+  status: "available" | "unavailable" | "deleted";
+  unavailable_reason: string | null;
+  media_type: "image/png" | "image/jpeg" | "image/webp" | null;
+  size_bytes: number | null;
+  width: number | null;
+  height: number | null;
+  orientation: number;
+  url: string | null;
+}
+
 export interface ChatDoneEvent {
+  images?: AnswerImageAttachment[];
+  answer_format_version?: 1 | 2;
+  answer_output_mode?: "text" | "images" | "text_and_images";
+  image_previews_unavailable?: number;
   app_id: string;
   conversation_id: string;
   message_id: string;
@@ -479,6 +545,10 @@ export interface ClarificationRequest {
 }
 
 export interface ChatMessage {
+  images?: AnswerImageAttachment[];
+  answer_format_version?: 1 | 2;
+  answer_output_mode?: "text" | "images" | "text_and_images";
+  image_previews_unavailable?: number;
   id: string;
   // Server-persisted message id. During streaming `id` stays the stable
   // client-side placeholder (so React does not remount the bubble when the
@@ -520,6 +590,10 @@ export interface ConversationRecord {
 }
 
 export interface ConversationMessageRecord {
+  images?: AnswerImageAttachment[];
+  answer_format_version?: 1 | 2;
+  answer_output_mode?: "text" | "images" | "text_and_images";
+  image_previews_unavailable?: number;
   id: string;
   conversation_id: string;
   seq_no: number;

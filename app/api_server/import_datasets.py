@@ -23,7 +23,7 @@ from typing import Any
 
 from app.api_server.apis.v1.schemas import KnowledgeBaseCreateRequest
 from app.api_server.config import ApiServerSettings, get_settings
-from app.api_server.services.container import build_services
+from app.api_server.services.container import build_services, shutdown_services
 
 FTS_WAIT_TIMEOUT_SECONDS = 600
 
@@ -99,6 +99,18 @@ def main(
 
     settings = settings or get_settings()
     services = build_services(settings)
+    try:
+        return _import_datasets(settings, services, args, datasets_dir)
+    finally:
+        shutdown_services(services)
+
+
+def _import_datasets(
+    settings: ApiServerSettings,
+    services: Any,
+    args: argparse.Namespace,
+    datasets_dir: Path,
+) -> int:
 
     kb = _find_knowledge_base(services, args.knowledge_base)
     if kb is None:

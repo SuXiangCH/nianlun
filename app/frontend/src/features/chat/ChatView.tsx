@@ -1,17 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
-import "katex/dist/katex.min.css";
 import { api } from "../../api/client";
 import { parseSse } from "../../api/sse";
 import type { AgentTraceStep, Application, ChatDoneEvent, ChatMessage, ClarificationRequest, ConversationMessageRecord, ConversationSummary, SourceSnippet, TokenUsage, ToolCall } from "../../types";
-import { normalizeHtmlTables } from "./markdown";
+import { AnswerMarkdown as MarkdownContent, ImagePreviewNotice, SourceImages } from "./AnswerMarkdown";
+import { imageSafeStreamingText } from "./markdown";
 
 interface ChatViewProps { apps: Application[]; selectedAppId: string; onSelectApp: (id: string) => void; onNewConversation: () => void; resetToken: number; conversationId: string; onConversationId: (id: string) => void; toast: (message: string, error?: boolean) => void; }
-interface MarkdownAstNode { type: string; value?: string; url?: string; data?: { hProperties?: Record<string, unknown> }; children?: MarkdownAstNode[]; }
 const sourceName = (source: SourceSnippet) => String(source.title || source.doc_name || source.document_name || source.filename || source.source || "知识库片段");
 const sourceText = (source: SourceSnippet) => String(source.text || source.retrieved_text || source.content || source.snippet || source.page_content || "暂无片段内容");
 const sourceLocation = (source: SourceSnippet): string => String(source.doc_name || source.document_name || source.filename || source.path || source.heading || source.chunk_id || source.doc_id || source.id || "知识库");
@@ -20,52 +15,7 @@ const sourceCitation = (source: SourceSnippet, index: number): number => {
   if (Number.isInteger(source.source_order) && Number(source.source_order) >= 0) return Number(source.source_order) + 1;
   return index + 1;
 };
-const remarkCitationLinks = () => (tree: MarkdownAstNode): void => {
-  const visit = (node: MarkdownAstNode, protectedNode = false): void => {
-    if (!node.children) return;
-    const nextChildren: MarkdownAstNode[] = [];
-    const protectsChildren = protectedNode || node.type === "link" || node.type === "code" || node.type === "inlineCode";
-    for (const child of node.children) {
-      if (child.type !== "text" || protectsChildren || !child.value) {
-        visit(child, protectsChildren);
-        nextChildren.push(child);
-        continue;
-      }
-      const pattern = /\[(\d+)\]/g;
-      let cursor = 0;
-      let match: RegExpExecArray | null;
-      while ((match = pattern.exec(child.value)) !== null) {
-        if (match.index > cursor) nextChildren.push({ type: "text", value: child.value.slice(cursor, match.index) });
-        const citationId = Number(match[1]);
-        nextChildren.push({
-          type: "link",
-          url: `#citation-${citationId}`,
-          data: { hProperties: { className: ["citation-link"], "data-citation-id": citationId, title: `查看来源 [${citationId}]` } },
-          children: [{ type: "text", value: match[0] }],
-        });
-        cursor = pattern.lastIndex;
-      }
-      if (cursor === 0) nextChildren.push(child);
-      else if (cursor < child.value.length) nextChildren.push({ type: "text", value: child.value.slice(cursor) });
-    }
-    node.children = nextChildren;
-  };
-  visit(tree);
-};
 const chatStorageKey = (applicationId: string, conversationId: string) => `nianlun.chat.${applicationId}.${conversationId}`;
-const MarkdownContent = ({ text, className, onCitationClick }: { text: string; className: string; onCitationClick?: (citationId: number) => void }) => (
-  <div className={className} onClick={(event) => {
-    if (!onCitationClick || !(event.target instanceof Element)) return;
-    const link = event.target.closest<HTMLAnchorElement>("a.citation-link");
-    if (!link) return;
-    const citationId = Number(link.dataset.citationId);
-    if (!Number.isInteger(citationId) || citationId <= 0) return;
-    event.preventDefault();
-    onCitationClick(citationId);
-  }}>
-    <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath, ...(onCitationClick ? [remarkCitationLinks] : [])]} rehypePlugins={[rehypeKatex]}>{normalizeHtmlTables(text)}</ReactMarkdown>
-  </div>
-);
 const readStoredChat = (applicationId: string, conversationId: string): { messages: ChatMessage[]; sources: SourceSnippet[] } | null => {
   if (!applicationId || !conversationId) return null;
   const storageKey = chatStorageKey(applicationId, conversationId);
@@ -80,7 +30,7 @@ const readStoredChat = (applicationId: string, conversationId: string): { messag
             ...message,
             pending: false,
             error: true,
-            text: message.text || "回答未完成，请重试",
+            text: imageSafeStreamingText(message.text || "回答未完成，请重试"),
           };
         }
         return { ...message, pending: false };
@@ -108,6 +58,10 @@ const mapMessage = (item: ConversationMessageRecord): ChatMessage => ({
   usage: item.usage ?? null,
   ttft_ms: item.ttft_ms ?? null,
   sources: item.sources || [],
+  images: item.images || [],
+  answer_format_version: item.answer_format_version ?? 1,
+  answer_output_mode: item.answer_output_mode ?? "text",
+  image_previews_unavailable: item.image_previews_unavailable ?? 0,
 });
 const TOOL_LABELS: Record<string, string> = {
   search_across_docs: "搜索知识库",
@@ -648,7 +602,7 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
       current.flatMap((message) => {
         if (message.pending && message.role === "assistant") {
           const trace = message.trace || [];
-          return message.text || trace.length ? [{ ...message, trace, pending: false, stopped: true }] : [];
+          return message.text || trace.length ? [{ ...message, text: imageSafeStreamingText(message.text), trace, pending: false, stopped: true }] : [];
         }
         return [message];
       }),
@@ -770,7 +724,7 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
           // server id separately — swapping `id` here would remount the whole
           // bubble (replaying trace animations and re-typesetting markdown)
           // the moment the answer completes.
-          const completedAssistant: ChatMessage = { id: assistantId, server_id: completedMessageId, role: "assistant", text: done.answer || "", pending: false, tool_calls: done.tool_calls ?? null, trace: completedTrace, keepTraceOpen: true, streamRound: null, streamTransitionName: null, usage: done.usage ?? null, ttft_ms: done.ttft_ms ?? null, sources: nextSources };
+          const completedAssistant: ChatMessage = { id: assistantId, server_id: completedMessageId, role: "assistant", text: done.answer || "", pending: false, tool_calls: done.tool_calls ?? null, trace: completedTrace, keepTraceOpen: true, streamRound: null, streamTransitionName: null, usage: done.usage ?? null, ttft_ms: done.ttft_ms ?? null, sources: nextSources, images: done.images || [], answer_format_version: done.answer_format_version ?? 1, answer_output_mode: done.answer_output_mode ?? "text", image_previews_unavailable: done.image_previews_unavailable ?? 0 };
           const currentMessages = latestChat.current.messages;
           const nextMessages = currentMessages.some((entry) => entry.id === assistantId)
             ? currentMessages.map((entry) => entry.id === assistantId ? { ...entry, ...completedAssistant } : entry)
@@ -824,7 +778,8 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
               <div className="message-body">
                 <div className="message-label">{message.role === "user" ? "你" : "Nianlun"}</div>
                 {message.role === "assistant" ? <AgentTraceDetails trace={message.trace} pending={Boolean(message.pending)} keepOpen={message.keepTraceOpen} english={prefersEnglish(messages[index - 1]?.text || "")} /> : null}
-                {message.role === "user" || message.text || !message.pending ? <div className={`message-text ${message.streamTransitionName ? "is-stream-candidate" : ""}`} style={message.streamTransitionName ? { viewTransitionName: message.streamTransitionName } : undefined}>{message.role === "assistant" ? <MarkdownContent className="message-markdown" text={message.text} onCitationClick={message.sources?.length ? (citationId) => showCitation(message.sources || [], citationId) : undefined} /> : message.text}</div> : null}
+                {message.role === "user" || message.text || !message.pending ? <div className={`message-text ${message.streamTransitionName ? "is-stream-candidate" : ""}`} style={message.streamTransitionName ? { viewTransitionName: message.streamTransitionName } : undefined}>{message.role === "assistant" ? <MarkdownContent className="message-markdown" text={message.text || (message.answer_output_mode === "images" ? (message.images || []).filter((image) => image.display_in_answer).map((image) => `![](nianlun-image:${image.id})`).join("\n\n") : "")} images={message.images} messageId={message.server_id || message.id} pending={Boolean(message.pending)} onCitationClick={message.sources?.length ? (citationId) => showCitation(message.sources || [], citationId) : undefined} /> : message.text}</div> : null}
+                {message.role === "assistant" && !message.pending ? <ImagePreviewNotice count={message.image_previews_unavailable} /> : null}
                 {message.role === "assistant" && !message.pending && message.usage ? <div className="message-usage">{formatUsage(message.usage, message.ttft_ms)}</div> : null}
                 {message.role === "assistant" && !message.pending && message.tool_calls?.length ? <ToolCallDetails toolCalls={message.tool_calls} /> : null}
                 {message.stopped && <div className="message-status">已停止 · 回答未完成</div>}
@@ -834,7 +789,21 @@ export function ChatView({ apps, selectedAppId, onSelectApp, onNewConversation, 
         </div>
         <form className="composer" onSubmit={send}><div className="composer-box"><textarea name="message" rows={1} maxLength={32000} disabled={busy} aria-label="输入问题" placeholder="问问你的知识库..." onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} />{busy ? <button className="stop-button" type="button" title="停止回答" aria-label="停止回答" onClick={stop}>■</button> : <button className="send-button" type="submit" title="发送" aria-label="发送">↑</button>}</div><div className="composer-hint">回答会显示引用片段 · Enter 发送，Shift + Enter 换行</div></form>
       </div>
-      <aside className="sources-panel"><div className="panel-heading"><h3>检索片段</h3><span>{sources.length ? `${sources.length} 条` : "等待检索"}</span></div><div className="source-list">{sources.length ? sources.map((source, index) => { const text = sourceText(source); const key = sourceItemKey(source, index); const citationId = sourceCitation(source, index); const expanded = Boolean(expandedSources[key]); const visibleText = expanded ? text : text.slice(0, 180); return <article className={`source-item ${activeCitation === citationId ? "is-citation-active" : ""}`} id={`citation-${citationId}`} key={key}><div className="source-item-heading"><span className="source-citation">[{citationId}]</span><strong title={sourceName(source)}>{sourceName(source)}</strong></div><MarkdownContent className="source-markdown" text={`${visibleText}${!expanded && text.length > 180 ? "…" : ""}`} /><button className="source-toggle" type="button" onClick={() => setExpandedSources((current) => ({ ...current, [key]: !expanded }))}>{expanded ? "收起片段" : "查看本次检索内容"}</button><small>{sourceLocation(source)}</small></article>; }) : <div className="source-empty">当对话产生检索结果时，相关片段会出现在这里。</div>}</div></aside>
+      <aside className="sources-panel"><div className="panel-heading"><h3>检索片段</h3><span>{sources.length ? `${sources.length} 条` : "等待检索"}</span></div><div className="source-list">{sources.length ? sources.map((source, index) => {
+        const text = sourceText(source);
+        const key = sourceItemKey(source, index);
+        const citationId = sourceCitation(source, index);
+        const expanded = Boolean(expandedSources[key]);
+        const visibleText = expanded ? text : text.slice(0, 180);
+        const message = messages.find((item) => (item.server_id || item.id) === source.message_id);
+        const sourceImages = (message?.images || []).filter((image) => source.image_attachment_ids?.includes(image.id));
+        return <article className={`source-item ${activeCitation === citationId ? "is-citation-active" : ""}`} id={`citation-${citationId}`} key={key}>
+          <div className="source-item-heading"><span className="source-citation">[{citationId}]</span><strong title={sourceName(source)}>{sourceName(source)}</strong></div>
+          <MarkdownContent className="source-markdown" text={`${visibleText}${!expanded && text.length > 180 ? "…" : ""}`} omitImages />
+          {expanded && <SourceImages images={sourceImages} messageId={source.message_id || ""} onCitationClick={(id) => showCitation(message?.sources || sources, id)} />}
+          <button className="source-toggle" type="button" onClick={() => setExpandedSources((current) => ({ ...current, [key]: !expanded }))}>{expanded ? "收起片段" : "查看本次检索内容"}</button><small>{sourceLocation(source)}</small>
+        </article>;
+      }) : <div className="source-empty">当对话产生检索结果时，相关片段会出现在这里。</div>}</div></aside>
     </section>
   );
 }

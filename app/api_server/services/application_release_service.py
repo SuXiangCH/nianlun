@@ -10,7 +10,6 @@ import threading
 import weakref
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from pydantic import ValidationError
@@ -39,12 +38,15 @@ from app.api_server.apis.v1.schemas import ApplicationResponse
 from app.api_server.common.errors import ApiError
 from app.api_server.repositories.publishing import PublishingRepository
 from app.api_server.services.application_service import ApplicationService
-from nianlun.agent.contracts import AGENT_TOOL_SCHEMA_VERSION
-from nianlun.agent.lead_agent.prompt import PROMPT_VERSION
+from nianlun.agent.prompt_registry import (
+    CURRENT_PROMPT_BUNDLE,
+    UnsupportedPromptBundle,
+    resolve_prompt_bundle,
+)
 from nianlun.agent.middleware.retrieval_loop_guard_middleware import (
     AgentLoopGuardConfig,
 )
-from nianlun.agent.retrieval_answer import prompt as v1_prompt
+from nianlun.models.reasoning import resolve_reasoning_effort
 
 
 @dataclass(frozen=True)
@@ -59,12 +61,18 @@ class ApiPrincipal:
 
 
 def _v1_prompt_hash() -> str:
-    return hashlib.sha256(Path(v1_prompt.__file__).read_bytes()).hexdigest()
+    return CURRENT_PROMPT_BUNDLE.v1_prompt_hash
 
 
 def config_fingerprint(config: PublishedConfig) -> tuple[str, str]:
+    excluded = {"reasoning_effort"} if config.reasoning_effort is None else set()
+    if config.sampling_config_version == 1:
+        excluded.add("sampling_config_version")
     canonical = json.dumps(
-        config.model_dump(mode="json"),
+        config.model_dump(
+            mode="json",
+            exclude=excluded,
+        ),
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -116,11 +124,17 @@ class ApplicationReleaseService:
             context_window_tokens=profile.get("context_window_tokens") or 128_000,
             knowledge_base_id=app["knowledge_base_id"],
             clarification_enabled=app.get("clarification_enabled", True),
+            temperature=profile.get("temperature"),
+            sampling_config_version=2,
+            reasoning_effort=resolve_reasoning_effort(
+                app.get("reasoning_effort", "inherit"), profile.get("reasoning_effort")
+            ),
             loop_guard=PublishedLoopGuard.model_validate(
                 asdict(AgentLoopGuardConfig())
             ),
-            prompt_version=PROMPT_VERSION,
-            tool_schema_version=AGENT_TOOL_SCHEMA_VERSION,
+            prompt_version=CURRENT_PROMPT_BUNDLE.prompt_version,
+            tool_schema_version=CURRENT_PROMPT_BUNDLE.tool_schema_version,
+            checkpoint_schema_version=CURRENT_PROMPT_BUNDLE.checkpoint_schema_version,
             v1_prompt_hash=_v1_prompt_hash(),
         )
 
@@ -148,13 +162,17 @@ class ApplicationReleaseService:
         return self._release(record)
 
     def validate_release(self, config: PublishedConfig) -> None:
-        if (
-            config.prompt_version != PROMPT_VERSION
-            or config.tool_schema_version != AGENT_TOOL_SCHEMA_VERSION
-            or config.checkpoint_schema_version != 1
-            or config.v1_prompt_hash != _v1_prompt_hash()
-        ):
-            raise ApiError("发布版本与当前程序不兼容，请重新发布或新建会话", 409)
+        try:
+            resolve_prompt_bundle(
+                tool_schema_version=config.tool_schema_version,
+                prompt_version=config.prompt_version,
+                v1_prompt_hash=config.v1_prompt_hash,
+                checkpoint_schema_version=config.checkpoint_schema_version,
+            )
+        except UnsupportedPromptBundle as exc:
+            raise ApiError(
+                "发布版本与当前程序不兼容，请重新发布或新建会话", 409
+            ) from exc
         models = self.applications.model_config_service
         if models is None:
             raise ApiError("API Server 未启用模型配置服务", 503)
@@ -310,6 +328,7 @@ class ApplicationReleaseService:
                     llm_model_id=config.llm_model_id,
                     agent_version=config.agent_version,
                     clarification_enabled=config.clarification_enabled,
+                    reasoning_effort=config.reasoning_effort or "default",
                 ),
             )
 

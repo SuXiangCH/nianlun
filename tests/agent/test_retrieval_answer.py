@@ -24,7 +24,6 @@ from nianlun.agent.retrieval_answer.prompt import (
     ANSWER_OUTPUT_RESERVE_TOKENS,
     RETRIEVAL_OUTPUT_RESERVE_TOKENS,
     build_answer_messages,
-    build_retrieval_system_prompt,
 )
 from nianlun.agent.token_estimation import estimate_tokens
 
@@ -731,7 +730,7 @@ def test_factory_selects_stage_prompt_and_graph(monkeypatch, agent_version) -> N
         factory_module, "build_chat_model", lambda *_args, **_kwargs: object()
     )
     monkeypatch.setattr(factory_module, "build_tools", lambda **_kwargs: [])
-    monkeypatch.setattr(factory_module, "build_system_prompt", lambda _kb: "base")
+    from nianlun.agent.prompt_registry import LEGACY_PROMPT_BUNDLE
 
     def build_inner(*_args: Any, **kwargs: Any) -> str:
         inner_calls.append(kwargs)
@@ -757,7 +756,9 @@ def test_factory_selects_stage_prompt_and_graph(monkeypatch, agent_version) -> N
     if agent_version == "v0":
         assert runtime.agent == "inner"
         assert runtime.agent_version == "v0"
-        assert inner_calls[0]["system_prompt"] == "base"
+        assert inner_calls[0][
+            "system_prompt"
+        ] == LEGACY_PROMPT_BUNDLE.build_system_prompt(_KnowledgeBase())
         assert not calls
         return
 
@@ -765,8 +766,7 @@ def test_factory_selects_stage_prompt_and_graph(monkeypatch, agent_version) -> N
     assert runtime.agent_version == "v1"
     assert len(calls) == 1
     assert calls[0]["retrieval_agent"] == "inner"
-    assert inner_calls[0]["system_prompt"] == build_retrieval_system_prompt(
-        _KnowledgeBase()
-    )
-    assert not inner_calls[0]["system_prompt"].startswith("base")
+    assert inner_calls[0][
+        "system_prompt"
+    ] == LEGACY_PROMPT_BUNDLE.build_retrieval_system_prompt(_KnowledgeBase())
     assert isinstance(inner_calls[0]["middleware"][0], RequestCancellationMiddleware)

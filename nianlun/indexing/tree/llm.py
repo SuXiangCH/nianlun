@@ -95,14 +95,14 @@ def _doc_description_prompt(structure) -> str:
 
 
 async def summarize_node(llm, text: str) -> str:
-    """单轮补全，``temperature=0``，直接返回正文。
+    """单轮补全，沿用模型配置，直接返回正文。
 
     失败回落 ``''``：单点失败不拖垮 ``asyncio.gather``。
     """
     if not text:
         return ""
     try:
-        resp = await llm.ainvoke(_node_summary_prompt(text), temperature=0)
+        resp = await llm.ainvoke(_node_summary_prompt(text))
         return content_to_text(resp)
     except Exception as e:  # pragma: no cover - 失败回落
         logger.warning(
@@ -114,7 +114,7 @@ async def summarize_node(llm, text: str) -> str:
 async def describe_document(llm, structure) -> str:
     """异步单轮，一句话描述。失败回落 ``''``。"""
     try:
-        resp = await llm.ainvoke(_doc_description_prompt(structure), temperature=0)
+        resp = await llm.ainvoke(_doc_description_prompt(structure))
         return content_to_text(resp)
     except Exception as e:  # pragma: no cover - 失败回落
         logger.warning(

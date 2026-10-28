@@ -862,7 +862,7 @@ def test_completed_replay_stops_disconnect_watcher_that_swallows_cancellation():
         prepared = SimpleNamespace(row={"id": "run"}, replay=result)
         service = SimpleNamespace(
             authenticate=lambda *args: None,
-            prepare=lambda *args: prepared,
+            prepare=lambda *args, **kwargs: prepared,
             wait=wait,
             location=lambda row: "/result",
             cancel=lambda prepared: None,

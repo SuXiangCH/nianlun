@@ -51,7 +51,7 @@ def test_summarize_node_basic():
     kind, prompt, kw = llm.calls[0]
     assert kind == "ainvoke"
     assert "正文内容" in prompt
-    assert kw.get("temperature") == 0
+    assert "temperature" not in kw
 
 
 def test_summarize_node_prompt_matches_old():
@@ -81,7 +81,7 @@ def test_describe_document_basic():
     assert kind == "ainvoke"
     assert "Document Structure:" in prompt
     assert "structure" in prompt  # structure 被 f-string 插入
-    assert kw.get("temperature") == 0
+    assert "temperature" not in kw
 
 
 def test_describe_document_prompt_matches_old():

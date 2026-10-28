@@ -24,6 +24,9 @@ class RetrievalAnswerGraphState(TypedDict, total=False):
     clarification: NotRequired[dict[str, Any] | None]
     retrieval_usage: NotRequired[dict[str, int] | None]
     answer_usage: NotRequired[dict[str, int] | None]
+    answer_output_mode: NotRequired[str]
+    selected_answer_images: NotRequired[list[dict[str, Any]]]
+    display_image_citation_ids: NotRequired[list[int]]
 
 
 __all__ = ["RetrievalAnswerGraphState"]

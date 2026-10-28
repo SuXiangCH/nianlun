@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from app.api_server.repositories.answer_images import invalidate_source_images
+
+
 import uuid
 from typing import Any
 
@@ -464,6 +467,7 @@ class WorkspaceRevisionRepositoryMixin:
                 )
             )
             document.status = "deleted"
+            invalidate_source_images(session)
             document.current_stage = "complete"
             document.stage_state = "canceled"
             document.failed_stage = None

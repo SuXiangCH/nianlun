@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import asyncio
 from collections import deque
 from collections.abc import AsyncIterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -15,10 +17,11 @@ import queue
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlencode
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from pydantic import ValidationError
 
 from app.api_server.apis.v1.runtime_schemas import (
     PublicChatRequest,
@@ -37,6 +40,14 @@ from app.api_server.services.application_release_service import (
 )
 from app.api_server.repositories.wecom_channels import WecomChannelRepository
 from app.api_server.services.application_service import ApplicationService
+from app.api_server.services.answer_image_service import AnswerImageService
+from nianlun.agent.image_history import TrustedHistory, scrub_messages
+from nianlun.agent.contracts import AnswerImagePolicy
+from app.api_server.services.answer_image_access_service import AnswerImageAccessService
+from app.api_server.services.answer_image_projection import (
+    AnswerImageProjection,
+    InlineProjection,
+)
 from nianlun.agent.lead_agent.runtime import iter_agent_stream_events
 from nianlun.agent.middleware import HistoryOverCapacityError
 from nianlun.agent.retrieval_answer.input_messages import validate_public_messages
@@ -92,15 +103,28 @@ class PreparedInvocation:
     timeout_seconds: float = 300.0
     retention_days: int = 30
     duplicate: bool = False
+    include_images: bool = False
+    image_transport: Literal["url", "data_url"] = "url"
+    principal: ApiPrincipal | None = None
+    knowledge_base_id: str | None = None
+    trusted_history: TrustedHistory | None = None
+    image_policy: AnswerImagePolicy = AnswerImagePolicy()
 
 
 def public_run(
-    row: dict[str, Any], *, include_result: bool = True
+    row: dict[str, Any],
+    *,
+    include_result: bool = True,
+    loaded_result: PublicChatResponse | None = None,
 ) -> PublicRunResponse:
     result = (
-        PublicChatResponse.model_validate_json(row["result_json"])
-        if row["result_json"]
-        else None
+        loaded_result
+        if loaded_result is not None
+        else (
+            PublicChatResponse.model_validate_json(row["result_json"])
+            if include_result and row.get("result_json")
+            else None
+        )
     )
     finished = (
         datetime.fromisoformat(row["finished_at"])
@@ -130,7 +154,7 @@ def public_run(
         knowledge_base_content_version=row["knowledge_base_content_version"],
         request_id=row["request_id"],
         duration_ms=duration_ms,
-        usage=result.usage if result else None,
+        usage=result.usage if result else row.get("usage"),
     )
 
 
@@ -141,6 +165,7 @@ class ApplicationInvocationService:
         applications: ApplicationService,
         factory: SQLiteConnectionFactory,
         settings: ApiServerSettings,
+        image_service: AnswerImageService | None = None,
     ) -> None:
         self.publishing, self.applications, self.settings = (
             publishing,
@@ -148,6 +173,7 @@ class ApplicationInvocationService:
             settings,
         )
         self.repository = ApplicationRunRepository(factory)
+        self.image_service = image_service
         self.channels = WecomChannelRepository(factory)
         self._guard = threading.RLock()
         self._active: dict[str, tuple[str, str, str, PreparedInvocation]] = {}
@@ -195,19 +221,26 @@ class ApplicationInvocationService:
         if input_messages is not None:
             payload["protocol_version"] = "openai-1"
             payload["messages"] = input_messages
+        if body.include_images:
+            payload["include_images"] = True
+            payload["image_transport"] = body.image_transport
         return hashlib.sha256(
             json.dumps(payload, ensure_ascii=False, sort_keys=True).encode()
         ).hexdigest()
 
-    @staticmethod
-    def _replay(row: dict[str, Any], fingerprint: str) -> PreparedInvocation:
+    def _replay(
+        self,
+        row: dict[str, Any],
+        fingerprint: str,
+        principal: ApiPrincipal | None = None,
+    ) -> PreparedInvocation:
         location = ApplicationInvocationService.location(row)
         if row["request_fingerprint"] != fingerprint:
             raise ApiError("幂等键已用于其他请求", 409, headers={"Location": location})
         if row["status"] == "completed":
             return PreparedInvocation(
                 row=row,
-                replay=PublicChatResponse.model_validate_json(row["result_json"]),
+                replay=self._load_result(row, principal),
             )
         if row["status"] in ("running", "cancelling"):
             raise ApiError(
@@ -232,7 +265,11 @@ class ApplicationInvocationService:
         if not key.strip() or len(key) > 128:
             raise ApiError("Idempotency-Key 必填且最多 128 字符", 422)
         app_id, client_id = principal.application_id, principal.client_id
+        image_policy = self.settings.freeze_image_policy(transport=body.image_transport)
         fingerprint = self._fingerprint(body, input_messages)
+        if input_messages is not None:
+            input_messages = scrub_messages(input_messages)
+            body = body.model_copy(update={"message": input_messages[-1]["content"]})
         with self.publishing.entry_lock(app_id):
             with self._guard:
                 if self._closed or self.checkpointer is None:
@@ -243,8 +280,9 @@ class ApplicationInvocationService:
                 self.publishing.validate_principal(principal)
                 existing = self.repository.find(app_id, client_id, body.user_id, key)
                 if existing:
-                    return self._replay(existing, fingerprint)
+                    return self._replay(existing, fingerprint, principal)
                 release = self.publishing.runtime_release(principal)
+                trusted_history = TrustedHistory() if input_messages is None else None
                 if input_messages is not None:
                     try:
                         validate_public_messages(
@@ -276,6 +314,29 @@ class ApplicationInvocationService:
                     if checkpoint is None:
                         self.repository.interrupt_context(body.conversation_id)
                         raise ApiError("会话 checkpoint 缺失，请创建新会话", 409)
+                    if input_messages is None:
+                        trusted_history = self.repository.chat.trusted_history(
+                            app_id,
+                            body.conversation_id,
+                            channel="api",
+                            client_id=client_id,
+                            user_id=body.user_id,
+                        )
+                if body.include_images:
+                    if (
+                        not self.settings.answer_images_enabled
+                        or self.image_service is None
+                    ):
+                        raise ApiError("图片输出未启用", 503)
+                    if release.config.tool_schema_version != 5:
+                        raise ApiError(
+                            "当前发布版本不支持图片，请重新发布支持图片的版本", 409
+                        )
+                    if (
+                        body.image_transport == "url"
+                        and not self.settings.application_api_public_base_url
+                    ):
+                        raise ApiError("公开图片地址未配置", 503)
                 now = time.monotonic()
                 if self._limits_exceeded(app_id, client_id, now):
                     raise ApiError(
@@ -287,8 +348,20 @@ class ApplicationInvocationService:
             record = self.applications.knowledge_base_lookup(
                 release.config.knowledge_base_id
             )
-            runtime = self.applications.release_runtime(
-                release.config, self.checkpointer, record
+            runtime = (
+                self.applications.release_runtime(
+                    release.config,
+                    self.checkpointer,
+                    record,
+                    image_capability=True,
+                    image_policy=image_policy,
+                )
+                if body.include_images
+                else self.applications.release_runtime(
+                    release.config,
+                    self.checkpointer,
+                    record,
+                )
             )
             prepared: PreparedInvocation | None = None
             try:
@@ -312,6 +385,7 @@ class ApplicationInvocationService:
                         request_id=request_id,
                         retention_days=self.settings.application_api_retention_days,
                         key_id=principal.key_id,
+                        image_transport=body.image_transport,
                     )
                     prepared = PreparedInvocation(
                         row=row,
@@ -321,6 +395,12 @@ class ApplicationInvocationService:
                         channel="api",
                         timeout_seconds=self.settings.application_api_timeout_seconds,
                         retention_days=self.settings.application_api_retention_days,
+                        include_images=body.include_images,
+                        image_transport=body.image_transport,
+                        principal=principal,
+                        knowledge_base_id=release.config.knowledge_base_id,
+                        trusted_history=trusted_history,
+                        image_policy=image_policy,
                     )
                     self._active[row["id"]] = (app_id, client_id, "api", prepared)
                     prepared.future = self._executor.submit(
@@ -673,7 +753,9 @@ class ApplicationInvocationService:
         row = prepared.row
         thread_id = checkpoint_thread_id(prepared.channel, row["conversation_id"])
         try:
-            raw = None
+            raw: dict[str, Any] | None = None
+            image_text_bytes = 0
+            native_answer = ""
             events = (
                 runtime.iter_public_events(
                     input_messages,
@@ -688,10 +770,53 @@ class ApplicationInvocationService:
                     thread_id=thread_id,
                     clarification_enabled=clarification_enabled,
                     cancellation_event=prepared.cancellation,
+                    **(
+                        {"trusted_history": prepared.trusted_history}
+                        if prepared.trusted_history is not None
+                        else {}
+                    ),
                 )
             )
             try:
                 for event in events:
+                    if (
+                        prepared.include_images
+                        and input_messages is None
+                        and event.get("type") == "message"
+                    ):
+                        data = event["data"]
+                        # v0 candidates include tool rounds; v1 candidates are answer tokens.
+                        if (
+                            data.get("phase") == "candidate"
+                            and getattr(runtime, "agent_version", "v0") != "v1"
+                        ):
+                            continue
+                        if data.get("phase") == "answer":
+                            final = str(data["delta"])
+                            if not final.startswith(native_answer):
+                                raise ApiError("最终回答与已输出内容不一致", 502)
+                            event = {
+                                **event,
+                                "data": {**data, "delta": final[len(native_answer) :]},
+                            }
+                    if prepared.include_images:
+                        if event.get("type") == "message":
+                            image_text_bytes += len(
+                                str(event["data"]["delta"]).encode("utf-8")
+                            )
+                            if (
+                                image_text_bytes
+                                > prepared.image_policy.max_canonical_bytes
+                            ):
+                                raise ApiError("图片回答正文超出大小限制", 413)
+                            if input_messages is None:
+                                native_answer += str(event["data"]["delta"])
+                        elif event.get("type") == "done":
+                            if (
+                                len(event["data"]["answer"].encode("utf-8"))
+                                > prepared.image_policy.max_canonical_bytes
+                            ):
+                                raise ApiError("图片回答正文超出大小限制", 413)
                     if event.get("type") == "done":
                         raw = event["data"]
                     elif event.get("type") == "message" and prepared.deltas is not None:
@@ -719,30 +844,87 @@ class ApplicationInvocationService:
                 raise ApiError("调用已取消", 409)
             if raw is None:
                 raise ApiError("模型未返回最终结果", 502)
-            response = PublicChatResponse(
-                app_id=row["application_id"],
-                release_id=row["release_id"],
-                run_id=row["id"],
-                conversation_id=row["conversation_id"],
-                message_id=row["message_id"],
-                answer=raw["answer"],
-                retrieved_snippets=[
-                    PublicSnippet.model_validate(item)
-                    for item in raw.get("retrieved_snippets", [])
-                ],
-                usage=raw.get("usage"),
-                ttft_ms=raw.get("ttft_ms"),
-                clarification=_public_clarification(raw.get("clarification")),
-                knowledge_base_content_version=row["knowledge_base_content_version"],
-            )
-            if not self.repository.complete(
-                row["id"],
-                response.model_dump(mode="json"),
-                raw,
-                prepared.retention_days,
+            with (
+                self.image_service.completion_scope()
+                if self.image_service
+                else nullcontext()
             ):
-                raise ApiError("调用已终止", 409)
-            return response
+                if prepared.include_images:
+                    assert self.image_service is not None
+                    raw = self.image_service.prepare_result(
+                        row["application_id"],
+                        raw,
+                        knowledge_base_id=prepared.knowledge_base_id,
+                        policy=prepared.image_policy,
+                        question=message,
+                    )
+                response = PublicChatResponse(
+                    app_id=row["application_id"],
+                    release_id=row["release_id"],
+                    run_id=row["id"],
+                    conversation_id=row["conversation_id"],
+                    message_id=row["message_id"],
+                    answer=raw["answer"],
+                    retrieved_snippets=[
+                        PublicSnippet.model_validate(item)
+                        for item in raw.get("retrieved_snippets", [])
+                    ],
+                    usage=raw.get("usage"),
+                    ttft_ms=raw.get("ttft_ms"),
+                    clarification=_public_clarification(raw.get("clarification")),
+                    knowledge_base_content_version=row[
+                        "knowledge_base_content_version"
+                    ],
+                    image_transport=prepared.image_transport,
+                    answer_output_mode=raw.get("answer_output_mode", "text"),
+                )
+                grants: list[dict[str, Any]] = []
+                stored = response.model_dump(mode="json")
+                if prepared.include_images:
+                    assert (
+                        self.image_service is not None
+                        and prepared.principal is not None
+                    )
+                    deadline = (
+                        datetime.now(timezone.utc)
+                        + timedelta(
+                            days=self.settings.application_api_result_retention_days
+                        )
+                    ).isoformat()
+
+                    def grant_url(image: dict[str, Any]) -> tuple[str, str]:
+                        assert prepared.principal is not None
+                        values, url = self.image_access.plan_grant(
+                            prepared.principal, image["id"], deadline
+                        )
+                        grants.append(values)
+                        return url, values["expires_at"]
+
+                    response, stored = self._image_projector(
+                        prepared.image_policy
+                    ).prepare(
+                        response,
+                        raw.get("images", []),
+                        transport=prepared.image_transport,
+                        read_bytes=self.image_service.read_prepared_image,
+                        url_for=grant_url,
+                    )
+                if not self.repository.complete(
+                    row["id"],
+                    stored,
+                    raw,
+                    prepared.retention_days,
+                    grants=grants,
+                    principal_key_id=prepared.principal.key_id
+                    if prepared.principal
+                    else None,
+                    result_retention_days=self.settings.application_api_result_retention_days,
+                    image_policy=prepared.image_policy,
+                ):
+                    raise ApiError("调用已终止", 409)
+                completed = self.repository.get(row["id"])
+                assert completed is not None
+                return self._load_result(completed, prepared.principal)
         except Exception as exc:
             current = self.repository.get(row["id"])
             if current and current["status"] == "cancelling":
@@ -754,7 +936,11 @@ class ApplicationInvocationService:
                     exited=True,
                 )
             else:
-                if _is_over_capacity_error(exc):
+                if isinstance(exc, ApiError):
+                    self.repository.cancel(
+                        row["id"], "failed", exc.status_code, exc.message, exited=True
+                    )
+                elif _is_over_capacity_error(exc):
                     self.repository.cancel(
                         row["id"],
                         "failed",
@@ -857,7 +1043,114 @@ class ApplicationInvocationService:
             or row["user_id"] != user_id
         ):
             raise ApiError("调用不存在", 404)
-        return public_run(row)
+        result = (
+            self._load_result(row, principal) if row["status"] == "completed" else None
+        )
+        return public_run(row, include_result=result is not None, loaded_result=result)
+
+    @property
+    def image_access(self) -> AnswerImageAccessService:
+        if self.image_service is None:
+            raise ApiError("图片输出未启用", 503)
+        return AnswerImageAccessService(
+            self.image_service, self.publishing, self.repository, self.settings
+        )
+
+    def _image_projector(
+        self, policy: AnswerImagePolicy | None = None
+    ) -> AnswerImageProjection:
+        policy = policy or self.settings.freeze_image_policy()
+        return AnswerImageProjection(
+            inline_max_bytes=policy.inline_max_bytes,
+            inline_total_bytes=policy.inline_total_bytes,
+            inline_response_max_bytes=policy.inline_response_max_bytes,
+            policy=policy,
+        )
+
+    def _load_result(
+        self, row: dict[str, Any], principal: ApiPrincipal | None = None
+    ) -> PublicChatResponse:
+        deadline = row.get("result_expires_at")
+        if deadline and datetime.fromisoformat(deadline) <= datetime.now(timezone.utc):
+            raise ApiError("调用结果已过期", 410)
+        stored = json.loads(row["result_json"])
+        if "storage_format" not in stored:
+            return PublicChatResponse.model_validate(stored)
+        if stored.get("storage_format") != "inline_projection_v1":
+            raise ApiError("调用结果存储格式不受支持", 500)
+        try:
+            plan = InlineProjection.model_validate(stored)
+        except ValidationError:
+            logger.error("application.invalid_image_snapshot run_id=%s", row["id"])
+            raise ApiError("调用结果存储格式无效", 500) from None
+        if not deadline:
+            raise ApiError("历史运行不支持内联图片", 409)
+        if self.image_service is None:
+            raise ApiError("图片输出未启用", 503)
+
+        def bound_image(binding: dict[str, Any]) -> bool:
+            assert self.image_service is not None
+            image = self.image_service.repository.attachment(
+                row["application_id"],
+                row["conversation_id"],
+                row["message_id"],
+                binding["id"],
+            )
+            if (
+                image is None
+                or image["status"] != "available"
+                or not image["display_in_answer"]
+                or image["blob_id"] != binding["blob_id"]
+            ):
+                return False
+            blob = self.image_service.repository.blob(binding["blob_id"])
+            return (
+                blob is not None
+                and blob["status"] == "ready"
+                and all(
+                    blob[field] == binding[field]
+                    for field in ("sha256", "size_bytes", "media_type")
+                )
+            )
+
+        def read_image(binding: dict[str, Any]) -> bytes | None:
+            assert self.image_service is not None
+            if not bound_image(binding):
+                return None
+            try:
+                raw, media_type = self.image_service.read_content(
+                    row["application_id"],
+                    row["conversation_id"],
+                    row["message_id"],
+                    binding["id"],
+                )
+                return raw if media_type == binding["media_type"] else None
+            except ApiError as exc:
+                if exc.status_code != 404:
+                    raise
+                return None
+
+        buffers = {
+            binding.id: read_image(binding.model_dump()) for binding in plan.bindings
+        }
+        # Recheck every binding after all byte IO, including sources of earlier images.
+        result = self._image_projector().replay_inline(
+            plan,
+            read_bytes=lambda binding: (
+                buffers[binding["id"]] if bound_image(binding) else None
+            ),
+        )
+        current = self.repository.get(row["id"])
+        if current is None or current["status"] != "completed":
+            raise ApiError("调用不存在", 404)
+        current_deadline = current.get("result_expires_at")
+        if not current_deadline or datetime.fromisoformat(
+            current_deadline
+        ) <= datetime.now(timezone.utc):
+            raise ApiError("调用结果已过期", 410)
+        if principal is not None:
+            self.publishing.validate_principal(principal)
+        return result
 
     @staticmethod
     def location(row: dict[str, Any]) -> str:

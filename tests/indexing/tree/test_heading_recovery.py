@@ -4,6 +4,8 @@ import asyncio
 import logging
 from pathlib import Path
 
+import pytest
+
 from nianlun.indexing.tree.heading_recovery import (
     HeadingRecoveryConfig,
     recover_heading_levels,
@@ -102,6 +104,52 @@ def test_pipeline_uses_dedicated_heading_recovery_llm(tmp_path: Path):
     assert result["heading_recovery"]["mode"] == "rules_then_llm"
     assert result["structure"][0]["nodes"][0]["nodes"][0]["title"] == "小节"
     assert llm.prompts
+
+
+@pytest.mark.parametrize("mode", ["rules", "rules_then_llm"])
+@pytest.mark.parametrize("folding", [False, True])
+def test_recovered_subtrees_fold_without_losing_text_or_image_references(
+    tmp_path: Path, mode: str, folding: bool
+):
+    from nianlun.indexing.tree.pipeline import structure_to_list
+
+    image = "![Original diagram](images/chart.png)"
+    source = (
+        "# Report\n"
+        + "Report introduction.\n" * 100
+        + "## 1. Chapter\nChapter text.\n"
+        + f"## 1.1 Figure\n{image}\nFigure text.\n"
+        + "## 2. Risks\n"
+        + "Risk details.\n" * 100
+    )
+    markdown = tmp_path / "report.md"
+    markdown.write_text(source, encoding="utf-8")
+    llm = _LLM('{"levels": {"0": 1, "1": 2, "2": 3, "3": 2}}')
+    result = build_md_index_sync(
+        str(markdown),
+        add_node_text=True,
+        heading_recovery_mode=mode,
+        heading_recovery_llm=llm,
+        thin=folding,
+        min_node_token=80,
+    )
+    root = result["structure"][0]
+    chapter, risks = root["nodes"]
+    assert [chapter["title"], risks["title"]] == ["1. Chapter", "2. Risks"]
+    if folding:
+        assert not chapter.get("nodes")
+        assert image in chapter["text"]
+        assert "Figure text." in chapter["text"]
+    else:
+        assert chapter["nodes"][0]["title"] == "1.1 Figure"
+        assert image in chapter["nodes"][0]["text"]
+    nodes = structure_to_list(result["structure"])
+    assert [node["node_id"] for node in nodes] == [
+        str(index).zfill(4) for index in range(3 if folding else 4)
+    ]
+    assert risks["line_num"] == source.split("\n").index("## 2. Risks") + 1
+    assert sum(node["text"].count(image) for node in nodes) == 1
+    assert markdown.read_text(encoding="utf-8") == source
 
 
 class _Message:

@@ -199,7 +199,7 @@ class VectorIndexService:
                 )
 
     def shutdown(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     def delete_collection(
         self, collection_name: str | None, knowledge_base_id: str

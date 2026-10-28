@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any, cast
 
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import (
@@ -24,6 +26,25 @@ _ACTIVE_PARSE_STATES = (
     "running",
     "converting",
 )
+
+logger = logging.getLogger(__name__)
+
+
+def _fail_parse_upload(
+    session: Session, document: Document, error_message: str, now: str
+) -> None:
+    operation = session.scalar(
+        select(UploadOperation)
+        .where(UploadOperation.document_id == document.id)
+        .order_by(UploadOperation.created_at.desc())
+        .limit(1)
+    )
+    if operation is None:
+        logger.warning("document.upload_operation_missing document_id=%s", document.id)
+        return
+    operation.status = "failed"
+    operation.error_message = error_message[:2_000]
+    operation.updated_at = now
 
 
 def _parse_task_dict(item: DocumentParseTask) -> dict[str, Any]:
@@ -87,6 +108,14 @@ class DocumentParseRepositoryMixin:
 
     def create_parse_task(self, values: dict[str, Any]) -> dict[str, Any]:
         with self.factory.session_scope(write=True) as session:
+            document = session.get(Document, str(values["document_id"]))
+            if (
+                document is None
+                or document.pipeline_generation
+                != int(values.get("pipeline_generation", 1))
+                or document.status == "deleted"
+            ):
+                raise ValueError("文档解析 generation 已失效")
             task = DocumentParseTask(
                 id=str(values["id"]),
                 document_id=str(values["document_id"]),
@@ -424,6 +453,7 @@ class DocumentParseRepositoryMixin:
                 document.error_message = error_message[:2_000]
                 document.updated_at = now
                 document.completed_at = now
+                _fail_parse_upload(session, document, error_message, now)
             return True
 
     def fail_document_parse_preflight(
@@ -451,6 +481,7 @@ class DocumentParseRepositoryMixin:
             document.error_message = error_message[:2_000]
             document.updated_at = now
             document.completed_at = now
+            _fail_parse_upload(session, document, error_message, now)
             return True
 
     def get_parse_task(self, task_id: str) -> dict[str, Any] | None:

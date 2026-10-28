@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+
 import logging
 import threading
 import uuid
@@ -12,7 +14,14 @@ from typing import TYPE_CHECKING, Any, Callable
 from fastapi import status
 
 from nianlun.agent.contracts import AGENT_TOOL_SCHEMA_VERSION
+from nianlun.agent.image_context import AnswerImagePolicy
+from nianlun.agent.prompt_registry import (
+    LEGACY_PROMPT_BUNDLE,
+    PromptBundle,
+    resolve_prompt_bundle,
+)
 from nianlun.config import get_enable_thinking, get_openai_temperature
+from nianlun.models.reasoning import resolve_reasoning_effort
 from nianlun.agent.lead_agent.prompt import PROMPT_VERSION
 from nianlun.agent.lead_agent.runtime import AgentRuntime
 from nianlun.agent.lead_agent.factory import AgentRuntimeFactory
@@ -101,7 +110,8 @@ class ApplicationService:
         self.model_config_service = model_config_service
         self.index_access = IndexAccessCoordinator(knowledge_base_lookup)
         self._runtimes: dict[
-            str, tuple[RuntimeCapabilityFingerprint, AgentRuntime]
+            tuple[str, str, bool, AnswerImagePolicy],
+            tuple[RuntimeCapabilityFingerprint, AgentRuntime],
         ] = {}
         self._lock = threading.RLock()
 
@@ -170,6 +180,7 @@ class ApplicationService:
             "config_version": 1,
             "agent_version": request.agent_version,
             "clarification_enabled": request.clarification_enabled,
+            "reasoning_effort": request.reasoning_effort,
             "created_at": timestamp.isoformat(),
             "updated_at": timestamp.isoformat(),
         }
@@ -181,8 +192,17 @@ class ApplicationService:
         config: PublishedConfig,
         checkpointer: Any,
         knowledge_base_record: dict[str, Any],
+        *,
+        image_capability: bool = False,
+        image_policy: AnswerImagePolicy = AnswerImagePolicy(),
     ) -> AgentRuntime:
         """Build one bounded invocation runtime while pinning its current snapshot."""
+        bundle = resolve_prompt_bundle(
+            tool_schema_version=config.tool_schema_version,
+            prompt_version=config.prompt_version,
+            v1_prompt_hash=config.v1_prompt_hash,
+            checkpoint_schema_version=config.checkpoint_schema_version,
+        )
         if self.model_config_service is None:
             raise ApiError("API Server 未启用模型配置服务", 503)
         profile = self.model_config_service.require_llm_profile(config.llm_model_id)
@@ -271,12 +291,22 @@ class ApplicationService:
                 allow_env_fallback=False,
                 tool_logging=False,
                 agent_version=config.agent_version,
-                temperature=config.temperature,
+                temperature=(
+                    None
+                    if config.sampling_config_version == 1
+                    and config.reasoning_effort is not None
+                    else config.temperature
+                ),
+                legacy_temperature=config.sampling_config_version == 1,
                 enable_thinking=config.thinking,
+                reasoning_effort=config.reasoning_effort,
                 loop_guard_config=AgentLoopGuardConfig(
                     **config.loop_guard.model_dump()
                 ),
                 checkpointer=checkpointer,
+                prompt_bundle=bundle,
+                image_capability=image_capability,
+                image_policy=image_policy,
             )
         except BaseException:
             close = getattr(knowledge_base, "close", None)
@@ -295,15 +325,32 @@ class ApplicationService:
         with self._lock:
             if not self.repository.delete_application(application_id):
                 raise ApiError("应用不存在", status.HTTP_404_NOT_FOUND)
-            self._runtimes.pop(application_id, None)
+            self.invalidate_runtime(application_id)
 
-    def runtime(self, application_id: str) -> AgentRuntime:
+    def runtime(
+        self,
+        application_id: str,
+        *,
+        prompt_bundle: PromptBundle = LEGACY_PROMPT_BUNDLE,
+        image_capability: bool = False,
+        image_policy: AnswerImagePolicy = AnswerImagePolicy(),
+    ) -> AgentRuntime:
         item = self.require_record(application_id)
         knowledge_base = self.knowledge_base_lookup(item["knowledge_base_id"])
         content_version = int(knowledge_base.get("content_version", 0))
-        fingerprint = self._runtime_capability_fingerprint(item, knowledge_base)
+        fingerprint = (
+            *self._runtime_capability_fingerprint(item, knowledge_base),
+            prompt_bundle.contract_key,
+            image_capability,
+        )
+        cache_key = (
+            application_id,
+            prompt_bundle.bundle_id,
+            image_capability,
+            image_policy,
+        )
         with self._lock:
-            cached = self._runtimes.get(application_id)
+            cached = self._runtimes.get(cache_key)
             if cached is not None and cached[0] == fingerprint:
                 logger.info(
                     "agent.runtime_reused application_id=%s knowledge_base_id=%s "
@@ -320,6 +367,9 @@ class ApplicationService:
             embedding_dim: int | None = None
             embedding_base_url: str | None = None
             embedding_api_key: str | None = None
+            reasoning_effort = resolve_reasoning_effort(
+                item.get("reasoning_effort", "inherit"), None
+            )
             if self.model_config_service is not None:
                 (
                     effective_model,
@@ -328,8 +378,13 @@ class ApplicationService:
                     _,
                     _,
                     context_window_tokens,
+                    model_reasoning_effort,
+                    temperature,
                 ) = self.model_config_service.runtime_config(
                     str(item.get("provider", "default")), item.get("model")
+                )
+                reasoning_effort = resolve_reasoning_effort(
+                    item.get("reasoning_effort", "inherit"), model_reasoning_effort
                 )
                 try:
                     selected_model_id = knowledge_base.get("embedding_model_id")
@@ -379,6 +434,7 @@ class ApplicationService:
                 embedding_base_url = None
                 embedding_api_key = None
                 context_window_tokens = None
+                temperature = get_openai_temperature()
 
             config = KnowledgeBaseConfig(
                 workspace_dir=Path(knowledge_base["workspace_dir"]),
@@ -414,10 +470,12 @@ class ApplicationService:
                     allow_env_fallback=False,
                     tool_logging=False,
                     agent_version=item.get("agent_version", "v0"),
-                    # The console/editor runtime keeps the CLI sampling defaults; only
-                    # published releases pin temperature/thinking from their config.
-                    temperature=get_openai_temperature(),
+                    temperature=temperature,
                     enable_thinking=get_enable_thinking(),
+                    reasoning_effort=reasoning_effort,
+                    prompt_bundle=prompt_bundle,
+                    image_capability=image_capability,
+                    image_policy=image_policy,
                 )
             except RuntimeError as exc:
                 # Knowledge-base construction failures surface as a capability gap.
@@ -437,7 +495,7 @@ class ApplicationService:
                     application_id,
                 )
             else:
-                self._runtimes[application_id] = (fingerprint, runtime)
+                self._runtimes[cache_key] = (fingerprint, runtime)
             logger.info(
                 "agent.runtime_created application_id=%s knowledge_base_id=%s "
                 "content_version=%s model=%s base_url=%s vector_enabled=%s",
@@ -497,12 +555,28 @@ class ApplicationService:
 
     def invalidate_runtime(self, application_id: str) -> None:
         with self._lock:
-            self._runtimes.pop(application_id, None)
+            for key in list(self._runtimes):
+                if key[0] == application_id:
+                    self._runtimes.pop(key)
 
     def invalidate_all(self) -> None:
         """Drop cached runtimes after workspace model settings change."""
         with self._lock:
             self._runtimes.clear()
+
+    def shutdown(self) -> None:
+        """Release cached snapshot readers after all request executors stop."""
+        with self._lock:
+            runtimes = [runtime for _, runtime in self._runtimes.values()]
+            self._runtimes.clear()
+        readers = {
+            id(runtime.kb): runtime.kb for runtime in runtimes if hasattr(runtime, "kb")
+        }
+        with ExitStack() as cleanup:
+            for reader in readers.values():
+                close = getattr(reader, "close", None)
+                if callable(close):
+                    cleanup.callback(close)
 
 
 __all__ = [

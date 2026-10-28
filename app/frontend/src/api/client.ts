@@ -1,7 +1,17 @@
-import type { AgentVersion, Application, ApplicationApiClient, ApplicationApiKey, ApplicationDeploymentEvent, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, ApplicationUpdateRequest, BatchUploadResult, ConversationMessageRecord, ConversationRecord, DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelConfigTestRequest, ModelConfigTestResult, ModelKind, ModelProfile, ModelProfileRequest, SourceSnippet, WecomChannelCreateInput, WecomChannelUpdateInput, WecomConnectResult } from "../types";
+import type { AgentVersion, Application, ApplicationApiClient, ApplicationApiKey, ApplicationDeploymentEvent, ApplicationPage, ApplicationPublication, ApplicationRelease, ApplicationRun, ApplicationUpdateRequest, BatchUploadResult, ConversationMessageRecord, ConversationRecord, DocumentIndexTree, DocumentPreview, KnowledgeBase, KnowledgeBaseDocument, KnowledgeBaseParserOptions, ModelConfigTestRequest, ModelConfigTestResult, ModelKind, ModelProfile, ModelProfileRequest, ReasoningEffortOverride, SourceSnippet, WecomChannelCreateInput, WecomChannelUpdateInput, WecomConnectResult } from "../types";
 
 const configuredBase = window.NIANLUN_API_BASE || import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 export const API_BASE = configuredBase.replace(/\/$/, "");
+
+export function answerImageUrl(path: string | null): string | null {
+  if (!path || !/^\/api\/v1\/apps\/[A-Za-z0-9_-]+\/conversations\/[A-Za-z0-9_-]+\/messages\/[A-Za-z0-9_-]+\/images\/[A-Za-z0-9_-]+\/content$/.test(path)) return null;
+  return `${API_BASE}${path}`;
+}
+
+export function documentImageUrl(path: string | null): string | null {
+  if (!path || !/^\/api\/v1\/knowledge-bases\/[A-Za-z0-9_-]+\/documents\/[A-Za-z0-9_-]+\/images\/img_[a-f0-9]{16,64}\/content\?content_version=\d+$/.test(path)) return null;
+  return `${API_BASE}${path}`;
+}
 
 /**
  * Base URL that external callers should use. Deployment injects the public
@@ -90,7 +100,7 @@ function uploadRequest<T>(
 export const api = {
   listApps: () => request<Application[]>("/api/v1/apps"),
   getApp: (id: string, signal?: AbortSignal) => request<Application>(`/api/v1/apps/${encodeURIComponent(id)}`, { signal }),
-  createApp: (body: { name: string; description: string; knowledge_base_id: string; llm_model_id: string; agent_version: AgentVersion }) => request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(body) }),
+  createApp: (body: { name: string; description: string; knowledge_base_id: string; llm_model_id: string; agent_version: AgentVersion; reasoning_effort?: ReasoningEffortOverride }) => request<Application>("/api/v1/apps", { method: "POST", body: JSON.stringify(body) }),
   deleteApp: (id: string) => request<null>(`/api/v1/apps/${encodeURIComponent(id)}`, { method: "DELETE" }),
   updateApp: (id: string, body: ApplicationUpdateRequest) => request<Application>(`/api/v1/apps/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   getPublication: (id: string, signal?: AbortSignal) => request<ApplicationPublication>(`/api/v1/apps/${encodeURIComponent(id)}/publication`, { signal }),
@@ -119,7 +129,7 @@ export const api = {
     return request<ApplicationPage<ApplicationRun>>(`/api/v1/apps/${encodeURIComponent(id)}/runs?${query}`, { signal });
   },
   listKnowledgeBases: () => request<KnowledgeBase[]>("/api/v1/knowledge-bases"),
-  updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; heading_recovery_enabled?: boolean; llm_model_id?: string | null; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  updateKnowledgeBase: (id: string, body: { name?: string; summary_enabled?: boolean; heading_recovery_enabled?: boolean; subtree_folding_enabled?: boolean; min_subtree_tokens?: number; parser_options?: KnowledgeBaseParserOptions; llm_model_id?: string | null; reasoning_effort?: ReasoningEffortOverride; embedding_model_id?: string; vector_enabled?: boolean }) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "PATCH", body: JSON.stringify(body) }),
   deleteKnowledgeBase: (id: string) => request<null>(`/api/v1/knowledge-bases/${encodeURIComponent(id)}`, { method: "DELETE" }),
   listModels: (kind?: ModelKind, signal?: AbortSignal) => request<ModelProfile[]>(`/api/v1/models${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`, { signal }),
   createModel: (body: ModelProfileRequest) => request<ModelProfile>("/api/v1/models", { method: "POST", body: JSON.stringify(body) }),
@@ -138,8 +148,10 @@ export const api = {
   listKnowledgeBaseDocuments: (knowledgeBaseId: string) => request<KnowledgeBaseDocument[]>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents`),
   getKnowledgeBaseDocument: (knowledgeBaseId: string, documentId: string) => request<KnowledgeBaseDocument>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}`),
   retryKnowledgeBaseDocument: (knowledgeBaseId: string, documentId: string) => request<KnowledgeBaseDocument>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/retry`, { method: "POST" }),
+  reparseKnowledgeBaseDocument: (knowledgeBaseId: string, documentId: string, isOcr: boolean | null) => request<KnowledgeBaseDocument>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/reparse`, { method: "POST", body: JSON.stringify({ is_ocr: isOcr }) }),
   deleteKnowledgeBaseDocument: (knowledgeBaseId: string, documentId: string) => request<null>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}`, { method: "DELETE" }),
   getKnowledgeBaseDocumentContent: (knowledgeBaseId: string, documentId: string) => requestText(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/content`),
+  getKnowledgeBaseDocumentPreview: (knowledgeBaseId: string, documentId: string) => request<DocumentPreview>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/preview`),
   getKnowledgeBaseDocumentTree: (knowledgeBaseId: string, documentId: string) => request<DocumentIndexTree>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/documents/${encodeURIComponent(documentId)}/tree`),
   rebuildFts: (knowledgeBaseId: string) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/fts`, { method: "POST" }),
   rebuildVector: (knowledgeBaseId: string) => request<KnowledgeBase>(`/api/v1/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/vector`, { method: "POST" }),

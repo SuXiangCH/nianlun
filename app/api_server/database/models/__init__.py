@@ -32,6 +32,12 @@ from .pipeline import (
     DocumentPipelineEvent,
     DocumentStagingAllocation,
 )
+from .answer_images import (
+    AnswerImageBlob,
+    ImageAccessGrant,
+    ImageStorageProfile,
+    MessageImage,
+)
 
 __all__ = [
     "Application",
@@ -43,6 +49,7 @@ __all__ = [
     "ApplicationApiKey",
     "ApplicationWecomChannel",
     "ApplicationWecomBotRevision",
+    "AnswerImageBlob",
     "Base",
     "Conversation",
     "Document",
@@ -59,7 +66,10 @@ __all__ = [
     "LLMModelProfile",
     "Message",
     "MessageSource",
+    "MessageImage",
     "ModelProfile",
+    "ImageAccessGrant",
+    "ImageStorageProfile",
     "ParserModelProfile",
     "UploadOperation",
 ]

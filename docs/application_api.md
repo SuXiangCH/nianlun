@@ -13,7 +13,63 @@
 
 设置 `NIANLUN_API_APPLICATION_ENABLED=true` 启用调用，其他限额见 `.env.example`。
 不设置时公开入口返回 404，控制台仍可准备应用与密钥。
-原有部署启动命令继续可用；不要额外启动第二个共享相同数据库/工作区的 API 进程。
+从仓库根目录使用以下任一启动方式；不要额外启动第二个共享相同数据库/工作区的 API 进程：
+
+```bash
+uv run python -m app.api_server.main
+# 或由 uvicorn CLI 加载同一应用；必须显式关闭原始 access log。
+uv run uvicorn app.api_server.main:app --host 127.0.0.1 --port 8000 --no-access-log
+```
+
+模块入口已设置 `access_log=False`。保留应用的 `request.started/request.completed` 日志，
+其中只有 request ID、method、path、状态码和耗时，不含查询串、Authorization 或正文。
+公开图片 URL 的 query token 是单图访问凭据，不得记录到代理、ASGI、stdout/容器采集或错误日志。
+示例 nginx 在 http/server 两级将原始 error log 写入 `/dev/null`，防止上游失败或无效请求的
+错误消息带出完整请求行；它同时关闭 access log。采用专用网关配置，不再覆盖这些设置或在
+负载均衡器、WAF、APM 中采集原始 URL；保留错误诊断时须先验证能清除 query 的真实格式化链路。
+
+网关按方法与精确路径放行下表，其余路径、非 UUID 标识、额外段、尾斜线和错误方法返回 404。
+表中每条路径另允许 OPTIONS 转发给应用 CORS 校验；CORS 仍只允许配置的 Origin，
+允许鉴权、幂等键和图片请求头，并暴露 Location 与 X-Request-Id。
+
+| 方法 | 公开路径（标识均为标准带连字符 UUID） |
+| --- | --- |
+| POST | `/api/v1/runtime/apps/{app_id}/chat` |
+| GET | `/api/v1/runtime/apps/{app_id}/runs/{run_id}` |
+| GET | `/api/v1/runtime/images/{grant_id}` |
+| POST | `/api/v1/runtime/apps/{app_id}/runs/{run_id}/images/{attachment_id}/access` |
+| POST | `/v1/chat/completions` |
+| GET | `/v1/models`、`/v1/models/{app_id}` |
+
+部署时在实际 nginx 上执行配置检查，并验证上述允许/拒绝矩阵、带 fake token 的成功与失败请求日志；
+配置路由单元测试不能代替 nginx 的真实转发、错误日志和 TLS 验收。
+
+### 图片目录升级与离线维护
+
+首次写入 snapshot v3 前，先停止共享存储的全部旧 API、worker 和清理进程，
+释放读引用并备份一致的 SQLite 与工作区，再部署支持 v2/v3 的同版本代码。
+维护锁不能识别未接入协议的旧进程，部署人员必须确认其退出。写入 v3 后只能回退到
+支持 v3 的程序；恢复纯 v2 程序需要另行授权恢复整套一致备份，不能单独回退指针。
+
+图片补建使用 `python -m app.api_server.backfill_document_images --knowledge-base-id KB_ID`；
+可加 `--document-id DOCUMENT_ID`、`--batch-size 1..100`（默认 100）和 `--dry-run`。
+先正常停止 API 和导入任务，等待所有 worker 完成关闭及 SQLite checkpoint。
+dry-run 若发现非空 WAL 会明确拒绝，不忽略 WAL、不自动 checkpoint 或改写数据库。
+真实 MinIO/nginx、旧库升级与整套恢复的隔离验收命令见
+[`tests/acceptance/README.md`](../tests/acceptance/README.md)。默认测试不启动这些基础设施；
+已显式启用的验收会自行创建临时服务和 bucket，不使用生产 endpoint 或凭据。
+dry-run 的候选、预算和预计 revision 是预测，实际提交数单独报告。
+
+API 与 `import_datasets` 在迁移、恢复和存储初始化前持有共享生命周期维护锁；
+补建（含 dry-run）在扫描前非阻塞取得独占锁。冲突立即退出。锁文件位于
+`NIANLUN_API_DATA_DIR/.storage-maintenance.lock`，部署和清理不得删除或替换它。
+所有使用同一数据库/工作区的入口必须使用相同的解析后 data_dir 配置。
+锁顺序固定为维护锁、workspace 锁、数据库事务。
+
+通用 tree/FTS/vector/Agent/knowledgebase CLI 不直接操作 API 工作区；检测到
+`snapshots/`、`.api-server.lock`、`.tree-build-options.json` 或 ownership 标记时
+会在业务读取、清理或外部构建前拒绝对应路径及其后代。索引维护走 API，
+图片补建走上述离线命令。不要移除这些标记或把 API 路径伪装为旧版工作区。
 
 ## 控制台
 
@@ -114,10 +170,130 @@ v1 在独立回答节点生成时实时输出；v0 需要确认最后一个模�
 SDK 可通过 `extra_headers={"Idempotency-Key": message_key}` 传入；不提供时每次 HTTP 请求都视为新调用。
 已完成流式重试重放一次完整答案。正在执行的重试返回 409 和 Retry-After，失败调用不自动重新执行。
 
-第一版只支持文本、单回答（`n=1`）。`temperature`、`max_tokens`、外部 tools、图片、音频、
+输入仅支持文本，单回答（`n=1`）；输出默认文本，可按下节显式启用原图 Markdown。
+`temperature`、`max_tokens`、外部 tools、图片/音频输入、
 `response_format` 等未支持参数返回 HTTP 400，避免覆盖已发布的 Agent 设置或静默忽略调用方意图。
 Responses API 尚未提供。兼容入口错误使用 `{"error":{"message":...,"type":...,"param":...,"code":...}}`，
 保留 HTTP 状态、Retry-After、Location 和 X-Request-Id；现有管理与原生调用的错误格式不变。
+
+### 可选图片输出与结果恢复
+
+图片输出要求 v5 发布、服务端 `NIANLUN_API_ANSWER_IMAGES_ENABLED=true` 与本次请求 opt-in。
+v4 发布请求图片受理前返回 409；WeCom 仍只支持文字。该功能不向模型提供图片像素，也不启用视觉理解。
+
+| 请求入口 | 开启图片 | 选择传输 |
+| --- | --- | --- |
+| 原生 JSON | `include_images: true` | `image_transport: "url"`（默认）或 `"data_url"` |
+| OpenAI 请求头 | `X-Nianlun-Include-Images: true` | `X-Nianlun-Image-Transport: url`（默认）或 `data_url` |
+
+未开启图片配 `data_url` 明确拒绝；原生返回 422，OpenAI 返回 400。图片开关和 transport
+纳入幂等指纹，省略 transport 等价于 url，同幂等键修改这些选项返回冲突。
+两种输出均保留原位文字与图片顺序，OpenAI `content` 仍为标准 Markdown 字符串；
+原生 result 同时返回 `images`、`image_transport`、`answer_output_mode`。
+纯图请求也返回有序 Markdown；不可用位置保留说明，不把来源预览附件自动公开。
+
+URL 模式须设置 `NIANLUN_API_APPLICATION_PUBLIC_BASE_URL` 为可信公开 API 根地址，不能从请求 Host 推导。
+图片使用单图 grant；默认 `NIANLUN_API_ANSWER_IMAGE_GRANT_HOURS=24`，且不超过运行结果期限。
+每次读取仍检查 Key、渠道、来源和有效期。标准响应带 no-store，浏览器图片读取不需要再附应用 Key。
+URL 是持有者凭据，接入方不应写日志或放入分析埋点。
+
+Data URL 模式不要求公网图片地址，不签 grant。可信 PNG/JPEG/WebP 字节直接内联在 Markdown 和
+`images[].url`，`expires_at=null`，不提供链接刷新。默认原始单图 1 MiB、本轮 2 MiB、完整原生
+JSON envelope 8 MiB，配置分别为 `NIANLUN_API_ANSWER_IMAGE_INLINE_MAX_BYTES`、
+`NIANLUN_API_ANSWER_IMAGE_INLINE_TOTAL_BYTES`、`NIANLUN_API_ANSWER_IMAGE_INLINE_RESPONSE_MAX_BYTES`。
+图片字节超限保留 `inline_budget_exceeded` 说明，不静默回退 URL；完整响应超限则失败。
+Markdown 渲染器和 CSP 可能拒绝 data scheme，调用方须验证兼容，不能为此放开任意 HTML/SVG。
+已交付的字节无法撤回；后续详情读取/重放会重新校验权限，来源失效时不再输出原图。
+服务端不把 Base64 写入持久化结果；调用方回传的 assistant 图片历史只作指代线索，不抓取或解码。
+
+阻塞、流式及幂等重放均返回同一 `Location` 查询地址；无需从 completion ID 推导 run ID。
+Location 相对于所调用的公开 API 根地址解析，携带原 user_id；OpenAI 未传 user 时使用 `openai`。
+浏览器可通过已暴露的 Location 头恢复结果。SDK 应校验同源和精确 run 路径后才发送应用 Key，
+禁用自动跨域重定向，不向图片 URL 转发 Key。以下示例使用 OpenAI SDK 的原始响应和 httpx，
+只在 URL 即将过期时刷新；刷新结果仅更新接入方展示状态，不改变保存的原始完成结果：
+
+```python
+import os
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs, urljoin, urlsplit
+
+import httpx
+from openai import OpenAI
+
+api_root = os.environ["NIANLUN_BASE"].rstrip("/")
+app_id = str(uuid.UUID(os.environ["NIANLUN_APP_ID"]))
+app_key = os.environ["NIANLUN_APP_KEY"]
+user_id = "employee-123"
+expected = urlsplit(api_root)
+if (
+    expected.scheme not in {"http", "https"}
+    or not expected.hostname
+    or expected.username is not None
+    or expected.password is not None
+    or expected.query
+    or expected.fragment
+):
+    raise ValueError("Invalid configured API root")
+
+sdk = OpenAI(base_url=f"{api_root}/v1", api_key=app_key)
+raw = sdk.chat.completions.with_raw_response.create(
+    model=app_id,
+    user=user_id,
+    messages=[{"role": "user", "content": "请介绍系统架构，并展示原图"}],
+    extra_headers={"X-Nianlun-Include-Images": "true"},
+)
+completion = raw.parse()
+# Render completion.choices[0].message.content in local display state; do not log it.
+
+run_url = urljoin(f"{api_root}/", raw.headers["Location"])
+actual = urlsplit(run_url)
+prefix = expected.path.rstrip("/") + f"/api/v1/runtime/apps/{app_id}/runs/"
+run_id = actual.path.removeprefix(prefix)
+if (
+    (actual.scheme, actual.netloc) != (expected.scheme, expected.netloc)
+    or actual.username is not None
+    or actual.password is not None
+    or actual.fragment
+    or not actual.path.startswith(prefix)
+    or not re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", run_id)
+    or parse_qs(actual.query) != {"user_id": [user_id]}
+):
+    raise ValueError("Unexpected run result Location")
+
+with httpx.Client(
+    headers={"Authorization": f"Bearer {app_key}"},
+    follow_redirects=False,
+    timeout=30,
+) as http:
+    response = http.get(run_url)
+    response.raise_for_status()
+    run = response.json()["data"]
+    if run["run_id"] != run_id or run["app_id"] != app_id:
+        raise ValueError("Unexpected run identity")
+    result = run["result"]
+    if result is not None and result["image_transport"] == "url":
+        for image in result["images"]:
+            if image["status"] != "available" or not image["expires_at"]:
+                continue
+            expires = datetime.fromisoformat(image["expires_at"])
+            if expires > datetime.now(timezone.utc) + timedelta(minutes=5):
+                continue
+            attachment_id = str(uuid.UUID(image["id"]))
+            refresh_url = (
+                f"{api_root}/api/v1/runtime/apps/{app_id}/runs/{run_id}"
+                f"/images/{attachment_id}/access"
+            )
+            response = http.post(refresh_url, json={"user_id": user_id})
+            response.raise_for_status()
+            refreshed = response.json()["data"]
+            # Update local display state with refreshed["url"]/refreshed["expires_at"].
+```
+
+内联调用在 extra_headers 加 `X-Nianlun-Image-Transport: data_url`，不调用刷新接口。
+流式 SDK 使用 `with_streaming_response.create(stream=True, ...)`，在响应上下文内读取 Location 和 SSE。
+图片开启后只提前发送安全文字前缀，首图及后续内容等待完成事务后输出；心跳继续，失败不发送成功结束标记。
 
 ## 原生调用（保留兼容）
 
@@ -161,12 +337,16 @@ print(result["answer"])
 ## 流式与重试
 
 将 response_mode 改为 streaming，消费 SSE `ready -> message -> done`。
-首版 message 输出一次完整最终答案，执行期间有注释心跳；候选回答与内部 trace 不公开。
+message 输出已确认可公开的文字增量；图片开启时首图及后续内容在持久化成功后按原顺序输出。
+执行期间有注释心跳；候选回答与内部 trace 不公开。
 只有 done 表示成功持久化。执行失败以 error 结束；鉴权或参数错误发生在流开始前，使用正常 JSON HTTP 错误。
 
 受理响应的 Location 是调用结果查询地址，需要同客户端有效 Key。也可以使用
 `GET /api/v1/runtime/apps/{app_id}/runs/{run_id}?user_id={user_id}`。
 同幂等键完成重试返回原结果；正在执行返回 409 和 Retry-After，不会再调用一次模型。
+URL 模式重放保留首次保存的 URL/到期时间，不隐式续签；Data URL 模式从固定描述重新授权、重建，
+资源有效时字节相同，来源撤销后只返回不可用说明，不为精确重放再次披露原图。
+刷新只更新接入方持有的展示链接，不修改原始幂等结果或重新执行模型。
 失败、超时或取消不自动重跑；需要再次尝试时创建新会话并使用新消息幂等键。
 已完成会话支持重启后续聊；中断上下文拒绝续聊，避免把半轮执行当成完整历史。
 
@@ -176,6 +356,9 @@ print(result["answer"])
 两者都以 `invalid_request_error` 返回，不会退化为 500/502。
 超时后上游请求可能仍在结束中，实际 worker 退出前不会释放并发额度。
 会话默认空闲有效期 30 天；过期 checkpoint 会清理，消息及调用审计不因过期自动删除。
+运行结果另有 `NIANLUN_API_APPLICATION_RESULT_RETENTION_DAYS`（默认 30 天）截止时间，
+到期查询、重放和图片刷新返回 410，不续期或自动重跑；grant 到期可在结果有效且权限仍有效时显式刷新。
+旧 run 的空结果期限不等于无限图片授权：旧文字读取保持兼容，图片签发/刷新明确拒绝。
 OpenAI 兼容入口由调用方自带完整 messages、不建会话，属于无状态调用：每次调用结束后立即回收其 checkpoint thread，
 因此重复调用不会累积 checkpoint，也不能用于续聊；续聊请使用公开 `/chat` 并携带 `conversation_id`。
 首版调用记录和幂等键保留，至少覆盖 30 天重试窗口；额外历史保留会占用磁盘，需通过后续显式管理策略清理。

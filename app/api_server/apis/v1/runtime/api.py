@@ -1,18 +1,28 @@
 """Public application execution, with all admission before SSE headers."""
 
 import asyncio
+import queue
+import time
 from typing import Any
 
 from fastapi import APIRouter, Header, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
-from app.api_server.apis.v1.runtime_schemas import PublicChatRequest
+from app.api_server.apis.v1.runtime_schemas import (
+    PublicChatRequest,
+    PublicImageAccessRequest,
+)
 from app.api_server.common.errors import ApiError, success
 from app.api_server.common.request_context import get_request_id
 from app.api_server.common.sse import encode_sse
+from app.api_server.services.answer_image_streaming import (
+    ImageStreamPrefix,
+    utf8_chunks,
+)
 
 router = APIRouter(prefix="/api/v1/runtime/apps", tags=["public runtime"])
 management_router = APIRouter(prefix="/api/v1/apps", tags=["application runs"])
+images_router = APIRouter(prefix="/api/v1/runtime/images", tags=["public images"])
 
 
 @router.post("/{application_id}/chat", response_model=None)
@@ -30,7 +40,12 @@ async def chat(
     )
     preparation = asyncio.create_task(
         asyncio.to_thread(
-            service.prepare, principal, body, idempotency_key, get_request_id(request)
+            service.prepare,
+            principal,
+            body,
+            idempotency_key,
+            get_request_id(request),
+            stream_output=body.response_mode == "streaming" and body.include_images,
         )
     )
     try:
@@ -40,6 +55,7 @@ async def chat(
         service.cancel(prepared)
         raise
     response.headers["Location"] = service.location(prepared.row)
+    response.headers["Cache-Control"] = "private, no-store"
     stop_monitoring = asyncio.Event()
 
     async def disconnected() -> None:
@@ -73,6 +89,13 @@ async def chat(
 
     async def event_stream():
         task = asyncio.create_task(service.wait(prepared))
+        prefix = (
+            ImageStreamPrefix(
+                max_canonical_bytes=prepared.image_policy.max_canonical_bytes
+            )
+            if prepared.include_images
+            else None
+        )
         try:
             yield encode_sse(
                 "ready",
@@ -85,14 +108,33 @@ async def chat(
                     ],
                 },
             )
-            while True:
-                try:
-                    response = await asyncio.wait_for(asyncio.shield(task), timeout=15)
-                    break
-                except TimeoutError:
+            heartbeat = time.monotonic()
+            while not task.done() or (
+                prepared.deltas is not None and not prepared.deltas.empty()
+            ):
+                if prepared.deltas is not None:
+                    try:
+                        delta = prepared.deltas.get_nowait()
+                    except queue.Empty:
+                        pass
+                    else:
+                        text = prefix.feed(delta) if prefix is not None else delta
+                        for part in utf8_chunks(text):
+                            yield encode_sse("message", {"delta": part})
+                        continue
+                if time.monotonic() - heartbeat >= 15:
                     yield ": heartbeat\n\n"
-            if prepared.replay is None:
-                yield encode_sse("message", {"delta": response.answer})
+                    heartbeat = time.monotonic()
+                await asyncio.sleep(0.01)
+            response = await task
+            if prepared.replay is None or body.include_images:
+                suffix = (
+                    prefix.remainder(response.answer)
+                    if prefix is not None
+                    else response.answer
+                )
+                for part in utf8_chunks(suffix):
+                    yield encode_sse("message", {"delta": part})
             yield encode_sse("done", response.model_dump(mode="json"))
         except ApiError as exc:
             yield encode_sse(
@@ -113,7 +155,7 @@ async def chat(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "private, no-store",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
             "Location": service.location(prepared.row),
@@ -126,11 +168,13 @@ def get_run(
     application_id: str,
     run_id: str,
     request: Request,
+    response: Response,
     user_id: str = Query(min_length=1, max_length=128),
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     service = request.app.state.services.invocations
     principal = service.authenticate(application_id, authorization)
+    response.headers["Cache-Control"] = "private, no-store"
     return success(service.get(principal, run_id, user_id).model_dump(mode="json"))
 
 
@@ -154,4 +198,42 @@ def list_runs(
     )
 
 
-__all__ = ["router", "management_router"]
+@images_router.get("/{grant_id}")
+def read_public_image(
+    grant_id: str, request: Request, token: str = Query(min_length=1, max_length=128)
+) -> Response:
+    data, media_type = request.app.state.services.invocations.image_access.read(
+        grant_id, token
+    )
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
+
+
+@router.post("/{application_id}/runs/{run_id}/images/{attachment_id}/access")
+def refresh_public_image(
+    application_id: str,
+    run_id: str,
+    attachment_id: str,
+    body: PublicImageAccessRequest,
+    request: Request,
+    response: Response,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    service = request.app.state.services.invocations
+    principal = service.authenticate(application_id, authorization)
+    response.headers["Cache-Control"] = "private, no-store"
+    return success(
+        service.image_access.refresh(
+            principal, run_id, attachment_id, body.user_id
+        ).model_dump(mode="json")
+    )
+
+
+__all__ = ["router", "management_router", "images_router"]

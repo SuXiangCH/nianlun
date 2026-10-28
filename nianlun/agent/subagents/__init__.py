@@ -1,7 +1,7 @@
 """Standalone deep-search subagent components.
 
-This package is intentionally not imported by the main Agent flow yet. It can
-be integrated later through the request-level ``agent_mode`` gate.
+This package is intentionally not imported by the main Agent flow yet. An
+explicit execution bridge can re-read and remap child evidence for a parent.
 """
 
 from nianlun.agent.subagents.config import DeepSearchConfig
@@ -17,6 +17,7 @@ from nianlun.agent.subagents.result import (
     DeepSearchOutput,
     DeepSearchResult,
     Evidence,
+    EvidenceImageRef,
     EvidenceOutput,
     bound_result,
     result_from_agent_output,
@@ -34,6 +35,7 @@ __all__ = [
     "DeepSearchResult",
     "DeepSearchRunner",
     "Evidence",
+    "EvidenceImageRef",
     "EvidenceOutput",
     "bound_result",
     "build_deep_search_agent",

@@ -6,6 +6,7 @@ import argparse
 import sys
 
 from nianlun.indexing.vector.build import build_doc_vectors
+from nianlun.knowledgebase.workspace_ownership import require_legacy_workspace
 
 
 def main() -> None:
@@ -34,6 +35,7 @@ def main() -> None:
         help="知识库 ID；共享 collection 时用于隔离检索结果",
     )
     args = parser.parse_args()
+    require_legacy_workspace(args.workspace)
     try:
         build_doc_vectors(
             args.workspace,

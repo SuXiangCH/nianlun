@@ -13,6 +13,7 @@ from app.api_server.apis.v1.apps.publishing import router as publishing_router
 from app.api_server.apis.v1.runtime.api import (
     router as runtime_router,
     management_router as runs_router,
+    images_router as runtime_images_router,
 )
 from app.api_server.apis.v1.runtime.openai import router as openai_router
 
@@ -28,6 +29,7 @@ for child_router in (
     models_router,
     publishing_router,
     runtime_router,
+    runtime_images_router,
     runs_router,
     openai_router,
 ):

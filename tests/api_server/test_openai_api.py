@@ -423,6 +423,15 @@ def test_stream_timeout_cancels_execution_without_done(client, runtime, monkeypa
     import threading
 
     exited, release = threading.Event(), threading.Event()
+    prepared_invocations = []
+    prepare = runtime.service.prepare
+
+    def capture_prepared(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        prepared_invocations.append(prepared)
+        return prepared
+
+    monkeypatch.setattr(runtime.service, "prepare", capture_prepared)
     runtime.service.settings = replace(
         runtime.settings, application_api_timeout_seconds=0.03
     )
@@ -450,4 +459,7 @@ def test_stream_timeout_cancels_execution_without_done(client, runtime, monkeypa
     finally:
         release.set()
     assert exited.wait(2)
+    # The generator exits before the worker persists its terminal status.
+    with pytest.raises(ApiError, match="调用超时"):
+        prepared_invocations[0].future.result(timeout=2)
     assert runtime.service.list(runtime.app_id)["items"][0]["status"] == "timed_out"

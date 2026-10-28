@@ -20,6 +20,7 @@ from nianlun.agent.retrieval_answer.input_messages import (
 )
 from nianlun.agent.retrieval_answer.state import RetrievalAnswerGraphState
 from nianlun.agent.tool_call_batches import annotate_tool_call_batches
+from nianlun.agent.prompt_registry import LEGACY_PROMPT_BUNDLE, PromptBundle
 from nianlun.agent.usage import message_usage
 
 _RETRIEVAL_TOOL_NAMES = {
@@ -29,6 +30,7 @@ _RETRIEVAL_TOOL_NAMES = {
     "get_line_content",
     "get_structure_outline",
     "search_document_nodes",
+    "select_answer_images",
 }
 
 
@@ -112,6 +114,8 @@ def build_retrieval_answer_graph(
     recursion_limit: int,
     context_window_tokens: int | None,
     checkpointer: Any = None,
+    prompt_bundle: PromptBundle = LEGACY_PROMPT_BUNDLE,
+    image_capability: bool = False,
 ) -> Any:
     """构建固定为 retrieval -> answer 的外层图。"""
 
@@ -124,6 +128,8 @@ def build_retrieval_answer_graph(
             context_window_tokens=context_window_tokens,
             conversation_context=state.get("conversation_context", []),
             input_messages=runtime.context.get("input_messages"),
+            trusted_history=runtime.context.get("trusted_history"),
+            prompt_bundle=prompt_bundle,
         )
         final_result: dict[str, Any] | None = None
         usage_messages: list[Any] = []
@@ -197,6 +203,9 @@ def build_retrieval_answer_graph(
             "clarification": clarification,
             "retrieval_usage": usage,
             "answer": "",
+            "answer_output_mode": "text",
+            "selected_answer_images": [],
+            "display_image_citation_ids": [],
         }
         if clarification is not None:
             update.update(
@@ -210,6 +219,27 @@ def build_retrieval_answer_graph(
                             "role": "assistant",
                             "content": _format_visible_clarification(clarification),
                         },
+                    ],
+                }
+            )
+        elif image_capability and collector.image_context.selected_images:
+            selected = collector.image_context.selected_images
+            update.update(
+                {
+                    "answer_output_mode": "images",
+                    "selected_answer_images": selected,
+                    "display_image_citation_ids": list(
+                        dict.fromkeys(
+                            binding["citation_id"]
+                            for image in selected
+                            for binding in image["source_bindings"]
+                        )
+                    ),
+                    "answer_usage": None,
+                    "answer_input_citation_ids": [],
+                    "omitted_citation_ids": [],
+                    "conversation_context": [
+                        {"role": "user", "content": state["question"]}
                     ],
                 }
             )
@@ -248,6 +278,10 @@ def build_retrieval_answer_graph(
             context_window_tokens=context_window_tokens,
             conversation_context=state.get("conversation_context", []),
             input_messages=runtime.context.get("input_messages"),
+            trusted_history=runtime.context.get("trusted_history"),
+            prompt_bundle=prompt_bundle,
+            image_capability=image_capability,
+            image_policy=runtime.context["retrieval_collector"].image_policy,
         )
         response = answer_model.invoke(messages)
         answer_text = content_to_text(response)
@@ -268,7 +302,11 @@ def build_retrieval_answer_graph(
         }
 
     def after_retrieval(state: RetrievalAnswerGraphState) -> str:
-        if state.get("clarification") is not None or state.get("answer"):
+        if (
+            state.get("clarification") is not None
+            or state.get("answer")
+            or state.get("answer_output_mode") == "images"
+        ):
             return "done"
         return "answer"
 

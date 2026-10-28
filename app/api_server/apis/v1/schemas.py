@@ -9,6 +9,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from nianlun.models.reasoning import ReasoningEffort, ReasoningEffortOverride
+
 
 class ApiSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", from_attributes=True)
@@ -77,6 +79,22 @@ class AgentTraceMessageStep(ApiSchema):
 AgentTraceStep = AgentTraceStatusStep | AgentTraceMessageStep
 
 
+class AnswerImageResponse(ApiSchema):
+    id: str
+    ref_ids: list[str] = Field(default_factory=list)
+    citation_ids: list[int] = Field(default_factory=list)
+    caption: str = ""
+    display_in_answer: bool = True
+    status: Literal["available", "unavailable", "deleted"]
+    unavailable_reason: str | None = None
+    media_type: Literal["image/png", "image/jpeg", "image/webp"] | None = None
+    size_bytes: int | None = Field(default=None, gt=0)
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    orientation: int = Field(default=1, ge=1, le=8)
+    url: str | None = None
+
+
 class ChatResponse(ApiSchema):
     app_id: str
     conversation_id: str
@@ -90,6 +108,10 @@ class ChatResponse(ApiSchema):
     usage: dict[str, int] | None = None
     ttft_ms: int | None = None
     clarification: dict[str, Any] | None = None
+    images: list[AnswerImageResponse] = Field(default_factory=list)
+    answer_format_version: Literal[1, 2] = 1
+    answer_output_mode: Literal["text", "images", "text_and_images"] = "text"
+    image_previews_unavailable: int = Field(default=0, ge=0)
 
 
 class ConversationResponse(ApiSchema):
@@ -122,6 +144,7 @@ class MessageSourceResponse(ApiSchema):
     total_chars: int | None = None
     text_truncated: bool = False
     content_version: int | None = None
+    image_attachment_ids: list[str] = Field(default_factory=list)
 
 
 class ConversationMessageResponse(ApiSchema):
@@ -140,6 +163,26 @@ class ConversationMessageResponse(ApiSchema):
     created_at: datetime
     updated_at: datetime
     sources: list[MessageSourceResponse] = Field(default_factory=list)
+    images: list[AnswerImageResponse] = Field(default_factory=list)
+    answer_format_version: Literal[1, 2] = 1
+    answer_output_mode: Literal["text", "images", "text_and_images"] = "text"
+    image_previews_unavailable: int = Field(default=0, ge=0)
+
+
+class ParserOptionsOverrides(ApiSchema):
+    is_ocr: bool | None = Field(default=None, strict=True)
+    enable_table: bool | None = Field(default=None, strict=True)
+    enable_formula: bool | None = Field(default=None, strict=True)
+    language: str | None = Field(default=None, min_length=1, max_length=32)
+
+    @field_validator("language", mode="before")
+    @classmethod
+    def strip_language(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+
+class DocumentReparseRequest(ApiSchema):
+    is_ocr: bool | None = Field(default=None, strict=True)
 
 
 class KnowledgeBaseCreateRequest(ApiSchema):
@@ -147,7 +190,13 @@ class KnowledgeBaseCreateRequest(ApiSchema):
     description: str = Field(default="", max_length=2_000)
     summary_enabled: bool = True
     heading_recovery_enabled: bool = True
+    parser_options: ParserOptionsOverrides = Field(
+        default_factory=ParserOptionsOverrides
+    )
+    subtree_folding_enabled: bool = True
+    min_subtree_tokens: int = Field(default=1200, ge=1, strict=True)
     llm_model_id: str | None = Field(default=None, max_length=128)
+    reasoning_effort: ReasoningEffortOverride = "inherit"
     embedding_model_id: str | None = Field(default=None, max_length=128)
 
     @field_validator("embedding_model_id", "llm_model_id")
@@ -161,9 +210,20 @@ class KnowledgeBaseUpdateRequest(ApiSchema):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     summary_enabled: bool | None = None
     heading_recovery_enabled: bool | None = None
+    parser_options: ParserOptionsOverrides | None = None
+    subtree_folding_enabled: bool | None = None
+    min_subtree_tokens: int | None = Field(default=None, ge=1, strict=True)
     llm_model_id: str | None = Field(default=None, max_length=128)
+    reasoning_effort: ReasoningEffortOverride = "inherit"
     embedding_model_id: str | None = Field(default=None, max_length=128)
     vector_enabled: bool | None = None
+
+    @field_validator("min_subtree_tokens")
+    @classmethod
+    def require_folding_threshold(cls, value: int | None) -> int:
+        if value is None:
+            raise ValueError("合并阈值必须为正整数")
+        return value
 
     @field_validator("embedding_model_id", "llm_model_id")
     @classmethod
@@ -190,11 +250,17 @@ class ModelConfigTestRequest(ModelEndpointConfigUpdate):
     dimension: int | None = Field(default=None, gt=0, le=100_000)
     api_mode: Literal["saas_precision", "self_hosted"] = "saas_precision"
     supports_vision: bool | None = Field(default=None, strict=True)
+    reasoning_effort: ReasoningEffort | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2, strict=True)
 
     @model_validator(mode="after")
     def validate_vision_target(self) -> "ModelConfigTestRequest":
         if self.target != "llm" and self.supports_vision is not None:
             raise ValueError("supports_vision 仅适用于 LLM")
+        if self.target != "llm" and self.reasoning_effort is not None:
+            raise ValueError("reasoning_effort 仅适用于 LLM")
+        if self.target != "llm" and self.temperature is not None:
+            raise ValueError("temperature 仅适用于 LLM")
         return self
 
     @field_validator("model")
@@ -226,6 +292,8 @@ class ModelProfileRequest(ModelEndpointConfigUpdate):
     model: str | None = Field(default=None, max_length=256)
     context_window_tokens: int | None = Field(default=None, gt=0, le=10_000_000)
     supports_vision: bool | None = Field(default=None, strict=True)
+    reasoning_effort: ReasoningEffort | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2, strict=True)
     dimension: int | None = Field(default=None, gt=0, le=100_000)
     # Kept for backwards-compatible clients; knowledge-base selection is the
     # source of truth for whether an Embedding profile is used.
@@ -269,6 +337,10 @@ class ModelProfileRequest(ModelEndpointConfigUpdate):
             raise ValueError("context_window_tokens 仅适用于 LLM")
         if self.kind != "llm" and self.supports_vision is not None:
             raise ValueError("supports_vision 仅适用于 LLM")
+        if self.kind != "llm" and self.reasoning_effort is not None:
+            raise ValueError("reasoning_effort 仅适用于 LLM")
+        if self.kind != "llm" and self.temperature is not None:
+            raise ValueError("temperature 仅适用于 LLM")
         return self
 
     @field_validator("language")
@@ -306,6 +378,8 @@ class ModelProfileResponse(ApiSchema):
     model: str | None
     context_window_tokens: int | None
     supports_vision: bool | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    temperature: float | None = None
     base_url: str | None
     api_key_configured: bool
     enabled: bool
@@ -329,7 +403,13 @@ class KnowledgeBaseResponse(ApiSchema):
     status: Literal["creating", "ready", "indexing", "error"]
     document_count: int
     summary_enabled: bool = True
+    reasoning_effort: ReasoningEffortOverride = "inherit"
     heading_recovery_enabled: bool = True
+    parser_options: ParserOptionsOverrides = Field(
+        default_factory=ParserOptionsOverrides
+    )
+    subtree_folding_enabled: bool = False
+    min_subtree_tokens: int | None = None
     llm_model_id: str | None = None
     workspace_dir: str
     workspace_relpath: str | None = None
@@ -363,6 +443,23 @@ class KnowledgeBaseResponse(ApiSchema):
     idempotent_replay: bool = False
     created_at: datetime
     updated_at: datetime
+
+
+class DocumentPreviewImageResponse(ApiSchema):
+    id: str
+    caption: str = ""
+    status: Literal["available", "unavailable"]
+    url: str | None = None
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    orientation: int = Field(default=1, ge=1, le=8)
+
+
+class DocumentPreviewResponse(ApiSchema):
+    content: str
+    rendered_content: str
+    content_version: int = Field(ge=0)
+    images: list[DocumentPreviewImageResponse] = Field(default_factory=list)
 
 
 class DocumentArtifactResponse(ApiSchema):
@@ -491,6 +588,7 @@ class ApplicationCreateRequest(ApiSchema):
     provider: str = Field(default="default", min_length=1, max_length=128)
     agent_version: Literal["v0", "v1"] = "v0"
     clarification_enabled: bool = True
+    reasoning_effort: ReasoningEffortOverride = "inherit"
 
     @field_validator("llm_model_id")
     @classmethod
@@ -509,6 +607,7 @@ class ApplicationResponse(ApiSchema):
     agent_version: Literal["v0", "v1"]
     config_version: int = 1
     clarification_enabled: bool = True
+    reasoning_effort: ReasoningEffortOverride = "inherit"
     created_at: datetime
     updated_at: datetime
 
@@ -530,6 +629,8 @@ __all__ = [
     "DocumentProgressResponse",
     "DocumentResponse",
     "KnowledgeBaseCreateRequest",
+    "ParserOptionsOverrides",
+    "DocumentReparseRequest",
     "KnowledgeBaseUpdateRequest",
     "KnowledgeBaseResponse",
     "ModelConfigTestRequest",

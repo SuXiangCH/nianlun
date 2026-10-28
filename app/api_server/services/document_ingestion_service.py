@@ -31,6 +31,7 @@ from app.api_server.services.document_pipeline_service import DocumentPipelineSe
 from app.api_server.services.documents.pipeline_contracts import (
     NormalizationChunk,
     NormalizationInput,
+    ParserConfigSnapshot,
 )
 from app.api_server.services.documents.pdf_chunks import (
     PdfChunk,
@@ -386,9 +387,7 @@ class DocumentIngestionService:
                 prebuilt_document=prebuilt_document,
             )
 
-    def _queue_markdown_normalization(
-        self, document: dict[str, Any], now: str
-    ) -> None:
+    def _queue_markdown_normalization(self, document: dict[str, Any], now: str) -> None:
         """Idempotently enqueue the native-Markdown normalize handoff."""
         document_id = str(document["id"])
         generation = int(document["pipeline_generation"])
@@ -428,6 +427,30 @@ class DocumentIngestionService:
             now=now,
         )
 
+    def _parser_config_for_knowledge_base(
+        self, knowledge_base_id: str
+    ) -> dict[str, Any]:
+        config = self.models.parser_runtime_config()
+        kb = self.knowledge_bases.require_record(knowledge_base_id)
+        config.update(
+            {
+                key: value
+                for key, value in kb.get("parser_options", {}).items()
+                if value is not None
+            }
+        )
+        return config
+
+    @staticmethod
+    def _parser_config_snapshot(config: dict[str, Any]) -> ParserConfigSnapshot:
+        return ParserConfigSnapshot.model_validate(
+            {
+                key: config[key]
+                for key in ParserConfigSnapshot.model_fields
+                if key in config
+            }
+        )
+
     def _upload_mineru_document(
         self,
         knowledge_base_id: str,
@@ -437,7 +460,7 @@ class DocumentIngestionService:
         mime_type: str | None,
         idempotency_key: str | None,
     ) -> Any:
-        parser_config = self.models.parser_runtime_config()
+        parser_config = self._parser_config_for_knowledge_base(knowledge_base_id)
         digest = _sha256(content)
         item = self.knowledge_bases.require_record(knowledge_base_id)
         workspace = Path(str(item["workspace_dir"]))
@@ -497,6 +520,9 @@ class DocumentIngestionService:
                         "source_relpath": source_relpath,
                         "source_sha256": digest,
                         "parser": "mineru",
+                        "parser_config_json": self._parser_config_snapshot(
+                            parser_config
+                        ).model_dump_json(),
                         "status": "parsing",
                         "current_stage": "parse",
                         "stage_state": "queued",
@@ -542,7 +568,7 @@ class DocumentIngestionService:
         lease_token: str,
         schedule_poll: bool = True,
     ) -> None:
-        client = self._mineru_client_factory(parser_config)
+        client = self._client_for_task(task, parser_config)
         try:
             if not self.repository.update_claimed_parse_task(
                 task["id"],
@@ -602,7 +628,11 @@ class DocumentIngestionService:
     def _schedule_preparation(
         self, document_id: str, parser_config: dict[str, Any] | None = None
     ) -> None:
-        key = f"prepare:{document_id}"
+        document = self._find_document(document_id)
+        if document is None or document["status"] == "deleted":
+            return
+        generation = int(document["pipeline_generation"])
+        key = f"prepare:{document_id}:g{generation}"
         with self._jobs_lock:
             active = self._jobs.get(key)
             if active is not None and not active.done():
@@ -611,6 +641,7 @@ class DocumentIngestionService:
                 self._prepare_parse_tasks,
                 document_id,
                 parser_config or self.models.parser_runtime_config(),
+                generation,
             )
 
     @staticmethod
@@ -671,9 +702,7 @@ class DocumentIngestionService:
                         else None
                     ),
                     relpath=(
-                        str(entry["relpath"])
-                        if entry["relpath"] is not None
-                        else None
+                        str(entry["relpath"]) if entry["relpath"] is not None else None
                     ),
                     sha256=str(entry["sha256"]),
                     size_bytes=int(entry["size_bytes"]),
@@ -683,7 +712,9 @@ class DocumentIngestionService:
             if [chunk.chunk_index for chunk in chunks] != list(range(len(chunks))):
                 raise ValueError
         except (KeyError, TypeError, ValueError) as exc:
-            raise PdfChunkError("PDF 分段计划无效，请重试以创建新的解析 generation") from exc
+            raise PdfChunkError(
+                "PDF 分段计划无效，请重试以创建新的解析 generation"
+            ) from exc
         for chunk in chunks:
             if chunk.relpath is None:
                 continue
@@ -727,21 +758,58 @@ class DocumentIngestionService:
         return True
 
     def _prepare_parse_tasks(
-        self, document_id: str, parser_config: dict[str, Any]
+        self,
+        document_id: str,
+        parser_config: dict[str, Any],
+        generation: int | None = None,
     ) -> None:
-        key = f"prepare:{document_id}"
         document = self._find_document(document_id)
         if document is None:
-            self._clear_job(key)
+            if generation is not None:
+                self._clear_job(f"prepare:{document_id}:g{generation}")
             return
+        if generation is None:
+            generation = int(document["pipeline_generation"])
+        key = f"prepare:{document_id}:g{generation}"
         try:
+            if (
+                int(document["pipeline_generation"]) != generation
+                or document["status"] == "deleted"
+            ):
+                return
             kb = self.knowledge_bases.require_record(str(document["knowledge_base_id"]))
             workspace = Path(str(kb["workspace_dir"])).resolve()
             source = (workspace / str(document["source_relpath"])).resolve()
             source.relative_to(workspace)
             content = source.read_bytes()
-            generation = int(document.get("pipeline_generation", 1))
             existing_tasks = self.repository.list_parse_tasks(document_id, generation)
+            if document.get("parser_config_json") is None:
+                # Legacy tasks already submitted must retain their original parameters.
+                parser_config = {
+                    **parser_config,
+                    **{
+                        key: value
+                        for key, value in kb.get("parser_options", {}).items()
+                        if value is not None
+                    },
+                }
+                if existing_tasks:
+                    first = existing_tasks[0]
+                    parser_config.update(self._task_options(first))
+                    parser_config.update(
+                        {key: first[key] for key in ("api_mode", "model_version")}
+                    )
+                frozen = self.repository.freeze_document_parser_config(
+                    document_id,
+                    generation,
+                    self._parser_config_snapshot(parser_config).model_dump_json(),
+                )
+            else:
+                frozen = str(document["parser_config_json"])
+            parser_config = {
+                **parser_config,
+                **ParserConfigSnapshot.model_validate_json(frozen).model_dump(),
+            }
             if document["file_extension"] == ".pdf":
                 options = build_parser_options(parser_config, ".pdf")
                 page_ranges = str(options.pop("page_ranges", "") or "")
@@ -767,6 +835,7 @@ class DocumentIngestionService:
                     self.repository.update_document(
                         document_id,
                         {"parse_plan_json": plan_json, "updated_at": now},
+                        pipeline_generation=generation,
                     )
                     document["parse_plan_json"] = plan_json
             else:
@@ -783,9 +852,7 @@ class DocumentIngestionService:
                         size_bytes=len(content),
                     )
                 ]
-            existing = {
-                int(item["chunk_index"]) for item in existing_tasks
-            }
+            existing = {int(item["chunk_index"]) for item in existing_tasks}
             now = _now()
             total_pages = sum(
                 (
@@ -795,6 +862,19 @@ class DocumentIngestionService:
                     else 0
                 )
                 for chunk in chunks
+            )
+            self.repository.update_document(
+                document_id,
+                {
+                    "current_stage": "parse",
+                    "stage_state": "running",
+                    "progress_completed": 0,
+                    "progress_total": total_pages or len(chunks),
+                    "progress_unit": "pages" if total_pages else "chunks",
+                    "updated_at": now,
+                },
+                pipeline_generation=generation,
+                expected_state=("parsing", "parse"),
             )
             for chunk in chunks:
                 if chunk.relpath is not None:
@@ -848,17 +928,6 @@ class DocumentIngestionService:
                     }
                 )
                 self._schedule_task_submission(str(task["id"]))
-            self.repository.update_document(
-                document_id,
-                {
-                    "current_stage": "parse",
-                    "stage_state": "running",
-                    "progress_completed": 0,
-                    "progress_total": total_pages or len(chunks),
-                    "progress_unit": "pages" if total_pages else "chunks",
-                    "updated_at": now,
-                },
-            )
             self.repository.append_pipeline_event(
                 document_id=document_id,
                 pipeline_generation=generation,
@@ -871,7 +940,6 @@ class DocumentIngestionService:
         except Exception as exc:
             code = getattr(exc, "code", None)
             message = str(exc).strip() or exc.__class__.__name__
-            generation = int(document.get("pipeline_generation", 1))
             failed = self.repository.fail_document_parse_preflight(
                 document_id,
                 generation,
@@ -890,9 +958,8 @@ class DocumentIngestionService:
                         document_id,
                     )
                 else:
-                    self._prepare_parse_tasks(document_id, parser_config)
+                    self._schedule_preparation(document_id)
                     return
-            self._fail_upload_for_document(document_id, message)
         finally:
             self._clear_job(key)
 
@@ -991,9 +1058,11 @@ class DocumentIngestionService:
         expected_chunk_indexes = set(
             range(max((int(task.get("chunk_count", 1)) for task in tasks), default=0))
         )
-        if not tasks or {
-            int(task.get("chunk_index", 0)) for task in tasks
-        } != expected_chunk_indexes:
+        if (
+            not tasks
+            or {int(task.get("chunk_index", 0)) for task in tasks}
+            != expected_chunk_indexes
+        ):
             self._schedule_preparation(document_id)
         for task in tasks:
             if (
@@ -1251,7 +1320,9 @@ class DocumentIngestionService:
                         or len(zip_content) > self.settings.max_upload_bytes
                         or not reserve(zip_allocation, "result_zip", len(zip_content))
                     ):
-                        raise MineruError("MinerU 解析结果超过大小限制或 staging 配额不足")
+                        raise MineruError(
+                            "MinerU 解析结果超过大小限制或 staging 配额不足"
+                        )
                     WorkspaceArtifactStore.atomic_write(zip_path, zip_content)
                 files = extract_result_archive(
                     zip_path,
@@ -1275,7 +1346,11 @@ class DocumentIngestionService:
                 if full_member is None:
                     raise MineruError("MinerU 解析结果缺少 Markdown 主文件")
                 content_list = next(
-                    (path for path in files if path.name.lower() == "content_list.json"),
+                    (
+                        path
+                        for path in files
+                        if path.name.lower() == "content_list.json"
+                    ),
                     None,
                 )
                 duplicate_size = full_member.stat().st_size
@@ -1288,7 +1363,9 @@ class DocumentIngestionService:
                 full_relpath = f"{result_root_relpath}/full.md"
                 full_content = full_member.read_bytes()
                 ensure_lease()
-                WorkspaceArtifactStore.atomic_write(workspace / full_relpath, full_content)
+                WorkspaceArtifactStore.atomic_write(
+                    workspace / full_relpath, full_content
+                )
                 now = _now()
                 for kind, relpath, mime, size_bytes, sha256 in (
                     (
@@ -1402,16 +1479,16 @@ class DocumentIngestionService:
         heading_recovery_mode = (
             "rules_then_llm"
             if document.get("parser") == "mineru"
-            and str(document.get("file_extension", "")).lower() == ".pdf"
             and bool(knowledge_base.get("heading_recovery_enabled", True))
             else "off"
         )
-        # A repaired PDF outline is a user-facing navigation result. Folding its
-        # short sections back into parents would erase the recovered hierarchy.
-        thin = tree_options.subtree_folding_enabled and heading_recovery_mode == "off"
+        thin = tree_options.subtree_folding_enabled
         llm = None
         if knowledge_base["summary_enabled"]:
-            llm = self.models.build_llm(knowledge_base.get("llm_model_id"))
+            llm = self.models.build_llm(
+                knowledge_base.get("llm_model_id"),
+                reasoning_effort=knowledge_base.get("reasoning_effort", "inherit"),
+            )
         if knowledge_base["summary_enabled"]:
             _, parsed = build_workspace_doc(
                 str(path),
@@ -1448,8 +1525,10 @@ class DocumentIngestionService:
                 "file_extension": entity.file_extension,
                 "mime_type": entity.mime_type,
                 "parser": entity.parser,
+                "status": entity.status,
                 "pipeline_generation": entity.pipeline_generation,
                 "parse_plan_json": entity.parse_plan_json,
+                "parser_config_json": entity.parser_config_json,
                 "source_relpath": entity.source_relpath,
                 "source_sha256": entity.source_sha256,
             }
@@ -1483,24 +1562,6 @@ class DocumentIngestionService:
                 "document.parse_failure_fence_rejected task_id=%s", task["id"]
             )
             return
-        self._fail_upload_for_document(str(task["document_id"]), message)
-
-    def _fail_upload_for_document(self, document_id: str, message: str) -> None:
-        document = self._find_document(document_id)
-        if document is None:
-            return
-        try:
-            upload_key = self._upload_key(
-                str(document["knowledge_base_id"]), str(document["id"])
-            )
-        except KeyError:
-            logger.warning(
-                "document.upload_operation_missing document_id=%s", document_id
-            )
-            return
-        self.repository.fail_upload(
-            str(document["knowledge_base_id"]), upload_key, message, _now()
-        )
 
     def list_documents(self, knowledge_base_id: str) -> list[dict[str, Any]]:
         self._materialize_legacy_markdown(knowledge_base_id)
@@ -1551,6 +1612,43 @@ class DocumentIngestionService:
             ),
             "events": self.repository.list_pipeline_events(document_id, generation),
         }
+
+    def reparse_document(
+        self, knowledge_base_id: str, document_id: str, *, is_ocr: bool | None = None
+    ) -> dict[str, Any]:
+        document = self.repository.get_document(knowledge_base_id, document_id)
+        if document is None:
+            raise ApiError("文档不存在", status.HTTP_404_NOT_FOUND)
+        if document["parser"] != "mineru":
+            raise ApiError(
+                "仅支持重新解析 PDF 或 Word 文档",
+                status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            )
+        if document["status"] not in {"ready", "failed"}:
+            raise ApiError("文档正在处理中，暂不能重新解析", status.HTTP_409_CONFLICT)
+        kb = self.knowledge_bases.require_record(knowledge_base_id)
+        workspace = Path(str(kb["workspace_dir"]))
+        source = _resolve_workspace_path(workspace, str(document["source_relpath"]))
+        if source is None or not source.is_file():
+            raise ApiError("原始文件不存在，无法重新解析", status.HTTP_409_CONFLICT)
+        config = self._parser_config_for_knowledge_base(knowledge_base_id)
+        if is_ocr is not None:
+            config["is_ocr"] = is_ocr
+        try:
+            self.repository.restart_parse_preparation(
+                document_id,
+                int(document["pipeline_generation"]),
+                _now(),
+                reparse=True,
+                parser_config_json=self._parser_config_snapshot(
+                    config
+                ).model_dump_json(),
+            )
+        except ValueError as exc:
+            raise ApiError(str(exc), status.HTTP_409_CONFLICT) from exc
+        self._schedule_preparation(document_id, config)
+        refreshed = self.repository.get_document(knowledge_base_id, document_id)
+        return self._payload(refreshed or document)
 
     def retry_document(
         self, knowledge_base_id: str, document_id: str
@@ -1921,6 +2019,7 @@ class DocumentIngestionService:
         artifacts = self.repository.list_document_artifacts(str(item["id"]))
         payload = dict(item)
         payload.pop("parse_plan_json", None)
+        payload.pop("parser_config_json", None)
         try:
             warnings = json.loads(str(payload.pop("warning_json", "[]")))
         except (TypeError, ValueError):
@@ -2033,7 +2132,9 @@ class DocumentIngestionService:
 
     def recover(self) -> None:
         self.pipeline.recover()
-        for document in self.repository.list_unqueued_markdown_normalization_documents():
+        for (
+            document
+        ) in self.repository.list_unqueued_markdown_normalization_documents():
             try:
                 self._queue_markdown_normalization(document, _now())
             except Exception:
@@ -2049,10 +2150,10 @@ class DocumentIngestionService:
     def shutdown(self) -> None:
         self._dispatcher_stop.set()
         self._dispatcher_wake.set()
-        self._dispatcher_thread.join(timeout=5)
+        self._dispatcher_thread.join()
         self.pipeline.shutdown()
-        self._submission_executor.shutdown(wait=False, cancel_futures=True)
-        self._poll_executor.shutdown(wait=False, cancel_futures=True)
+        self._submission_executor.shutdown(wait=True, cancel_futures=True)
+        self._poll_executor.shutdown(wait=True, cancel_futures=True)
 
 
 __all__ = ["DocumentIngestionService", "MINERU_EXTENSIONS", "SUPPORTED_EXTENSIONS"]

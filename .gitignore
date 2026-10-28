@@ -57,10 +57,15 @@ docs/*
 !docs/wecom_channel.md
 !docs/architecture/
 docs/architecture/*
+!docs/architecture/answer_images_design.md
+!docs/architecture/answer_images/
+docs/architecture/answer_images/*
+!docs/architecture/answer_images/[0-9][0-9]_*.md
 !docs/architecture/evaluation.md
 !docs/architecture/agent_tool_loop_guard.md
 !docs/architecture/weak_titled_markdown_structure_design.md
 !docs/architecture/document_processing_pipeline_design.md
+!docs/architecture/reasoning_effort.md
 !docs/architecture/application_api_publishing_design.md
 !docs/architecture/application_api_publishing_plan.md
 !docs/architecture/wecom_channel_design.md

@@ -91,7 +91,7 @@ async def _call(
                     )
                 call_counter[0] += 1
             response = await asyncio.wait_for(
-                llm.ainvoke(system + "\n\n" + user, temperature=0),
+                llm.ainvoke(system + "\n\n" + user),
                 config.timeout_seconds,
             )
             received_response = True

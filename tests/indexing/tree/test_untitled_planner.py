@@ -274,10 +274,10 @@ def test_grouping_creates_parent_with_empty_own_content_spans():
     assert parents[0].own_content_spans == ()
 
 
-def test_planner_calls_use_zero_temperature():
+def test_planner_calls_preserve_configured_temperature():
     source, _raw = _multi_chunk_source(paragraphs=2)
     config = PlannerConfig(max_retries=0, target_tokens=5, max_candidate_tokens=10)
     llm = ScriptedPlannerLLM()
     asyncio.run(plan_untitled(source, llm, config))
     assert llm.kwargs, "mock 应至少收到一次调用"
-    assert all(kwargs.get("temperature") == 0 for kwargs in llm.kwargs)
+    assert all("temperature" not in kwargs for kwargs in llm.kwargs)

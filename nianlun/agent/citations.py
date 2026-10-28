@@ -11,9 +11,6 @@ from mdit_py_plugins.dollarmath import dollarmath_plugin
 
 _CITATION_RE = re.compile(r"\[(\d+)\]")
 _HTML_TABLE_RE = re.compile(r"<table\b[^>]*>[\s\S]*?</table>", re.IGNORECASE)
-_MARKDOWN = (
-    MarkdownIt("commonmark").enable("table").use(dollarmath_plugin, double_inline=True)
-)
 
 
 def _unmatched_double_dollar_rule(state: Any, silent: bool) -> bool:
@@ -29,9 +26,20 @@ def _unmatched_double_dollar_rule(state: Any, silent: bool) -> bool:
     return True
 
 
-_MARKDOWN.inline.ruler.before(
-    "math_inline", "remark_math_unmatched_double", _unmatched_double_dollar_rule
-)
+def create_answer_markdown_parser() -> MarkdownIt:
+    """Keep citation and image interpretation aligned with the console syntax."""
+    parser = (
+        MarkdownIt("commonmark")
+        .enable("table")
+        .use(dollarmath_plugin, double_inline=True)
+    )
+    parser.inline.ruler.before(
+        "math_inline", "remark_math_unmatched_double", _unmatched_double_dollar_rule
+    )
+    return parser
+
+
+_MARKDOWN = create_answer_markdown_parser()
 
 
 def _html_table_cells(html: str) -> list[str]:
@@ -105,4 +113,4 @@ def extract_citation_ids(markdown: str) -> set[int]:
     return citation_ids
 
 
-__all__ = ["extract_citation_ids"]
+__all__ = ["create_answer_markdown_parser", "extract_citation_ids"]

@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class PublicChatRequest(BaseModel):
@@ -11,6 +11,14 @@ class PublicChatRequest(BaseModel):
     user_id: str = Field(min_length=1, max_length=128)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
     response_mode: Literal["blocking", "streaming"] = "blocking"
+    include_images: bool = Field(default=False, strict=True)
+    image_transport: Literal["url", "data_url"] = "url"
+
+    @model_validator(mode="after")
+    def validate_image_transport(self) -> "PublicChatRequest":
+        if not self.include_images and self.image_transport != "url":
+            raise ValueError("image_transport=data_url 需要 include_images=true")
+        return self
 
     @field_validator("message", "user_id")
     @classmethod
@@ -50,6 +58,21 @@ class PublicClarification(BaseModel):
     duplicate: bool = False
 
 
+class PublicAnswerImage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    ref_ids: list[str] = Field(default_factory=list)
+    citation_ids: list[int] = Field(default_factory=list)
+    caption: str = ""
+    width: int | None = Field(default=None, gt=0)
+    height: int | None = Field(default=None, gt=0)
+    orientation: int = Field(default=1, ge=1, le=8)
+    status: Literal["available", "unavailable", "deleted"]
+    unavailable_reason: str | None = None
+    url: str | None = None
+    expires_at: str | None = None
+
+
 class PublicChatResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     app_id: str
@@ -63,6 +86,9 @@ class PublicChatResponse(BaseModel):
     ttft_ms: int | None = None
     clarification: PublicClarification | None = None
     knowledge_base_content_version: int
+    images: list[PublicAnswerImage] = Field(default_factory=list)
+    image_transport: Literal["url", "data_url"] = "url"
+    answer_output_mode: Literal["text", "images", "text_and_images"] = "text"
 
 
 class PublicRunResponse(BaseModel):
@@ -82,3 +108,15 @@ class PublicRunResponse(BaseModel):
     request_id: str | None = None
     duration_ms: int
     usage: dict[str, int] | None = None
+
+
+class PublicImageAccessRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    user_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("user_id")
+    @classmethod
+    def reject_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("user_id 不能为空白")
+        return value

@@ -70,6 +70,7 @@ class Document(Base):
         Integer, nullable=False, default=1, server_default=text("1")
     )
     parse_plan_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    parser_config_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     current_stage: Mapped[str] = mapped_column(
         String(16), nullable=False, default="complete", server_default="complete"
     )
@@ -202,7 +203,7 @@ class DocumentArtifact(Base):
             "kind IN ('original', 'result_zip', 'full_markdown', 'content_list', "
             "'layout', 'model', 'asset', 'parse_chunk_source', "
             "'parse_chunk_result', 'normalized_markdown', 'page_map', "
-            "'enriched_markdown', 'tree', 'diagnostics')",
+            "'enriched_markdown', 'tree', 'diagnostics', 'image_catalog', 'image_asset')",
             name="ck_document_artifact_kind",
         ),
         CheckConstraint("size_bytes >= 0", name="ck_document_artifact_size"),

@@ -28,10 +28,23 @@ from app.api_server.services.model_vision_probe import (
 )
 from nianlun.models.embedding import build_embeddings_model
 from nianlun.models.llm import build_chat_model
+from nianlun.models.reasoning import (
+    ReasoningEffort,
+    ReasoningEffortKwargs,
+    ReasoningEffortOverride,
+    resolve_reasoning_effort,
+)
 
 
 DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 128_000
 """Fallback input window for catalog LLM profiles without an explicit value."""
+
+
+class _InheritTemperature:
+    pass
+
+
+_INHERIT_TEMPERATURE = _InheritTemperature()
 
 
 def _now() -> datetime:
@@ -124,6 +137,9 @@ class ModelConfigService:
             if request.target in {"llm", "embedding"} and not model:
                 raise RuntimeError("模型名称未配置")
             if request.target == "llm":
+                reasoning: ReasoningEffortKwargs = {}
+                if request.reasoning_effort is not None:
+                    reasoning["reasoning_effort"] = request.reasoning_effort
                 llm = build_chat_model(
                     model=model,
                     base_url=base_url,
@@ -131,6 +147,8 @@ class ModelConfigService:
                     allow_env_fallback=False,
                     request_timeout_seconds=20.0,
                     max_retries=0,
+                    temperature=request.temperature,
+                    **reasoning,
                 )
                 # Compatible endpoints differ on token-limit parameter names.
                 llm.invoke("连接测试：请仅回复 OK。")
@@ -279,6 +297,10 @@ class ModelConfigService:
         values["is_default"] = bool(request.is_default or current["is_default"])
         if "supports_vision" not in request.model_fields_set:
             values.pop("supports_vision")
+        if "reasoning_effort" not in request.model_fields_set:
+            values.pop("reasoning_effort")
+        if "temperature" not in request.model_fields_set:
+            values.pop("temperature")
         if "api_key" not in request.model_fields_set:
             values["api_key"] = current["api_key"]
         try:
@@ -370,6 +392,17 @@ class ModelConfigService:
                 and "supports_vision" in override.model_fields_set
                 else item.get("supports_vision")
             ),
+            reasoning_effort=(
+                override.reasoning_effort
+                if override is not None
+                and "reasoning_effort" in override.model_fields_set
+                else item.get("reasoning_effort")
+            ),
+            temperature=(
+                override.temperature
+                if override is not None and "temperature" in override.model_fields_set
+                else item.get("temperature")
+            ),
             api_mode=(
                 override.api_mode
                 if override is not None and "api_mode" in override.model_fields_set
@@ -390,7 +423,14 @@ class ModelConfigService:
             )
         return profile
 
-    def build_llm(self, profile_id: str | None = None) -> Any:
+    def build_llm(
+        self,
+        profile_id: str | None = None,
+        *,
+        reasoning_effort: ReasoningEffortOverride = "inherit",
+        temperature: float | None | _InheritTemperature = _INHERIT_TEMPERATURE,
+        legacy_temperature: bool = False,
+    ) -> Any:
         """Build the strict catalog LLM used by API-server indexing tasks."""
         profile = self.require_llm_profile(profile_id)
         model = str(profile.get("model") or "").strip()
@@ -406,11 +446,27 @@ class ModelConfigService:
                 f"模型“{profile['name']}”未配置 API Key",
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
             )
+        effort = resolve_reasoning_effort(
+            reasoning_effort, profile.get("reasoning_effort")
+        )
+        reasoning: dict[str, Any] = (
+            {"reasoning_effort": effort} if effort is not None else {}
+        )
+        resolved_temperature = (
+            profile.get("temperature")
+            if isinstance(temperature, _InheritTemperature)
+            else temperature
+        )
+        if legacy_temperature:
+            resolved_temperature = 0.0 if effort is None else None
         return build_chat_model(
             model=model,
             base_url=base_url,
             api_key=api_key,
             allow_env_fallback=False,
+            temperature=resolved_temperature,
+            legacy_temperature=legacy_temperature,
+            **reasoning,
         )
 
     def parser_runtime_config(self) -> dict[str, Any]:
@@ -514,7 +570,16 @@ class ModelConfigService:
         self,
         application_provider: str,
         application_model_profile_id: str | None,
-    ) -> tuple[str | None, ProviderConfig, bool, str | None, int | None, int | None]:
+    ) -> tuple[
+        str | None,
+        ProviderConfig,
+        bool,
+        str | None,
+        int | None,
+        int | None,
+        ReasoningEffort | None,
+        float | None,
+    ]:
         """Resolve app overrides and catalog defaults for AgentRuntime.
 
         The Agent core currently accepts one API key/base URL pair. The LLM
@@ -548,6 +613,8 @@ class ModelConfigService:
             None,
             None,
             llm.get("context_window_tokens") or DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
+            llm.get("reasoning_effort"),
+            llm.get("temperature"),
         )
 
 

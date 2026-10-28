@@ -54,7 +54,7 @@ describe("Agent version workflow", () => {
     }));
   });
   afterEach(() => { act(() => root.unmount()); container.remove(); vi.unstubAllGlobals(); });
-  const render = async () => { await act(async () => root.render(<ApplicationDetail app={app} knowledgeBases={[]} llmModels={[]} onBack={vi.fn()} onUse={vi.fn()} onUpdated={onUpdated} />)); };
+  const render = async (overrides: Partial<Application> = {}, models: ModelProfile[] = []) => { await act(async () => root.render(<ApplicationDetail app={{ ...app, ...overrides }} knowledgeBases={[]} llmModels={models} onBack={vi.fn()} onUse={vi.fn()} onUpdated={onUpdated} />)); };
   const click = async (name: string) => {
     const button = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((item) => item.getAttribute("aria-label") === name || item.textContent?.trim() === name);
     expect(button, name).toBeTruthy(); await act(async () => button!.click());
@@ -67,6 +67,60 @@ describe("Agent version workflow", () => {
       input.dispatchEvent(new Event(input instanceof HTMLSelectElement ? "change" : "input", { bubbles: true }));
     });
   };
+
+  it("defaults draft reasoning to inherit and includes an explicit override when saving", async () => {
+    await render(); await click("Agent 配置");
+    expect(container.querySelector<HTMLSelectElement>("#draft-reasoning")?.value).toBe("inherit");
+    await change("#draft-reasoning", "default");
+    await act(async () => container.querySelector<HTMLFormElement>(".application-draft")!.requestSubmit());
+    expect(requests.find((item) => item.method === "PATCH")?.body.reasoning_effort).toBe("default");
+  });
+
+  it("compares frozen reasoning levels and explicit no configuration", () => {
+    act(() => root.render(<VersionSettings config={{ ...config, reasoning_effort: "high" }} previous={{ ...config, reasoning_effort: null }} knowledgeBases={[]} />));
+    const row = Array.from(container.querySelectorAll("dl > div")).find((item) => item.querySelector("dt")?.textContent?.includes("思考程度"));
+    expect(row?.classList.contains("is-changed")).toBe(true);
+    expect(row?.textContent).toContain("不配置");
+    expect(row?.textContent).toContain("高");
+  });
+
+  it("compares frozen zero temperature against an unconfigured value", () => {
+    act(() => root.render(<VersionSettings config={{ ...config, temperature: 0 }} previous={{ ...config, temperature: null }} knowledgeBases={[]} />));
+    const row = Array.from(container.querySelectorAll("dl > div")).find((item) => item.querySelector("dt")?.textContent?.includes("温度"));
+    expect(row?.classList.contains("is-changed")).toBe(true);
+    expect(row?.querySelector(".application-setting-before")?.textContent).toBe("不配置");
+    expect(row?.querySelector("dd > span:last-child")?.textContent).toBe("0");
+  });
+
+  it("shows legacy reasoning snapshots with their effective unconfigured temperature", () => {
+    act(() => root.render(<VersionSettings config={{ ...config, sampling_config_version: 2, temperature: 0, reasoning_effort: "high" }} previous={{ ...config, temperature: 0, reasoning_effort: "high" }} knowledgeBases={[]} />));
+    const row = Array.from(container.querySelectorAll("dl > div")).find((item) => item.querySelector("dt")?.textContent?.includes("温度"));
+    expect(row?.classList.contains("is-changed")).toBe(true);
+    expect(row?.querySelector(".application-setting-before")?.textContent).toBe("不配置");
+    expect(row?.querySelector("dd > span:last-child")?.textContent).toBe("0");
+  });
+
+  it.each([0, 0.7, null])("shows model temperature %s in the publication preview", async (temperature) => {
+    const model: ModelProfile = {
+      id: "llm", kind: "llm", name: "chat-model", model: "chat-model", context_window_tokens: 128000, supports_vision: null, temperature,
+      base_url: "https://model.test/v1", api_key_configured: true, enabled: true, api_mode: "saas_precision", dimension: null,
+      model_version: "vlm", language: "ch", is_ocr: false, enable_table: true, enable_formula: true, page_ranges: "", is_default: true, created_at: "", updated_at: "",
+    };
+    await render({}, [model]); await click("发布");
+    const row = Array.from(container.querySelectorAll(".application-deploy-summary dl > div")).find((item) => item.querySelector("dt")?.textContent === "温度");
+    expect(row?.querySelector("dd")?.textContent).toBe(temperature === null ? "不配置" : String(temperature));
+  });
+
+  it.each([["inherit", "高"], ["default", "不配置"], ["low", "低"], ["medium", "中"], ["high", "高"]] as const)("resolves the %s override in the publication preview", async (effort, label) => {
+    const model: ModelProfile = {
+      id: "llm", kind: "llm", name: "chat-model", model: "chat-model", context_window_tokens: 128000, supports_vision: null, reasoning_effort: "high",
+      base_url: "https://model.test/v1", api_key_configured: true, enabled: true, api_mode: "saas_precision", dimension: null,
+      model_version: "vlm", language: "ch", is_ocr: false, enable_table: true, enable_formula: true, page_ranges: "", is_default: true, created_at: "", updated_at: "",
+    };
+    await render({ reasoning_effort: effort }, [model]); await click("发布");
+    const row = Array.from(container.querySelectorAll(".application-deploy-summary dl > div")).find((item) => item.querySelector("dt")?.textContent === "思考程度");
+    expect(row?.querySelector("dd")?.textContent).toBe(label);
+  });
 
   it("shows the saved draft before any version exists and opens it for editing", async () => {
     channelCreated = false; await render(); await click("版本管理");
@@ -156,6 +210,8 @@ describe("Agent version workflow", () => {
     const knowledge = (id: string): KnowledgeBase => ({
       id, name: "产品文档", description: "", status: "ready", document_count: 0,
       summary_enabled: true, heading_recovery_enabled: true, llm_model_id: null,
+      subtree_folding_enabled: true, min_subtree_tokens: 1200,
+      parser_options: { is_ocr: null, enable_table: null, enable_formula: null, language: null },
       workspace_dir: id, workspace_relpath: id, content_version: 0,
       fts_status: "disabled", fts_revision: null, fts_target_revision: null, fts_collection: null, fts_error: null,
       vector_status: "disabled", vector_enabled: false, vector_revision: null, vector_target_revision: null,

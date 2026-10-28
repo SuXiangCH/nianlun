@@ -12,12 +12,19 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from nianlun.agent.contracts import AnswerImagePolicy, KnowledgeBasePort
+from nianlun.agent.lead_agent.runner import AgentStatusSink, RetrievalCollector
+from nianlun.agent.middleware.retrieval_loop_guard_middleware import LoopGuardState
+from nianlun.agent.subagents.images import (
+    ChildImageContext,
+    enrich_image_evidence,
+    reread_image_refs,
+)
 
 from nianlun.agent.subagents.config import DeepSearchConfig
 from nianlun.agent.subagents.prompt import DEEP_SEARCH_SYSTEM_PROMPT
 from nianlun.agent.subagents.result import (
     DeepSearchResult,
-    bound_result,
     failed_result,
     result_from_agent_output,
 )
@@ -46,6 +53,17 @@ class DeepSearchExecution:
     def to_dict(self, config: DeepSearchConfig | None = None) -> dict[str, Any]:
         return self.result.to_dict(config or self.config)
 
+    def reread_image_refs(
+        self, *, knowledge_base: KnowledgeBasePort, collector: RetrievalCollector
+    ) -> dict[str, str]:
+        """Explicitly import verified evidence into an existing parent request."""
+        return reread_image_refs(
+            self.result,
+            knowledge_base=knowledge_base,
+            collector=collector,
+            config=self.config,
+        )
+
 
 class DeepSearchRunner:
     """Lazily create and safely execute a stateless deep-search Agent.
@@ -62,11 +80,21 @@ class DeepSearchRunner:
         config: DeepSearchConfig | None = None,
         system_prompt: str = DEEP_SEARCH_SYSTEM_PROMPT,
         context_factory: Callable[[], Mapping[str, Any]] | None = None,
+        tool_schema_version: int = 4,
+        image_capability: bool = False,
+        image_policy: AnswerImagePolicy | None = None,
     ) -> None:
         self.config = config or DeepSearchConfig()
         self._agent_factory = agent_factory
         self._system_prompt = system_prompt
         self._context_factory = context_factory
+        if tool_schema_version not in (4, 5) or (
+            image_capability and tool_schema_version != 5
+        ):
+            raise ValueError("Unsupported child image/tool contract")
+        self._tool_schema_version = tool_schema_version
+        self._image_capability = image_capability
+        self._image_policy = image_policy or AnswerImagePolicy()
         self._agent: DeepSearchAgent | None = None
         self._agent_lock = threading.Lock()
         self._slots = threading.BoundedSemaphore(self.config.max_concurrent)
@@ -100,6 +128,7 @@ class DeepSearchRunner:
         run_id = uuid.uuid4().hex
         events: list[dict[str, Any]] = []
         external_cancel = cancel_event or threading.Event()
+        child_cancel = threading.Event()
 
         if not isinstance(task, str) or not task.strip():
             return self._execution(
@@ -137,10 +166,55 @@ class DeepSearchRunner:
 
         emit("deep_search_started")
         try:
-            child_context = dict(
+            dependencies = dict(
                 self._context_factory() if self._context_factory else {}
             )
-            child_context.update(context or {})
+            child_context = {
+                key: value
+                for key, value in (context or {}).items()
+                if key
+                not in {
+                    "knowledge_base",
+                    "thread_id",
+                    "configurable",
+                    "input_messages",
+                    "messages",
+                    "history",
+                    "trusted_history",
+                    "conversation_context",
+                }
+                and (value is None or type(value) in (str, bool, int, float))
+            }
+            child_context.update(
+                {
+                    key: dependencies[key]
+                    for key in ("knowledge_base", "tool_logging")
+                    if key in dependencies
+                }
+            )
+            collector = RetrievalCollector(
+                tool_schema_version=self._tool_schema_version,
+                image_capability=self._image_capability,
+                image_policy=self._image_policy,
+            )
+            collector.image_context = ChildImageContext(
+                enabled=self._image_capability, policy=self._image_policy
+            )
+            child_context.update(
+                {
+                    "retrieval_collector": collector,
+                    "retrieval_deduplication_state": {
+                        "documents": set(),
+                        "nodes": set(),
+                    },
+                    "loop_guard_state": LoopGuardState(),
+                    "status_sink": AgentStatusSink(),
+                    "clarification_enabled": False,
+                    "tool_schema_version": self._tool_schema_version,
+                    "image_capability": self._image_capability,
+                    "image_policy": self._image_policy,
+                }
+            )
         except Exception as exc:
             self._slots.release()
             result = failed_result("context_error", str(exc))
@@ -155,7 +229,8 @@ class DeepSearchRunner:
                 "subagent_run_id": run_id,
                 "parent_request_id": parent_id,
                 "deadline": deadline,
-                "cancel_event": external_cancel,
+                "cancel_event": child_cancel,
+                "cancellation_event": child_cancel,
             }
         )
 
@@ -170,6 +245,7 @@ class DeepSearchRunner:
             submitted = True
             while True:
                 if external_cancel.is_set():
+                    child_cancel.set()
                     result = failed_result(
                         "cancelled", "Deep-search task was cancelled."
                     )
@@ -179,7 +255,7 @@ class DeepSearchRunner:
                     )
                 remaining = self.config.timeout_seconds - (time.monotonic() - started)
                 if remaining <= 0:
-                    external_cancel.set()
+                    child_cancel.set()
                     result = failed_result("timeout", "Deep-search task timed out.")
                     emit("deep_search_failed", code="timeout")
                     return self._execution(
@@ -192,14 +268,17 @@ class DeepSearchRunner:
                     continue
 
             if external_cancel.is_set():
+                child_cancel.set()
                 result = failed_result("cancelled", "Deep-search task was cancelled.")
                 emit("deep_search_failed", code="cancelled")
                 return self._execution(
                     run_id, result, events, parent_request_id=parent_id
                 )
 
-            result = bound_result(
-                result_from_agent_output(raw_output, self.config), self.config
+            result = enrich_image_evidence(
+                result_from_agent_output(raw_output, self.config),
+                collector,
+                self.config,
             )
             if result.status == "completed":
                 emit(

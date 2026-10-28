@@ -77,6 +77,7 @@ class Conversation(Base):
         String, nullable=False, default="ready", server_default="ready"
     )
     expires_at: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    agent_contract_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     application: Mapped[Application] = relationship(back_populates="conversations")
     messages: Mapped[list[Message]] = relationship(
@@ -119,6 +120,15 @@ class Message(Base):
     tool_calls_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     trace_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
     usage_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    answer_format_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1
+    )
+    image_previews_unavailable: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    answer_output_mode: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="text", server_default="text"
+    )
     ttft_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[str] = mapped_column(String(64), nullable=False)

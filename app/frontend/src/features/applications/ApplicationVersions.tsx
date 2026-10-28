@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ArrowRight, ChevronLeft, ChevronRight, Copy, Eye, FilePenLine, GitCompareArrows, Pencil, Plus, Upload } from "lucide-react";
 import { api } from "../../api/client";
 import { Modal } from "../../components/Modal";
+import { reasoningEffortLabel } from "../../components/ReasoningEffortSelect";
 import type { Application, ApplicationPage, ApplicationRelease, KnowledgeBase, PublishedApplicationConfig } from "../../types";
 
 export const versionError = (error: unknown): string => error instanceof Error ? error.message : "请求失败，请重试";
@@ -40,6 +41,7 @@ export function useReleaseOptions(appId: string, seed: ApplicationRelease | null
 
 function settingRows(config: Partial<PublishedApplicationConfig>, knowledgeBases: KnowledgeBase[]) {
   const bool = (value: boolean | undefined) => value === undefined ? "—" : value ? "开启" : "关闭";
+  const temperature = (config.sampling_config_version ?? 1) === 1 && config.reasoning_effort ? null : config.temperature;
   return [
     ["LLM 模型", config.model || "—", config.llm_model_id || ""],
     ["模型地址", config.base_url || "—"],
@@ -47,6 +49,8 @@ function settingRows(config: Partial<PublishedApplicationConfig>, knowledgeBases
     ["Agent 架构", config.agent_version === "v1" ? "v1 · 检索与回答分离" : config.agent_version === "v0" ? "v0 · 一体化检索与回答" : "—"],
     ["上下文窗口", config.context_window_tokens ? `${config.context_window_tokens.toLocaleString()} tokens` : "—"],
     ["允许澄清问题", bool(config.clarification_enabled)],
+    ["思考程度", reasoningEffortLabel(config.reasoning_effort)],
+    ["温度", temperature == null ? "不配置" : String(temperature)],
     ["知识库更新", "最新已提交内容"],
   ];
 }

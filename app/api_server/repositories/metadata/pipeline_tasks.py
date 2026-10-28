@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from sqlalchemy import delete, func, or_, select, update
 
 from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.common.errors import ApiError
+from nianlun.models.reasoning import (
+    ReasoningEffort,
+    ReasoningEffortOverride,
+    resolve_reasoning_effort,
+)
 from app.api_server.database.models import (
     Document,
     DocumentEnrichmentCallResult,
@@ -47,15 +52,19 @@ class DocumentPipelineRepositoryMixin:
         document_id: str,
         pipeline_generation: int,
         now: str,
+        *,
+        reparse: bool = False,
+        parser_config_json: str | None = None,
     ) -> int:
-        """Fence an incomplete parse generation and queue fresh preparation."""
+        """Fence the prior generation and queue a retry or explicit reparse."""
         with self.factory.session_scope(write=True) as session:
             document = session.get(Document, document_id)
             if (
                 document is None
                 or document.pipeline_generation != pipeline_generation
-                or document.status != "failed"
-                or document.failed_stage != "parse"
+                or document.status
+                not in ({"ready", "failed"} if reparse else {"failed"})
+                or (not reparse and document.failed_stage != "parse")
                 or document.parser != "mineru"
             ):
                 raise ValueError("文档当前状态不允许重新准备解析任务")
@@ -125,6 +134,8 @@ class DocumentPipelineRepositoryMixin:
             next_generation = pipeline_generation + 1
             document.pipeline_generation = next_generation
             document.parse_plan_json = None
+            if parser_config_json is not None:
+                document.parser_config_json = parser_config_json
             document.status = "parsing"
             document.current_stage = "parse"
             document.stage_state = "queued"
@@ -259,6 +270,7 @@ class DocumentPipelineRepositoryMixin:
                     DocumentEnrichmentTask.pipeline_generation == pipeline_generation,
                 )
             )
+            kb = None
             if use_knowledge_base_model:
                 # Keep model selection and its durable reference in one write transaction.
                 kb = session.get(KnowledgeBase, document.knowledge_base_id)
@@ -281,6 +293,22 @@ class DocumentPipelineRepositoryMixin:
                 profile = session.get(ModelProfile, llm_profile_id)
                 if profile is None or profile.kind != "llm":
                     raise ApiError("文档处理模型已变化，请重试", 409)
+            else:
+                profile = None
+            options = json.loads(options_json)
+            if use_knowledge_base_model or "reasoning_effort" not in options:
+                llm = profile.llm_config if profile is not None else None
+                options["reasoning_effort"] = resolve_reasoning_effort(
+                    cast(ReasoningEffortOverride, kb.reasoning_effort)
+                    if use_knowledge_base_model and kb is not None
+                    else "inherit",
+                    cast(ReasoningEffort | None, llm.reasoning_effort) if llm else None,
+                )
+                options_json = json.dumps(options, ensure_ascii=False, sort_keys=True)
+            if use_knowledge_base_model or "temperature" not in options:
+                llm = profile.llm_config if profile is not None else None
+                options["temperature"] = llm.temperature if llm else None
+                options_json = json.dumps(options, ensure_ascii=False, sort_keys=True)
             item = DocumentEnrichmentTask(
                 id=str(uuid.uuid4()),
                 document_id=document_id,

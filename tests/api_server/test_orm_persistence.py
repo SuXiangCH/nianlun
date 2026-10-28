@@ -85,6 +85,11 @@ def test_orm_models_cover_all_business_tables():
         "document_enrichment_call_results",
         "document_pipeline_events",
         "document_staging_allocations",
+        "answer_image_blobs",
+        "message_images",
+        "image_access_grants",
+        "image_storage_profiles",
+        "image_blob_read_leases",
     }
 
 
@@ -104,8 +109,8 @@ def test_schema_initialization_records_current_version(tmp_path):
         }
     finally:
         connection.close()
-    assert migrations.SCHEMA_VERSION == 13
-    assert versions == {13}
+    assert migrations.SCHEMA_VERSION == 23
+    assert versions == {migrations.SCHEMA_VERSION}
     assert tables >= set(Base.metadata.tables)
 
     connection = factory.connect()
@@ -129,6 +134,34 @@ def test_schema_initialization_records_current_version(tmp_path):
     finally:
         connection.close()
     assert "agent_version" in application_columns
+
+
+def test_parser_options_migration_preserves_legacy_data_and_is_repeatable(tmp_path):
+    factory = _factory(tmp_path)
+    _seed_application(factory)
+    connection = factory.connect()
+    try:
+        connection.execute(
+            "ALTER TABLE knowledge_bases DROP COLUMN parser_options_json"
+        )
+        connection.execute("ALTER TABLE documents DROP COLUMN parser_config_json")
+        connection.execute("UPDATE schema_migrations SET version = 20")
+        connection.commit()
+    finally:
+        connection.close()
+    initialize_database(factory)
+    initialize_database(factory)
+    connection = factory.connect()
+    try:
+        row = connection.execute(
+            "SELECT name, parser_options_json FROM knowledge_bases WHERE id='kb-1'"
+        ).fetchone()
+        assert tuple(row) == ("测试知识库", "{}")
+        assert "parser_config_json" in {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(documents)")
+        }
+    finally:
+        connection.close()
 
 
 def test_release_management_upgrade_retains_existing_channel_and_is_repeatable(
@@ -274,7 +307,7 @@ def test_schema_initialization_preserves_pre_release_data(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {13}
+    assert versions == {migrations.SCHEMA_VERSION}
 
 
 def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
@@ -336,7 +369,7 @@ def test_schema_initialization_migrates_v1_messages_without_data_loss(tmp_path):
         }
     finally:
         connection.close()
-    assert versions == {13}
+    assert versions == {migrations.SCHEMA_VERSION}
 
 
 def test_schema_migration_replaces_document_hash_constraint_with_partial_index(
@@ -804,6 +837,81 @@ def test_model_profile_repository_manages_defaults_and_deletion(tmp_path):
     repository.delete_model_profile("llm-1")
     assert repository.get_model_profile("llm-1") is None
     assert [item["id"] for item in repository.list_model_profiles()] == ["llm-2"]
+
+
+@pytest.mark.parametrize("failure_kind", ["preflight", "claimed"])
+def test_parse_failure_commits_upload_state_before_retry(tmp_path, failure_kind):
+    factory = _factory(tmp_path)
+    repository = SQLiteMetadataRepository(factory)
+    _seed_application(factory)
+    now = "2026-01-01T00:00:00+00:00"
+    repository.create_document(
+        dict(
+            id="doc-1",
+            knowledge_base_id="kb-1",
+            original_filename="input.pdf",
+            file_extension=".pdf",
+            size_bytes=100,
+            source_relpath="sources/input.pdf",
+            source_sha256="source-hash",
+            parser="mineru",
+            status="parsing",
+            current_stage="parse",
+            stage_state="running",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    repository.start_upload("kb-1", "upload-1", "request-hash", "doc-1", now)
+    repository.mark_upload_files_committed(
+        "kb-1", "upload-1", "sources/input.pdf", "result.md", "source-hash", "hash", now
+    )
+    repository.create_parse_task(
+        dict(
+            id="task-1",
+            document_id="doc-1",
+            attempt=1,
+            data_id="doc-1:g1:c0000",
+            model_version="vlm",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    claimed = repository.claim_parse_task(
+        "task-1",
+        owner="test",
+        mode="submit",
+        now=now,
+        lease_expires_at="2026-01-01T00:01:00+00:00",
+    )
+    assert claimed is not None
+    if failure_kind == "claimed":
+        assert repository.fail_claimed_parse_task(
+            "task-1",
+            claimed["lease_token"],
+            error_code="TEST_FAILURE",
+            error_message="parse failed",
+            now=now,
+        )
+    else:
+        assert repository.fail_document_parse_preflight(
+            "doc-1", 1, error_code="TEST_FAILURE", error_message="parse failed", now=now
+        )
+    upload = repository.get_upload("kb-1", "upload-1")
+    assert upload["status"] == "failed"
+    assert upload["error_message"] == "parse failed"
+    if failure_kind == "claimed":
+        retry = repository.retry_parse_task("doc-1", "saas_precision", "vlm", "{}", now)
+        assert retry["attempt"] == 2
+        assert repository.get_upload("kb-1", "upload-1")["status"] == "files_committed"
+        assert not repository.fail_claimed_parse_task(
+            "task-1",
+            claimed["lease_token"],
+            error_code="OLD_FAILURE",
+            error_message="stale failure",
+            now=now,
+        )
+        assert repository.get_upload("kb-1", "upload-1")["status"] == "files_committed"
 
 
 def test_parse_retry_restores_upload_state_and_artifact_upsert(tmp_path):
@@ -1309,7 +1417,7 @@ def test_wecom_channel_migration_upgrades_v12_schema_repeatably(tmp_path):
     assert "idx_conversations_channel_peer" in conversation_indexes
     assert "idx_conversations_application_updated" in conversation_indexes
     assert violations == []
-    assert versions == {13}
+    assert versions == {migrations.SCHEMA_VERSION}
 
     with factory.session_scope() as session:
         conversation = session.get(Conversation, "conversation-legacy")

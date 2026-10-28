@@ -152,8 +152,13 @@ class WorkspaceView:
                 f"snapshot manifest JSON 无效: {manifest_path}"
             ) from exc
         try:
-            if not isinstance(payload, dict) or payload.get("schema_version") != 2:
-                raise WorkspaceViewError("snapshot manifest schema_version 必须为 2")
+            if not isinstance(payload, dict) or payload.get("schema_version") not in {
+                2,
+                3,
+            }:
+                raise WorkspaceViewError(
+                    "snapshot manifest schema_version 必须为 2 或 3"
+                )
             if payload.get("knowledge_base_id") != knowledge_base_id:
                 raise WorkspaceViewError("snapshot manifest knowledge_base_id 不匹配")
             if payload.get("content_version") != content_version:
@@ -208,6 +213,7 @@ class WorkspaceView:
                     "content_relpath",
                     "page_map_relpath",
                     "source_relpath",
+                    "image_catalog_relpath",
                 ):
                     relpath = raw_document.get(field)
                     if relpath is None and field != "index_relpath":
@@ -223,6 +229,8 @@ class WorkspaceView:
                     "doc_name": raw_document.get("doc_name") or "unknown",
                     "doc_description": raw_document.get("doc_description") or "",
                     "path": raw_document.get("content_relpath") or "",
+                    "image_catalog_path": raw_document.get("image_catalog_relpath")
+                    or "",
                     "line_count": raw_document.get("line_count") or 0,
                 }
             return cls(root, meta, index_paths, records, handle)
@@ -263,6 +271,47 @@ class WorkspaceView:
             raise WorkspaceViewError(
                 f"文档 content artifact 不是 UTF-8: {relpath}"
             ) from exc
+
+    def read_image_catalog(
+        self, document_id: str, *, verify_assets: bool = True
+    ) -> dict[str, object] | None:
+        """Read the optional, snapshot-bound image catalog for one document."""
+        if document_id not in self.meta:
+            raise KeyError(document_id)
+        relpath = self.meta[document_id].get("image_catalog_path")
+        if not isinstance(relpath, str) or not relpath:
+            return None
+        raw = self._read_artifact(relpath)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise WorkspaceViewError(f"图片目录 JSON 无效: {relpath}") from exc
+        if not isinstance(payload, dict):
+            raise WorkspaceViewError(f"图片目录格式无效: {relpath}")
+        if (
+            payload.get("document_id") != document_id
+            or payload.get("format_version") != 1
+        ):
+            raise WorkspaceViewError(f"图片目录身份无效: {relpath}")
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise WorkspaceViewError(f"图片目录 entries 无效: {relpath}")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise WorkspaceViewError(f"图片目录 entry 无效: {relpath}")
+            asset = entry.get("asset_relpath")
+            if not isinstance(asset, str) or (
+                self._snapshot_handle is not None
+                and asset not in self._artifact_records
+            ):
+                raise WorkspaceViewError(f"图片资源未登记: {asset}")
+            if verify_assets:
+                raw_asset = self._read_artifact(asset)
+                if len(raw_asset) != entry.get("size_bytes") or hashlib.sha256(
+                    raw_asset
+                ).hexdigest() != entry.get("sha256"):
+                    raise WorkspaceViewError(f"图片资源 hash/size 不匹配: {asset}")
+        return payload
 
     def _read_artifact(self, relpath: str) -> bytes:
         path = _resolve_confined(self.workspace, relpath)

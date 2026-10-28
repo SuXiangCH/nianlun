@@ -91,6 +91,152 @@ def publish(service, app_id, *, config_version=1, deployment_version=0):
     )
 
 
+def test_new_releases_use_current_bundle_and_known_legacy_remains_valid(publishing):
+    from nianlun.agent.prompt_registry import (
+        CURRENT_PROMPT_BUNDLE,
+        LEGACY_PROMPT_BUNDLE,
+    )
+
+    service, app_id, _ = publishing
+    config = service.draft_config(app_id)
+    assert (
+        config.tool_schema_version,
+        config.prompt_version,
+        config.v1_prompt_hash,
+        config.checkpoint_schema_version,
+    ) == CURRENT_PROMPT_BUNDLE.contract_key
+    for bundle in (LEGACY_PROMPT_BUNDLE, CURRENT_PROMPT_BUNDLE):
+        frozen = config.model_copy(
+            update={
+                "tool_schema_version": bundle.tool_schema_version,
+                "prompt_version": bundle.prompt_version,
+                "v1_prompt_hash": bundle.v1_prompt_hash,
+                "checkpoint_schema_version": bundle.checkpoint_schema_version,
+            }
+        )
+        service.validate_release(frozen)
+        with pytest.raises(ApiError, match="不兼容"):
+            service.validate_release(
+                frozen.model_copy(update={"v1_prompt_hash": "0" * 64})
+            )
+
+
+def test_reasoning_effort_is_frozen_restored_and_independent_of_model_defaults(
+    publishing,
+):
+    from app.api_server.apis.v1.publishing_schemas import (
+        ApplicationReleaseCreateRequest,
+        ApplicationRestoreRequest,
+    )
+
+    service, app_id, repository = publishing
+    models = service.applications.model_config_service
+    profile = repository.get_model_profile("llm")
+    profile["reasoning_effort"] = "high"
+    repository.update_model_profile(profile, datetime.now(timezone.utc).isoformat())
+    assert service.applications.get(app_id).reasoning_effort == "inherit"
+    release = service.create_release(
+        app_id, ApplicationReleaseCreateRequest(expected_config_version=1)
+    )
+    assert release.config.reasoning_effort == "high"
+    profile["reasoning_effort"] = "low"
+    repository.update_model_profile(profile, datetime.now(timezone.utc).isoformat())
+    assert service.draft_config(app_id).reasoning_effort == "low"
+    assert service.require_release(app_id, release.id).config.reasoning_effort == "high"
+    service.validate_release(release.config)
+    restored = service.restore_release(
+        app_id, release.id, ApplicationRestoreRequest(expected_config_version=1)
+    )
+    assert restored.reasoning_effort == "high"
+    assert restored.config_version == 2
+    assert service.draft_config(app_id).reasoning_effort == "high"
+    cleared = service.update(
+        app_id,
+        ApplicationUpdateRequest(expected_config_version=2, reasoning_effort="default"),
+    )
+    assert cleared.reasoning_effort == "default"
+    assert service.draft_config(app_id).reasoning_effort is None
+    unchanged = service.update(
+        app_id, ApplicationUpdateRequest(expected_config_version=3, name="Rename")
+    )
+    assert unchanged.reasoning_effort == "default"
+    assert models is not None
+
+
+def test_publication_rechecks_inherited_effort_in_transaction(publishing):
+    from app.api_server.apis.v1.publishing_schemas import (
+        ApplicationReleaseCreateRequest,
+    )
+    from app.api_server.services.application_release_service import config_fingerprint
+
+    service, app_id, repository = publishing
+    config = service.draft_config(app_id)
+    profile = repository.get_model_profile("llm")
+    profile["reasoning_effort"] = "high"
+    repository.update_model_profile(profile, datetime.now(timezone.utc).isoformat())
+    canonical, fingerprint = config_fingerprint(config)
+    with pytest.raises(ApiError, match="思考程度已变化"):
+        service.repository.create_release(config, canonical, fingerprint, 1, "")
+    release = service.create_release(
+        app_id, ApplicationReleaseCreateRequest(expected_config_version=1)
+    )
+    assert release.config.reasoning_effort == "high"
+
+
+@pytest.mark.parametrize("temperature", [None, 0.0, 0.6])
+def test_release_freezes_model_temperature(publishing, temperature):
+    from app.api_server.apis.v1.publishing_schemas import (
+        ApplicationReleaseCreateRequest,
+    )
+
+    service, app_id, repository = publishing
+    profile = repository.get_model_profile("llm")
+    profile.update(temperature=temperature, reasoning_effort="high")
+    repository.update_model_profile(profile, datetime.now(timezone.utc).isoformat())
+    release = service.create_release(
+        app_id, ApplicationReleaseCreateRequest(expected_config_version=1)
+    )
+    assert release.config.temperature == temperature
+    assert release.config.sampling_config_version == 2
+    profile["temperature"] = 1.0
+    repository.update_model_profile(profile, datetime.now(timezone.utc).isoformat())
+    assert service.require_release(app_id, release.id).config.temperature == temperature
+    service.validate_release(release.config)
+
+
+def test_release_rechecks_temperature_in_transaction(publishing):
+    from app.api_server.services.application_release_service import config_fingerprint
+
+    service, app_id, repository = publishing
+    config = service.draft_config(app_id)
+    profile = repository.get_model_profile("llm")
+    profile["temperature"] = 0.9
+    repository.update_model_profile(profile, datetime.now(timezone.utc).isoformat())
+    canonical, fingerprint = config_fingerprint(config)
+    with pytest.raises(ApiError, match="温度已变化"):
+        service.repository.create_release(config, canonical, fingerprint, 1, "")
+
+
+def test_old_release_fingerprint_stays_stable_without_reasoning_effort(publishing):
+    import hashlib
+    from app.api_server.services.application_release_service import config_fingerprint
+
+    service, app_id, _ = publishing
+    config = service.draft_config(app_id).model_copy(
+        update={"sampling_config_version": 1, "temperature": 0.0}
+    )
+    old = config.model_dump(
+        mode="json", exclude={"reasoning_effort", "sampling_config_version"}
+    )
+    canonical = json.dumps(
+        old, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    assert config_fingerprint(config) == (
+        canonical,
+        hashlib.sha256(canonical.encode()).hexdigest(),
+    )
+
+
 @pytest.fixture
 def management(publishing):
     service, app_id, _ = publishing
@@ -383,7 +529,7 @@ def test_publish_is_immutable_idempotent_and_uses_explicit_effective_config(publ
     service, app_id, repository = publishing
     first = publish(service, app_id)
     assert first.enabled and first.deployment_version == 1
-    assert first.active_release.config.temperature == 0
+    assert first.active_release.config.temperature is None
     assert first.active_release.config.thinking is None
     assert first.active_release.config.llm_model_id == "llm"
     assert first.active_release.config.context_window_tokens == 64000
@@ -895,13 +1041,23 @@ def test_expired_terminal_run_allows_application_cleanup(publishing):
 
 
 def test_incompatible_active_release_does_not_block_valid_draft(
-    publishing, monkeypatch
+    publishing,
 ):
     service, app_id, _ = publishing
-    publish(service, app_id)
-    monkeypatch.setattr(
-        "app.api_server.services.application_release_service.PROMPT_VERSION", 999
-    )
+    first = publish(service, app_id)
+    with service.repository.factory.session_scope(write=True) as session:
+        row = session.get(ApplicationRelease, first.active_release.id)
+        config = json.loads(row.config_json)
+        config["v1_prompt_hash"] = "0" * 64
+        row.config_json = json.dumps(config)
+        from app.api_server.apis.v1.publishing_schemas import PublishedConfig
+        from app.api_server.services.application_release_service import (
+            config_fingerprint,
+        )
+
+        row.config_json, row.config_hash = config_fingerprint(
+            PublishedConfig.model_validate(config)
+        )
     state = service.get_publication(app_id)
     assert not state.dependencies_ready
     assert state.draft_ready

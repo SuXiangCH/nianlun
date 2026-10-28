@@ -2,12 +2,14 @@ import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { BookOpen, CircleHelp, Cpu, Database, Eye, EyeOff, MoreHorizontal, Pencil, PlugZap, Plus, RefreshCw, Search } from "lucide-react";
 import { Modal } from "../../components/Modal";
+import { ReasoningEffortSelect } from "../../components/ReasoningEffortSelect";
 import type {
   ModelConfigTestRequest,
   ModelConfigTestResult,
   ModelKind,
   ModelProfile,
   ModelProfileRequest,
+  ReasoningEffort,
 } from "../../types";
 
 interface Props {
@@ -38,6 +40,8 @@ const newDraft = (kind: ModelKind): ModelDraft => ({
   model: null,
   context_window_tokens: null,
   supports_vision: null,
+  reasoning_effort: null,
+  temperature: null,
   base_url: "",
   api_key: "",
   enabled: true,
@@ -58,6 +62,8 @@ const draftFromProfile = (profile: ModelProfile): ModelDraft => ({
   model: profile.model,
   context_window_tokens: profile.context_window_tokens,
   supports_vision: profile.supports_vision ?? null,
+  reasoning_effort: profile.reasoning_effort ?? null,
+  temperature: profile.temperature ?? null,
   base_url: profile.base_url || "",
   api_key: "",
   enabled: true,
@@ -77,7 +83,7 @@ const testRequestFromDraft = (draft: ModelDraft, clearKey: boolean): ModelConfig
   model: draft.model,
   base_url: draft.base_url,
   dimension: draft.dimension,
-  ...(draft.kind === "llm" ? { supports_vision: draft.supports_vision ?? null } : {}),
+  ...(draft.kind === "llm" ? { supports_vision: draft.supports_vision ?? null, reasoning_effort: draft.reasoning_effort ?? null, temperature: draft.temperature ?? null } : {}),
   ...(draft.kind === "parser" ? { api_mode: draft.api_mode } : {}),
   ...(clearKey ? { api_key: null } : draft.api_key.trim() ? { api_key: draft.api_key.trim() } : {}),
 });
@@ -384,6 +390,13 @@ export function ModelManagementView({
                 <option value="">未确认</option><option value="true">支持</option><option value="false">不支持</option>
               </select>
             </div>}
+            {editor.draft.kind === "llm" && <details><summary>高级设置</summary><div className="field">
+              <label htmlFor="model-profile-reasoning">思考程度</label>
+              <ReasoningEffortSelect id="model-profile-reasoning" value={editor.draft.reasoning_effort ?? ""} disabled={saving || testing !== null} onChange={(event) => updateDraft("reasoning_effort", event.target.value ? event.target.value as ReasoningEffort : null)} />
+            </div><div className="field">
+              <label htmlFor="model-profile-temperature">温度</label>
+              <input id="model-profile-temperature" type="number" min={0} max={2} step="any" value={editor.draft.temperature ?? ""} disabled={saving || testing !== null} onChange={(event) => updateDraft("temperature", event.target.value === "" ? null : Number(event.target.value))} placeholder="不配置" />
+            </div></details>}
             {editor.draft.kind === "parser" && <>
               <div className="field">
                 <label htmlFor="model-parser-mode">对接模式</label>

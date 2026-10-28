@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import TextIO, cast
 
 from nianlun.agent.contracts import AgentVersion
+from nianlun.knowledgebase.config import WORKSPACE_DIR
+from nianlun.knowledgebase.workspace_ownership import require_legacy_workspace
 from nianlun.agent.batch import (
     default_batch_output_path,
     run_batch,
@@ -114,6 +116,7 @@ def configure_tool_log_output() -> None:
 
 def setup(tool_logging: bool = True, *, agent_version: str = "v0") -> AgentRuntime:
     """初始化运行时，失败时打印提示并退出。"""
+    require_legacy_workspace(WORKSPACE_DIR)
     if tool_logging:
         configure_tool_log_output()
     try:

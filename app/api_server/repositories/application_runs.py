@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from nianlun.agent.contracts import AnswerImagePolicy
+
 from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
@@ -12,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.api_server.common.errors import ApiError
 from app.api_server.database.connection import SQLiteConnectionFactory
-from app.api_server.database.models.chat import Conversation
+from app.api_server.database.models.chat import Conversation, Message
 from app.api_server.database.models.application_runs import ApplicationRun
 from app.api_server.database.models.publishing import (
     ApplicationApiClient,
@@ -22,6 +24,8 @@ from app.api_server.database.models.publishing import (
     ApplicationWecomChannel,
 )
 from app.api_server.repositories.sqlite_chat import SQLiteChatRepository
+from app.api_server.database.models import ImageAccessGrant
+from app.api_server.repositories.answer_images import normalize_completion_images
 
 
 def utcnow() -> datetime:
@@ -147,6 +151,7 @@ class ApplicationRunRepository:
         request_id: str | None,
         retention_days: int,
         key_id: str,
+        image_transport: str = "url",
     ) -> dict[str, Any]:
         now = utcnow()
         with self.factory.session_scope(write=True) as session:
@@ -256,6 +261,7 @@ class ApplicationRunRepository:
                 request_id=request_id,
                 created_at=now.isoformat(),
                 updated_at=now.isoformat(),
+                image_transport=image_transport,
             )
             session.add(row)
             session.flush()
@@ -394,27 +400,75 @@ class ApplicationRunRepository:
         response: dict[str, Any],
         raw: dict[str, Any],
         retention_days: int,
+        *,
+        grants: list[dict[str, Any]] | None = None,
+        principal_key_id: str | None = None,
+        result_retention_days: int = 30,
+        image_policy: AnswerImagePolicy = AnswerImagePolicy(),
     ) -> bool:
         now = utcnow()
         with self.factory.session_scope(write=True) as session:
             row = session.get(ApplicationRun, run_id)
             if row is None or row.status != "running":
                 return False
+            if principal_key_id is not None:
+                credential = session.get(ApplicationApiKey, principal_key_id)
+                client = session.get(ApplicationApiClient, row.client_id)
+                deployment = session.get(ApplicationDeployment, row.application_id)
+                if (
+                    credential is None
+                    or credential.revoked_at
+                    or credential.client_id != row.client_id
+                    or (
+                        credential.expires_at
+                        and datetime.fromisoformat(credential.expires_at) <= now
+                    )
+                    or client is None
+                    or not client.enabled
+                    or deployment is None
+                    or not deployment.enabled
+                ):
+                    raise ApiError("应用凭据或渠道已失效", 403)
+            normalize_completion_images(session, raw, policy=image_policy)
+            from app.api_server.services.answer_image_projection import (
+                reconcile_completion_projection,
+            )
+
+            response = reconcile_completion_projection(
+                response, raw, policy=image_policy
+            )
             self.chat.complete_turn(
                 application_id=row.application_id,
                 conversation_id=row.conversation_id,
                 assistant_message_id=row.message_id,
-                answer=response["answer"],
+                answer=raw["answer"],
                 route=raw.get("route", "direct"),
                 snippets=raw.get("retrieved_snippets", []),
                 usage=raw.get("usage"),
                 ttft_ms=raw.get("ttft_ms"),
                 now=now,
                 session=session,
+                images=raw.get("images", []),
+                image_policy=image_policy,
+                answer_format_version=raw.get("answer_format_version", 1),
+                answer_output_mode=raw.get("answer_output_mode", "text"),
+                image_previews_unavailable=raw.get("image_previews_unavailable", 0),
             )
+            session.flush()
+            available = {
+                image["id"]
+                for image in raw.get("images", [])
+                if image.get("status") == "available"
+            }
+            for grant in grants or []:
+                if grant["attachment_id"] in available:
+                    session.add(ImageAccessGrant(**grant))
             row.status = "completed"
             row.result_json = json.dumps(response, ensure_ascii=False)
             row.updated_at = row.finished_at = now.isoformat()
+            row.result_expires_at = (
+                now + timedelta(days=result_retention_days)
+            ).isoformat()
             conversation = session.get(Conversation, row.conversation_id)
             assert conversation is not None
             conversation.expires_at = (now + timedelta(days=retention_days)).isoformat()
@@ -488,20 +542,33 @@ class ApplicationRunRepository:
         status: str | None = None,
         client_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        query = select(ApplicationRun).where(ApplicationRun.application_id == app_id)
+        columns = [
+            column
+            for column in ApplicationRun.__table__.columns
+            if column.name != "result_json"
+        ]
+        query = (
+            select(*columns, Message.usage_json)
+            .outerjoin(Message, Message.id == ApplicationRun.message_id)
+            .where(ApplicationRun.application_id == app_id)
+        )
         if status:
             query = query.where(ApplicationRun.status == status)
         if client_id:
             query = query.where(ApplicationRun.client_id == client_id)
         with self.factory.session_scope() as session:
-            return [
-                run_dict(row)
-                for row in session.scalars(
-                    query.order_by(ApplicationRun.created_at.desc())
-                    .limit(limit)
-                    .offset(offset)
-                )
-            ]
+            rows = session.execute(
+                query.order_by(ApplicationRun.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            ).mappings()
+            result = []
+            for row in rows:
+                item = dict(row)
+                usage = item.pop("usage_json")
+                item["usage"] = json.loads(usage) if usage is not None else None
+                result.append(item)
+            return result
 
     def count(
         self, app_id: str, *, status: str | None = None, client_id: str | None = None

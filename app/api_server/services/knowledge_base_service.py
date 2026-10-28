@@ -25,6 +25,8 @@ from app.api_server.services.model_config_service import ModelConfigService
 from nianlun.indexing.tree.workspace import build_workspace_doc
 from app.api_server.services.workspace_store import (
     NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS,
+    TREE_BUILD_OPTIONS_FILENAME,
+    TreeBuildOptions,
     WorkspaceArtifactStore,
     workspace_lock,
 )
@@ -77,6 +79,11 @@ class KnowledgeBaseService:
         result = dict(item)
         relative_path = str(result.get("workspace_relpath", result["id"]))
         result["workspace_dir"] = str(self._workspace_path(relative_path))
+        tree_options = self.artifacts.read_tree_build_options(
+            Path(result["workspace_dir"])
+        )
+        result["subtree_folding_enabled"] = tree_options.subtree_folding_enabled
+        result["min_subtree_tokens"] = tree_options.min_subtree_tokens
         result["vector_enabled"] = result.get("vector_status") != "disabled"
         revision = self.repository.get_committed_revision(
             str(result["id"]), int(result.get("content_version", 0))
@@ -144,7 +151,10 @@ class KnowledgeBaseService:
             WorkspaceArtifactStore.atomic_write(workspace_dir / "_meta.json", b"{}")
             WorkspaceArtifactStore.write_tree_build_options(
                 workspace_dir,
-                NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS,
+                TreeBuildOptions(
+                    subtree_folding_enabled=request.subtree_folding_enabled,
+                    min_subtree_tokens=request.min_subtree_tokens,
+                ),
             )
             timestamp = _now()
             item = {
@@ -156,7 +166,9 @@ class KnowledgeBaseService:
                 "document_count": 0,
                 "summary_enabled": request.summary_enabled,
                 "heading_recovery_enabled": request.heading_recovery_enabled,
+                "parser_options": request.parser_options.model_dump(),
                 "llm_model_id": request.llm_model_id,
+                "reasoning_effort": request.reasoning_effort,
                 "embedding_model_id": request.embedding_model_id,
                 "content_version": 0,
                 "fts_status": "disabled",
@@ -195,10 +207,14 @@ class KnowledgeBaseService:
             updates["summary_enabled"] = request.summary_enabled
         if request.heading_recovery_enabled is not None:
             updates["heading_recovery_enabled"] = request.heading_recovery_enabled
+        if request.parser_options is not None:
+            updates["parser_options_json"] = request.parser_options.model_dump_json()
         if "llm_model_id" in request.model_fields_set:
             if request.llm_model_id is not None:
                 self.models.require_llm_profile(request.llm_model_id)
             updates["llm_model_id"] = request.llm_model_id
+        if "reasoning_effort" in request.model_fields_set:
+            updates["reasoning_effort"] = request.reasoning_effort
         if "embedding_model_id" in request.model_fields_set:
             if request.embedding_model_id is None:
                 raise ApiError(
@@ -237,7 +253,44 @@ class KnowledgeBaseService:
         elif request.vector_enabled is True and not item.get("embedding_model_id"):
             raise ApiError("请先选择 Embedding 模型", status.HTTP_409_CONFLICT)
         updates["updated_at"] = _now().isoformat()
-        self.repository.update_knowledge_base_settings(knowledge_base_id, updates)
+        workspace = Path(item["workspace_dir"])
+        with workspace_lock(workspace):
+            if {
+                "subtree_folding_enabled",
+                "min_subtree_tokens",
+            } & request.model_fields_set:
+                old_options = self.artifacts.read_tree_build_options(workspace)
+                options = TreeBuildOptions(
+                    subtree_folding_enabled=(
+                        request.subtree_folding_enabled
+                        if request.subtree_folding_enabled is not None
+                        else old_options.subtree_folding_enabled
+                    ),
+                    min_subtree_tokens=(
+                        request.min_subtree_tokens
+                        if request.min_subtree_tokens is not None
+                        else old_options.min_subtree_tokens
+                        or NEW_KNOWLEDGE_BASE_TREE_BUILD_OPTIONS.min_subtree_tokens
+                    ),
+                )
+                config_path = workspace / TREE_BUILD_OPTIONS_FILENAME
+                previous = config_path.read_bytes() if config_path.exists() else None
+                try:
+                    self.artifacts.write_tree_build_options(workspace, options)
+                    self.repository.update_knowledge_base_settings(
+                        knowledge_base_id, updates
+                    )
+                except Exception:
+                    # Restore the file if the metadata transaction cannot commit.
+                    if previous is None:
+                        config_path.unlink(missing_ok=True)
+                    else:
+                        self.artifacts.atomic_write(config_path, previous)
+                    raise
+            else:
+                self.repository.update_knowledge_base_settings(
+                    knowledge_base_id, updates
+                )
         return self.get(knowledge_base_id)
 
     def delete(self, knowledge_base_id: str) -> dict[str, Any]:
@@ -341,7 +394,10 @@ class KnowledgeBaseService:
                 elif item["summary_enabled"]:
                     _, document = build_workspace_doc(
                         str(staging_path),
-                        llm=self.models.build_llm(item.get("llm_model_id")),
+                        llm=self.models.build_llm(
+                            item.get("llm_model_id"),
+                            reasoning_effort=item.get("reasoning_effort", "inherit"),
+                        ),
                         thin=tree_options.subtree_folding_enabled,
                         min_node_token=tree_options.min_subtree_tokens,
                     )

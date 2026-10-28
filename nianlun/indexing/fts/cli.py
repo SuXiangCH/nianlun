@@ -20,6 +20,7 @@ import argparse
 import sys
 
 from nianlun.indexing.fts.build import build_node_fts
+from nianlun.knowledgebase.workspace_ownership import require_legacy_workspace
 
 
 def main() -> None:
@@ -44,6 +45,7 @@ def main() -> None:
         help="共享 collection 时的知识库隔离 ID",
     )
     a = ap.parse_args()
+    require_legacy_workspace(a.workspace)
 
     try:
         build_node_fts(

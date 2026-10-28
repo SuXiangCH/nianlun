@@ -137,7 +137,9 @@ def test_incremental_processes_only_specified_docs_after_records_are_built(
     assert store.loaded is True
 
 
-def test_incremental_deletes_tombstoned_document_not_in_workspace(tmp_path: Path) -> None:
+def test_incremental_deletes_tombstoned_document_not_in_workspace(
+    tmp_path: Path,
+) -> None:
     workspace = _workspace(tmp_path, ["doc-1"])
     FakeStore.shared_client = FakeClient(collections={"fts-target"})
 

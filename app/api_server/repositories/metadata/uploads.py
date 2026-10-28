@@ -152,7 +152,13 @@ class UploadOperationRepositoryMixin:
             return content_version
 
     def fail_upload(
-        self, knowledge_base_id: str, idempotency_key: str, error_message: str, now: str
+        self,
+        knowledge_base_id: str,
+        idempotency_key: str,
+        error_message: str,
+        now: str,
+        *,
+        pipeline_generation: int | None = None,
     ) -> None:
         with self.factory.session_scope(write=True) as session:
             operation = session.get(
@@ -164,6 +170,14 @@ class UploadOperationRepositoryMixin:
             )
             if operation is None:
                 raise KeyError((knowledge_base_id, idempotency_key))
+            if pipeline_generation is not None:
+                document = session.get(Document, operation.document_id)
+                if (
+                    document is None
+                    or document.pipeline_generation != pipeline_generation
+                    or document.status == "deleted"
+                ):
+                    return
             operation.status = "failed"
             operation.error_message = error_message[:2_000]
             operation.updated_at = now

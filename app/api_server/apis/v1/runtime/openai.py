@@ -8,7 +8,7 @@ import time
 from typing import Any
 import uuid
 
-from fastapi import APIRouter, Header, Request
+from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.api_server.apis.v1.openai_schemas import (
@@ -29,6 +29,10 @@ from app.api_server.common.request_context import get_request_id
 from app.api_server.services.application_invocation_service import (
     ApplicationInvocationService,
     PreparedInvocation,
+)
+from app.api_server.services.answer_image_streaming import (
+    ImageStreamPrefix,
+    utf8_chunks,
 )
 
 router = APIRouter(prefix="/v1", tags=["OpenAI compatible"])
@@ -131,9 +135,19 @@ async def _blocking(
 async def create_completion(
     body: ChatCompletionRequest,
     request: Request,
+    response: Response,
     authorization: str | None = Header(default=None),
     idempotency_key: str | None = Header(default=None, min_length=1, max_length=128),
+    x_nianlun_include_images: str = Header(default="false"),
+    x_nianlun_image_transport: str = Header(default="url"),
 ) -> Any:
+    if x_nianlun_include_images not in {
+        "true",
+        "false",
+    } or x_nianlun_image_transport not in {"url", "data_url"}:
+        raise ApiError("图片请求头格式无效", 400)
+    if x_nianlun_include_images == "false" and x_nianlun_image_transport == "data_url":
+        raise ApiError("内联图片需要 X-Nianlun-Include-Images: true", 400)
     service = _service(request)
     principal = await asyncio.to_thread(service.authenticate, body.model, authorization)
     messages = body.runtime_messages()
@@ -141,6 +155,10 @@ async def create_completion(
         message=messages[-1]["content"],
         user_id=body.user or "openai",
         response_mode="streaming" if body.stream else "blocking",
+        include_images=x_nianlun_include_images == "true",
+        image_transport="data_url"
+        if x_nianlun_image_transport == "data_url"
+        else "url",
     )
     preparation = asyncio.create_task(
         asyncio.to_thread(
@@ -160,11 +178,20 @@ async def create_completion(
         service.cancel(prepared)
         raise
     if not body.stream:
+        response.headers["Location"] = service.location(prepared.row)
+        response.headers["Cache-Control"] = "private, no-store"
         return await _blocking(service, prepared, request)
 
     async def events():
         task = asyncio.create_task(service.wait(prepared))
         identity = _identity(prepared)
+        prefix = (
+            ImageStreamPrefix(
+                max_canonical_bytes=prepared.image_policy.max_canonical_bytes
+            )
+            if prepared.include_images
+            else None
+        )
 
         def chunk(delta: CompletionDelta, *, finished: bool = False) -> str:
             payload = ChatCompletionChunk(
@@ -188,15 +215,24 @@ async def create_completion(
                     except queue.Empty:
                         pass
                     else:
-                        yield chunk(CompletionDelta(content=text))
+                        if prefix is not None:
+                            text = prefix.feed(text)
+                        for part in utf8_chunks(text):
+                            yield chunk(CompletionDelta(content=part))
                         continue
                 if time.monotonic() - heartbeat >= 15:
                     yield ": heartbeat\n\n"
                     heartbeat = time.monotonic()
                 await asyncio.sleep(0.01)
             result = await task
-            if prepared.replay is not None:
-                yield chunk(CompletionDelta(content=result.answer))
+            if prepared.replay is not None or prepared.include_images:
+                suffix = (
+                    prefix.remainder(result.answer)
+                    if prefix is not None
+                    else result.answer
+                )
+                for part in utf8_chunks(suffix):
+                    yield chunk(CompletionDelta(content=part))
             yield chunk(CompletionDelta(), finished=True)
             if body.stream_options is not None and body.stream_options.include_usage:
                 yield _data(
@@ -217,7 +253,7 @@ async def create_completion(
         events(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "private, no-store",
             "X-Accel-Buffering": "no",
             "Location": service.location(prepared.row),
         },

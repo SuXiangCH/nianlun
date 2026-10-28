@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Iterator
@@ -13,7 +15,15 @@ from typing import Any
 
 from fastapi import status
 
-from nianlun.agent.lead_agent.runtime import iter_agent_stream_events, run_agent
+from nianlun.agent.lead_agent.runtime import (
+    AgentRuntime,
+    iter_agent_stream_events,
+    run_agent,
+)
+from nianlun.agent.prompt_registry import (
+    UnsupportedPromptBundle,
+    resolve_prompt_contract_json,
+)
 from app.api_server.apis.v1.schemas import (
     ChatResponse,
     ConversationMessageResponse,
@@ -21,8 +31,11 @@ from app.api_server.apis.v1.schemas import (
     MessageSourceResponse,
 )
 from app.api_server.common.errors import ApiError
+from app.api_server.config import ApiServerSettings
+from nianlun.agent.contracts import AnswerImagePolicy
 from app.api_server.repositories.sqlite_chat import SQLiteChatRepository
 from app.api_server.services.application_service import ApplicationService
+from app.api_server.services.answer_image_service import AnswerImageService
 
 logger = logging.getLogger(__name__)
 _STREAM_END = object()
@@ -68,9 +81,13 @@ class ChatService:
         self,
         applications: ApplicationService,
         repository: SQLiteChatRepository,
+        image_service: AnswerImageService | None = None,
+        settings: ApiServerSettings | None = None,
     ) -> None:
         self.applications = applications
         self.repository = repository
+        self.image_service = image_service
+        self.settings = settings or ApiServerSettings()
         self._conversation_locks: dict[str, threading.RLock] = {}
         self._locks_guard = threading.Lock()
         self._stream_executor = ThreadPoolExecutor(
@@ -85,6 +102,26 @@ class ChatService:
     def _conversation_id(conversation_id: str | None) -> str:
         return conversation_id or str(uuid.uuid4())
 
+    def _runtime(
+        self, application_id: str, contract: str | None, policy: AnswerImagePolicy
+    ) -> AgentRuntime:
+        try:
+            if contract is None:
+                raise UnsupportedPromptBundle("Missing console contract")
+            bundle = resolve_prompt_contract_json(contract)
+        except UnsupportedPromptBundle as exc:
+            raise ApiError("会话版本不兼容，请新建会话", 409) from exc
+        return self.applications.runtime(
+            application_id,
+            prompt_bundle=bundle,
+            image_capability=(
+                bundle.supports_images
+                and self.image_service is not None
+                and self.settings.answer_images_enabled
+            ),
+            image_policy=policy,
+        )
+
     def complete(
         self,
         application_id: str,
@@ -94,12 +131,13 @@ class ChatService:
         clarification_enabled: bool = False,
     ) -> ChatResponse:
         active_conversation_id = self._conversation_id(conversation_id)
+        policy = self.settings.freeze_image_policy()
         assistant_message_id = str(uuid.uuid4())
         lock = self._conversation_lock(f"{application_id}:{active_conversation_id}")
         with lock:
             self.applications.require_record(application_id)
             try:
-                self.repository.begin_turn(
+                contract = self.repository.begin_turn(
                     application_id=application_id,
                     conversation_id=active_conversation_id,
                     user_message_id=str(uuid.uuid4()),
@@ -110,27 +148,47 @@ class ChatService:
             except ValueError as exc:
                 raise ApiError(str(exc), status.HTTP_409_CONFLICT) from exc
             try:
-                runtime = self.applications.runtime(application_id)
+                runtime = self._runtime(application_id, contract, policy)
                 _log_runtime(application_id, runtime)
                 result = run_agent(
                     runtime,
                     message,
                     thread_id=f"{application_id}:{active_conversation_id}",
                     clarification_enabled=clarification_enabled,
+                    trusted_history=self.repository.trusted_history(
+                        application_id, active_conversation_id
+                    ),
                 )
-                self.repository.complete_turn(
-                    application_id=application_id,
-                    conversation_id=active_conversation_id,
-                    assistant_message_id=assistant_message_id,
-                    answer=result["answer"],
-                    route=result.get("route", "direct"),
-                    snippets=result.get("retrieved_snippets", []),
-                    tool_calls=result.get("tool_calls", []),
-                    trace=result.get("trace", []),
-                    usage=result.get("usage"),
-                    ttft_ms=result.get("ttft_ms"),
-                    now=_now(),
-                )
+                with (
+                    self.image_service.completion_scope()
+                    if self.image_service
+                    else nullcontext()
+                ):
+                    result = self._prepare_result(
+                        application_id, result, policy=policy, question=message
+                    )
+                    self.repository.complete_turn(
+                        application_id=application_id,
+                        conversation_id=active_conversation_id,
+                        assistant_message_id=assistant_message_id,
+                        answer=result["answer"],
+                        route=result.get("route", "direct"),
+                        snippets=result.get("retrieved_snippets", []),
+                        tool_calls=result.get("tool_calls", []),
+                        trace=result.get("trace", []),
+                        usage=result.get("usage"),
+                        ttft_ms=result.get("ttft_ms"),
+                        images=result.get("images", []),
+                        image_policy=policy,
+                        answer_format_version=result.get("answer_format_version", 1),
+                        answer_output_mode=str(
+                            result.get("answer_output_mode", "text")
+                        ),
+                        image_previews_unavailable=result.get(
+                            "image_previews_unavailable", 0
+                        ),
+                        now=_now(),
+                    )
             except Exception as exc:
                 self._mark_failed(
                     application_id,
@@ -139,6 +197,9 @@ class ChatService:
                     exc,
                 )
                 raise
+        result = self._console_result(
+            application_id, active_conversation_id, assistant_message_id, result
+        )
         return ChatResponse(
             app_id=application_id,
             conversation_id=active_conversation_id,
@@ -152,6 +213,10 @@ class ChatService:
             usage=result.get("usage"),
             ttft_ms=result.get("ttft_ms"),
             clarification=result.get("clarification"),
+            images=result.get("images", []),
+            answer_format_version=result.get("answer_format_version", 1),
+            answer_output_mode=result.get("answer_output_mode", "text"),
+            image_previews_unavailable=result.get("image_previews_unavailable", 0),
         )
 
     async def complete_async(
@@ -182,6 +247,7 @@ class ChatService:
         clarification_enabled: bool = False,
     ) -> tuple[str, str, Iterator[dict[str, Any]]]:
         active_conversation_id = self._conversation_id(conversation_id)
+        policy = self.settings.freeze_image_policy()
         message_id = str(uuid.uuid4())
         cancellation_event = threading.Event()
 
@@ -196,7 +262,7 @@ class ChatService:
                 try:
                     self.applications.require_record(application_id)
                     try:
-                        self.repository.begin_turn(
+                        contract = self.repository.begin_turn(
                             application_id=application_id,
                             conversation_id=active_conversation_id,
                             user_message_id=str(uuid.uuid4()),
@@ -207,7 +273,7 @@ class ChatService:
                     except ValueError as exc:
                         raise ApiError(str(exc), status.HTTP_409_CONFLICT) from exc
                     turn_started = True
-                    runtime = self.applications.runtime(application_id)
+                    runtime = self._runtime(application_id, contract, policy)
                     _log_runtime(application_id, runtime)
                     for event in iter_agent_stream_events(
                         runtime,
@@ -215,22 +281,55 @@ class ChatService:
                         thread_id=f"{application_id}:{active_conversation_id}",
                         clarification_enabled=clarification_enabled,
                         cancellation_event=cancellation_event,
+                        trusted_history=self.repository.trusted_history(
+                            application_id, active_conversation_id
+                        ),
                     ):
                         if event.get("type") == "done":
-                            payload = event["data"]
-                            self.repository.complete_turn(
-                                application_id=application_id,
-                                conversation_id=active_conversation_id,
-                                assistant_message_id=message_id,
-                                answer=payload.get("answer", ""),
-                                route=payload.get("route", "direct"),
-                                snippets=payload.get("retrieved_snippets", []),
-                                tool_calls=payload.get("tool_calls", []),
-                                trace=payload.get("trace", []),
-                                usage=payload.get("usage"),
-                                ttft_ms=payload.get("ttft_ms"),
-                                now=_now(),
-                            )
+                            with (
+                                self.image_service.completion_scope()
+                                if self.image_service
+                                else nullcontext()
+                            ):
+                                payload = self._prepare_result(
+                                    application_id,
+                                    event["data"],
+                                    policy=policy,
+                                    question=message,
+                                )
+                                self.repository.complete_turn(
+                                    application_id=application_id,
+                                    conversation_id=active_conversation_id,
+                                    assistant_message_id=message_id,
+                                    answer=payload.get("answer", ""),
+                                    route=payload.get("route", "direct"),
+                                    snippets=payload.get("retrieved_snippets", []),
+                                    tool_calls=payload.get("tool_calls", []),
+                                    trace=payload.get("trace", []),
+                                    usage=payload.get("usage"),
+                                    ttft_ms=payload.get("ttft_ms"),
+                                    images=payload.get("images", []),
+                                    image_policy=policy,
+                                    answer_format_version=payload.get(
+                                        "answer_format_version", 1
+                                    ),
+                                    answer_output_mode=str(
+                                        payload.get("answer_output_mode", "text")
+                                    ),
+                                    image_previews_unavailable=payload.get(
+                                        "image_previews_unavailable", 0
+                                    ),
+                                    now=_now(),
+                                )
+                            event = {
+                                "type": "done",
+                                "data": self._console_result(
+                                    application_id,
+                                    active_conversation_id,
+                                    message_id,
+                                    payload,
+                                ),
+                            }
                             turn_completed = True
                         yield event
                 except Exception as exc:
@@ -266,6 +365,65 @@ class ChatService:
 
         events = _CancellableEventStream(locked_events(), cancellation_event)
         return active_conversation_id, message_id, events
+
+    def _prepare_result(
+        self,
+        application_id: str,
+        result: dict[str, Any],
+        *,
+        policy: AnswerImagePolicy = AnswerImagePolicy(),
+        question: str = "",
+    ) -> dict[str, Any]:
+        if self.image_service is None or not self.settings.answer_images_enabled:
+            return {**result, "images": [], "answer_output_mode": "text"}
+        return self.image_service.prepare_result(
+            application_id, result, policy=policy, question=question
+        )
+
+    @staticmethod
+    def _source_projection(
+        source: dict[str, Any], images: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        value = {key: item for key, item in source.items() if key != "images"}
+        value["image_attachment_ids"] = [
+            image["id"]
+            for image in images
+            if source.get("citation_id") in image.get("citation_ids", [])
+        ]
+        return value
+
+    def _console_result(
+        self,
+        application_id: str,
+        conversation_id: str,
+        message_id: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        images = (
+            self.image_service.console_images(
+                application_id, conversation_id, message_id
+            )
+            if self.image_service is not None
+            else []
+        )
+        persisted = self.repository.get_messages(application_id, conversation_id) or []
+        message = next((item for item in persisted if item["id"] == message_id), None)
+        return {
+            **result,
+            **(
+                {
+                    "answer": message["content"],
+                    "answer_output_mode": message["answer_output_mode"],
+                }
+                if message
+                else {}
+            ),
+            "images": images,
+            "retrieved_snippets": [
+                self._source_projection(source, images)
+                for source in result.get("retrieved_snippets", [])
+            ],
+        }
 
     async def iterate_stream_async(
         self, events: Iterator[dict[str, Any]]
@@ -334,7 +492,21 @@ class ChatService:
         items = self.repository.get_messages(application_id, conversation_id)
         if items is None:
             raise ApiError("会话不存在", status.HTTP_404_NOT_FOUND)
-        return [ConversationMessageResponse.model_validate(item) for item in items]
+        result = []
+        for item in items:
+            images = (
+                self.image_service.console_images(
+                    application_id, conversation_id, item["id"]
+                )
+                if self.image_service is not None
+                else []
+            )
+            item["images"] = images
+            item["sources"] = [
+                self._source_projection(source, images) for source in item["sources"]
+            ]
+            result.append(ConversationMessageResponse.model_validate(item))
+        return result
 
     def source(
         self,
@@ -352,7 +524,16 @@ class ChatService:
         )
         if item is None:
             raise ApiError("检索片段不存在", status.HTTP_404_NOT_FOUND)
-        return MessageSourceResponse.model_validate(item)
+        images = (
+            self.image_service.console_images(
+                application_id, conversation_id, message_id
+            )
+            if self.image_service is not None
+            else []
+        )
+        return MessageSourceResponse.model_validate(
+            self._source_projection(item, images)
+        )
 
     def delete_conversation(self, application_id: str, conversation_id: str) -> None:
         self.applications.require_record(application_id)
@@ -388,7 +569,7 @@ class ChatService:
             )
 
     def shutdown(self) -> None:
-        self._stream_executor.shutdown(wait=False, cancel_futures=True)
+        self._stream_executor.shutdown(wait=True, cancel_futures=True)
 
 
 def _now() -> datetime:

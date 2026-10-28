@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from nianlun.models.reasoning import ReasoningEffort
 
 
 MAX_NORMALIZATION_CHUNKS = 100
@@ -76,6 +77,20 @@ class PageMap(BaseModel):
     entries: list[PageMapEntry]
 
 
+class ParserConfigSnapshot(BaseModel):
+    """Non-secret parser parameters fixed for one document generation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    api_mode: Literal["saas_precision", "self_hosted"]
+    model_version: str
+    language: str
+    is_ocr: bool
+    enable_table: bool
+    enable_formula: bool
+    page_ranges: str = ""
+
+
 class EnrichmentOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -83,6 +98,8 @@ class EnrichmentOptions(BaseModel):
     heading_recovery_enabled: bool
     subtree_folding_enabled: bool
     min_subtree_tokens: int = Field(ge=1)
+    reasoning_effort: ReasoningEffort | None = None
+    temperature: float | None = Field(default=None, ge=0, le=2)
 
 
 __all__ = [
@@ -92,4 +109,5 @@ __all__ = [
     "NormalizationInput",
     "PageMap",
     "PageMapEntry",
+    "ParserConfigSnapshot",
 ]

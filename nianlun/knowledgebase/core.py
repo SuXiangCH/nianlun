@@ -19,6 +19,7 @@ from nianlun.knowledgebase.config import (
 )
 from nianlun.knowledgebase.workspace_view import WorkspaceView
 from nianlun.knowledgebase.retrieval_ports import DocumentSearchPort, NodeSearchPort
+from nianlun.knowledgebase.image_syntax import parse_image_syntax
 
 
 MAX_LINE_SPEC_LINES = 500
@@ -67,6 +68,8 @@ class KnowledgeBase:
         content_version: int | None = None,
     ) -> None:
         self.workspace_dir = Path(workspace_dir)
+        self.knowledge_base_id = knowledge_base_id
+        self.content_version = content_version
         self.meta_path = self.workspace_dir / "_meta.json"
         if snapshot_relpath is None:
             self._workspace_view = WorkspaceView.legacy(self.workspace_dir)
@@ -364,6 +367,119 @@ class KnowledgeBase:
 
         return "\n".join(walk(doc["structure"]))
 
+    def _images_for_node(
+        self,
+        catalog: dict[str, object] | None,
+        node_id: object,
+        char_offset: int,
+        char_limit: int | None,
+    ) -> list[dict[str, Any]]:
+        if not catalog:
+            return []
+        raw_entries = catalog.get("entries")
+        if not isinstance(raw_entries, list):
+            return []
+        window_end = char_offset + char_limit if char_limit is not None else None
+        selected: list[dict[str, Any]] = []
+        for raw in raw_entries:
+            if not isinstance(raw, dict):
+                continue
+            occurrences = raw.get("occurrences")
+            if not isinstance(occurrences, list):
+                continue
+            for occurrence in occurrences:
+                if not isinstance(occurrence, dict):
+                    continue
+                if occurrence.get("node_id") != node_id:
+                    continue
+                start = occurrence.get("char_offset")
+                end = occurrence.get("char_end")
+                if (
+                    not isinstance(start, int)
+                    or not isinstance(end, int)
+                    or start < char_offset
+                ):
+                    continue
+                if window_end is not None and end > window_end:
+                    continue
+                selected.append(
+                    {
+                        "image_id": raw.get("image_id"),
+                        "asset_relpath": raw.get("asset_relpath"),
+                        "sha256": raw.get("sha256"),
+                        "media_type": raw.get("media_type"),
+                        "size_bytes": raw.get("size_bytes"),
+                        "width": raw.get("width"),
+                        "height": raw.get("height"),
+                        "orientation": raw.get("orientation", 1),
+                        "alt_text": raw.get("alt_text", ""),
+                        "char_offset": start,
+                        "char_end": end,
+                        "source_start": start,
+                        "source_end": end,
+                        "generation": catalog.get("generation"),
+                        "content_version": self.content_version,
+                        "knowledge_base_id": self.knowledge_base_id,
+                    }
+                )
+        return selected
+
+    def _image_spans_for_node(
+        self,
+        catalog: dict[str, object] | None,
+        node_id: object,
+        text: str,
+        start: int,
+        end: int,
+    ) -> list[dict[str, Any]]:
+        syntax = parse_image_syntax(text)
+        spans = {
+            (image.start, image.end): {
+                "source_start": image.start,
+                "source_end": image.end,
+                "kind": image.kind,
+            }
+            for image in syntax.images
+        }
+        for hidden in syntax.hidden:
+            spans.setdefault(
+                (hidden.start, hidden.end),
+                {
+                    "source_start": hidden.start,
+                    "source_end": hidden.end,
+                    "kind": "hidden",
+                },
+            )
+        # Reference definitions may live in a different node; the catalog has
+        # already resolved those against this immutable document version.
+        if catalog:
+            entries = catalog.get("entries", [])
+            if not isinstance(entries, list):
+                raise ValueError("图片目录缺少 entries")
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("图片目录 entry 格式无效")
+                for occurrence in entry.get("occurrences", []):
+                    first, last = (
+                        occurrence.get("char_offset"),
+                        occurrence.get("char_end"),
+                    )
+                    if (
+                        occurrence.get("node_id") != node_id
+                        or not isinstance(first, int)
+                        or not isinstance(last, int)
+                    ):
+                        continue
+                    spans.setdefault(
+                        (first, last),
+                        {"source_start": first, "source_end": last, "kind": "markdown"},
+                    )
+        return [
+            span
+            for (first, last), span in sorted(spans.items())
+            if first < end and last > start
+        ]
+
     def get_line_content(
         self,
         doc_id: str,
@@ -407,11 +523,19 @@ class KnowledgeBase:
         min_line, max_line = min(line_nums), max(line_nums)
         target_lines = set(line_nums)
         results = []
+        catalog: dict[str, object] | None = None
+        catalog_loaded = False
 
         def find_content(nodes):
+            nonlocal catalog, catalog_loaded
             for node in nodes:
                 ln = node.get("line_num", 0)
                 if ln and min_line <= ln <= max_line and ln in target_lines:
+                    if not catalog_loaded:
+                        # Reuse validation within this call only, so later reads
+                        # still detect damaged artifacts in the same snapshot.
+                        catalog = self._workspace_view.read_image_catalog(doc_id)
+                        catalog_loaded = True
                     full_text = sanitize_text(node.get("text", ""))
                     total_chars = len(full_text)
                     end = total_chars
@@ -430,6 +554,19 @@ class KnowledgeBase:
                             "total_chars": total_chars,
                             "text_truncated": text_truncated,
                             "next_char_offset": end if text_truncated else None,
+                            "images": self._images_for_node(
+                                catalog,
+                                node.get("node_id"),
+                                char_offset,
+                                char_limit,
+                            ),
+                            "image_spans": self._image_spans_for_node(
+                                catalog,
+                                node.get("node_id"),
+                                full_text,
+                                char_offset,
+                                end,
+                            ),
                         }
                     )
                 if node.get("nodes"):
@@ -453,6 +590,9 @@ class KnowledgeBase:
 
 
 if __name__ == "__main__":
+    from nianlun.knowledgebase.workspace_ownership import require_legacy_workspace
+
+    require_legacy_workspace(WORKSPACE_DIR)
     kb = KnowledgeBase()
     print(kb.list_documents(detailed=True))
     print(kb.list_documents(detailed=False))

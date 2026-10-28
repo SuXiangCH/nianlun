@@ -20,6 +20,7 @@ from app.api_server.services.workspace_store import (
     TREE_BUILD_OPTIONS_FILENAME,
     workspace_lock,
 )
+from nianlun.knowledgebase.workspace_view import WorkspaceView
 
 
 class FakeSummaryLLM:
@@ -117,13 +118,26 @@ def _wait_document_ready(
     return payload
 
 
+def _committed_tree(
+    client: TestClient, knowledge_base_id: str, document_id: str
+) -> dict[str, Any]:
+    record = client.app.state.services.knowledge_bases.require_record(knowledge_base_id)
+    return WorkspaceView.revision(
+        Path(record["workspace_dir"]),
+        record["snapshot_relpath"],
+        record["snapshot_manifest_sha256"],
+        knowledge_base_id=knowledge_base_id,
+        content_version=record["content_version"],
+    ).load_document(document_id)
+
+
 def test_app_lifespan_shuts_down_background_services(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path)
     services = build_services(settings)
     shutdown_calls: list[str] = []
-    for service_name in ("chat", "documents", "fts", "vector"):
+    for service_name in ("chat", "documents", "fts", "vector", "images"):
         monkeypatch.setattr(
             getattr(services, service_name),
             "shutdown",
@@ -133,7 +147,23 @@ def test_app_lifespan_shuts_down_background_services(
     with TestClient(create_app(settings, services)) as client:
         assert client.get("/api/v1/knowledge-bases").status_code == 200
 
-    assert shutdown_calls == ["chat", "documents", "fts", "vector"]
+    assert shutdown_calls == ["chat", "documents", "fts", "vector", "images"]
+
+
+def test_app_lifespan_closes_storage_even_if_invocation_close_raises(
+    tmp_path, monkeypatch
+):
+    settings = _settings(tmp_path)
+    services = build_services(settings)
+
+    def fail():
+        raise RuntimeError("Cancel persistence failed")
+
+    monkeypatch.setattr(services.invocations, "close", fail)
+    with pytest.raises(RuntimeError, match="Cancel persistence failed"):
+        with TestClient(create_app(settings, services)):
+            pass
+    assert services.images.blob_store._closed
 
 
 def test_knowledge_base_upload_and_app_creation(
@@ -142,7 +172,7 @@ def test_knowledge_base_upload_and_app_creation(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: FakeSummaryLLM(),
+        lambda _self, _profile_id=None, **_kwargs: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
 
@@ -256,9 +286,7 @@ def test_new_knowledge_base_enables_subtree_folding_without_api_setting(
         ]
         == "ready"
     )
-    new_artifact = json.loads(
-        (new_workspace / f"{new_document_id}.json").read_text(encoding="utf-8")
-    )
+    new_artifact = _committed_tree(client, new_knowledge_base["id"], new_document_id)
     assert len(new_artifact["structure"]) == 1
     assert not new_artifact["structure"][0].get("nodes")
     assert "## Child" in new_artifact["structure"][0]["text"]
@@ -282,10 +310,127 @@ def test_new_knowledge_base_enables_subtree_folding_without_api_setting(
         ]
         == "ready"
     )
-    legacy_artifact = json.loads(
-        (legacy_workspace / f"{legacy_document_id}.json").read_text(encoding="utf-8")
+    legacy_artifact = _committed_tree(
+        client, legacy_knowledge_base["id"], legacy_document_id
     )
     assert legacy_artifact["structure"][0]["nodes"][0]["title"] == "Child"
+
+
+def test_knowledge_base_folding_threshold_is_configurable_and_applies_to_new_builds(
+    tmp_path: Path,
+) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        response = client.post(
+            "/api/v1/knowledge-bases",
+            json={
+                "name": "可配置合并",
+                "summary_enabled": False,
+                "min_subtree_tokens": 1,
+            },
+        )
+        assert response.status_code == 200
+        kb = response.json()["data"]
+        assert kb["subtree_folding_enabled"] is True
+        assert kb["min_subtree_tokens"] == 1
+        path = f"/api/v1/knowledge-bases/{kb['id']}"
+        source = b"# Parent\n\nintro\n\n## Child\n\ndetail"
+        first = client.post(
+            f"{path}/documents", files={"file": ("before.md", source)}
+        ).json()["data"]["document_id"]
+        assert _wait_document_ready(client, kb["id"], first)["status"] == "ready"
+        first_tree = _committed_tree(client, kb["id"], first)
+        assert first_tree["structure"][0]["nodes"][0]["title"] == "Child"
+
+        updated = client.patch(path, json={"min_subtree_tokens": 1200})
+        assert updated.status_code == 200
+        assert updated.json()["data"]["min_subtree_tokens"] == 1200
+        assert client.get(path).json()["data"]["min_subtree_tokens"] == 1200
+        assert (
+            next(
+                item
+                for item in client.get("/api/v1/knowledge-bases").json()["data"]
+                if item["id"] == kb["id"]
+            )["min_subtree_tokens"]
+            == 1200
+        )
+        second = client.post(
+            f"{path}/documents", files={"file": ("after.md", source + b"\nmore detail")}
+        ).json()["data"]["document_id"]
+        assert _wait_document_ready(client, kb["id"], second)["status"] == "ready"
+        second_tree = _committed_tree(client, kb["id"], second)
+        assert not second_tree["structure"][0].get("nodes")
+        assert "## Child" in second_tree["structure"][0]["text"]
+        assert _committed_tree(client, kb["id"], first) == first_tree
+        disabled = client.patch(path, json={"subtree_folding_enabled": False})
+        assert disabled.json()["data"]["subtree_folding_enabled"] is False
+        assert disabled.json()["data"]["min_subtree_tokens"] == 1200
+
+
+@pytest.mark.parametrize("threshold", [0, -1, 1.5, True, None])
+def test_knowledge_base_rejects_invalid_folding_thresholds(tmp_path: Path, threshold):
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        created = client.post(
+            "/api/v1/knowledge-bases", json={"name": "阈值校验"}
+        ).json()["data"]
+        assert (
+            client.post(
+                "/api/v1/knowledge-bases",
+                json={"name": "无效阈值", "min_subtree_tokens": threshold},
+            ).status_code
+            == 422
+        )
+        path = f"/api/v1/knowledge-bases/{created['id']}"
+        assert (
+            client.patch(path, json={"min_subtree_tokens": threshold}).status_code
+            == 422
+        )
+        assert client.get(path).json()["data"]["min_subtree_tokens"] == 1200
+
+
+def test_legacy_folding_configuration_is_preserved_until_explicitly_updated(
+    tmp_path: Path,
+):
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        kb = client.post(
+            "/api/v1/knowledge-bases", json={"name": "旧知识库配置"}
+        ).json()["data"]
+        config_path = Path(kb["workspace_dir"]) / TREE_BUILD_OPTIONS_FILENAME
+        config_path.unlink()
+        path = f"/api/v1/knowledge-bases/{kb['id']}"
+        legacy = client.get(path).json()["data"]
+        assert legacy["subtree_folding_enabled"] is False
+        assert legacy["min_subtree_tokens"] is None
+        assert client.patch(path, json={"name": "旧知识库改名"}).status_code == 200
+        assert not config_path.exists()
+        enabled = client.patch(path, json={"subtree_folding_enabled": True})
+        assert enabled.status_code == 200
+        assert enabled.json()["data"]["min_subtree_tokens"] == 1200
+        assert json.loads(config_path.read_text())["subtree_folding_enabled"] is True
+
+
+def test_folding_config_is_restored_when_metadata_update_fails(
+    tmp_path: Path, monkeypatch
+):
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        kb = client.post("/api/v1/knowledge-bases", json={"name": "保存失败"}).json()[
+            "data"
+        ]
+        config_path = Path(kb["workspace_dir"]) / TREE_BUILD_OPTIONS_FILENAME
+        original = config_path.read_bytes()
+
+        def fail_update(*args, **kwargs):
+            raise RuntimeError("metadata unavailable")
+
+        monkeypatch.setattr(
+            client.app.state.services.knowledge_bases.repository,
+            "update_knowledge_base_settings",
+            fail_update,
+        )
+        with pytest.raises(RuntimeError, match="metadata unavailable"):
+            client.patch(
+                f"/api/v1/knowledge-bases/{kb['id']}", json={"min_subtree_tokens": 600}
+            )
+        assert config_path.read_bytes() == original
 
 
 def test_knowledge_base_name_can_be_updated(
@@ -1008,6 +1153,7 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "allow_env_fallback": False,
         "request_timeout_seconds": 20.0,
         "max_retries": 0,
+        "temperature": None,
     }
 
     profiles = {}
@@ -1064,6 +1210,7 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "allow_env_fallback": False,
         "request_timeout_seconds": 20.0,
         "max_retries": 0,
+        "temperature": None,
     }
     assert calls["embedding"] == {
         "model": "catalog-embedding",
@@ -1091,6 +1238,7 @@ def test_model_catalog_connection_tests_use_mocked_services(
         "allow_env_fallback": False,
         "request_timeout_seconds": 20.0,
         "max_retries": 0,
+        "temperature": None,
     }
 
     response = client.post(
@@ -1280,7 +1428,7 @@ def test_document_tree_outline_serves_without_node_text(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: FakeSummaryLLM(),
+        lambda _self, _profile_id=None, **_kwargs: FakeSummaryLLM(),
     )
     client = TestClient(create_app(_settings(tmp_path)))
     knowledge_base = client.post(

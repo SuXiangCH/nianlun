@@ -3,6 +3,7 @@ import { ArrowRight, Braces, Building2, RefreshCw, Upload } from "lucide-react";
 import { api } from "../../api/client";
 import { Modal } from "../../components/Modal";
 import type { Application, ApplicationPublication, ApplicationRelease, KnowledgeBase, ModelProfile, PublishedApplicationConfig } from "../../types";
+import { resolveReasoningEffort } from "../../components/ReasoningEffortSelect";
 import { useReleaseOptions, VersionSettings, versionError } from "./ApplicationVersions";
 import { isWecomExpired, useWecomNow } from "./ApplicationWecomChannel";
 
@@ -44,6 +45,9 @@ export function ApplicationPublishPanel({ app, publication, initialRelease, init
     agent_version: draft.agent_version, knowledge_base_id: draft.knowledge_base_id,
     llm_model_id: model?.id || draft.llm_model_id || undefined,
     clarification_enabled: draft.clarification_enabled ?? true,
+    sampling_config_version: 2,
+    temperature: model?.temperature ?? null,
+    reasoning_effort: resolveReasoningEffort(draft.reasoning_effort, model?.reasoning_effort),
     model: model?.model || undefined, base_url: model?.base_url || undefined,
     context_window_tokens: model?.context_window_tokens || 128000,
   };

@@ -27,7 +27,7 @@ class InputStats(EvaluationSchema):
 class JudgeMetadata(EvaluationSchema):
     provider: str = Field(min_length=1)
     model: str = Field(min_length=1)
-    temperature: float
+    temperature: float | None
 
 
 class EvaluationUsage(EvaluationSchema):

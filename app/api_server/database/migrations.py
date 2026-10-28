@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 
 from sqlalchemy import MetaData
 from sqlalchemy.dialects.sqlite import dialect as sqlite_dialect
@@ -12,7 +13,7 @@ from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import Base
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 23
 
 _REQUIRED_COLUMNS = {
     table.name: {column.name for column in table.columns}
@@ -52,6 +53,46 @@ def _migrate_heading_recovery_enabled(connection: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_document_parser_options(connection: sqlite3.Connection) -> None:
+    for table, column, definition in (
+        ("knowledge_bases", "parser_options_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("documents", "parser_config_json", "TEXT NULL"),
+    ):
+        columns = {
+            str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        if column not in columns:
+            connection.execute(
+                f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}'
+            )
+
+
+def _migrate_reasoning_effort(connection: sqlite3.Connection) -> None:
+    for table, definition in (
+        ("llm_model_profiles", "VARCHAR(16) NULL"),
+        ("knowledge_bases", "VARCHAR(16) NOT NULL DEFAULT 'inherit'"),
+        ("applications", "VARCHAR(16) NOT NULL DEFAULT 'inherit'"),
+    ):
+        columns = {
+            str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        if "reasoning_effort" not in columns:
+            connection.execute(
+                f'ALTER TABLE "{table}" ADD COLUMN reasoning_effort {definition}'
+            )
+
+
+def _migrate_model_temperature(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute('PRAGMA table_info("llm_model_profiles")')
+    }
+    if "temperature" not in columns:
+        connection.execute(
+            "ALTER TABLE llm_model_profiles ADD COLUMN temperature FLOAT NULL"
+        )
+
+
 def _migrate_llm_vision_capability(connection: sqlite3.Connection) -> None:
     columns = {
         str(row[1])
@@ -61,6 +102,207 @@ def _migrate_llm_vision_capability(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE llm_model_profiles ADD COLUMN supports_vision BOOLEAN NULL"
         )
+
+
+def _migrate_image_storage_profiles(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """CREATE TABLE IF NOT EXISTS image_storage_profiles (
+            profile_id VARCHAR(128) NOT NULL PRIMARY KEY,
+            backend VARCHAR(32) NOT NULL,
+            locator_json TEXT NOT NULL,
+            locator_fingerprint VARCHAR(64) NOT NULL,
+            created_at VARCHAR(64) NOT NULL,
+            CONSTRAINT ck_image_storage_profile_backend CHECK (backend IN ('filesystem', 's3'))
+        )"""
+    )
+
+
+def _migrate_console_agent_contract(connection: sqlite3.Connection) -> None:
+    """Pin pre-v5 console conversations without rewriting their checkpoints."""
+    columns = {
+        str(row[1]) for row in connection.execute('PRAGMA table_info("conversations")')
+    }
+    if "agent_contract_json" not in columns:
+        from nianlun.agent.prompt_registry import LEGACY_PROMPT_BUNDLE
+
+        connection.execute(
+            "ALTER TABLE conversations ADD COLUMN agent_contract_json TEXT NULL"
+        )
+        predicate = " WHERE channel = 'console'" if "channel" in columns else ""
+        connection.execute(
+            "UPDATE conversations SET agent_contract_json = ?" + predicate,
+            (LEGACY_PROMPT_BUNDLE.contract_json(),),
+        )
+
+
+def _migrate_image_blob_lifecycle(connection: sqlite3.Connection) -> None:
+    """Retain immutable cleanup locators and fence active deduplication."""
+    if connection.execute('PRAGMA foreign_key_list("answer_image_blobs")').fetchall():
+        source = Base.metadata.tables["answer_image_blobs"]
+        replacement = source.to_metadata(MetaData(), name="answer_image_blobs_v19")
+        dialect = sqlite_dialect()
+        connection.execute(str(CreateTable(replacement).compile(dialect=dialect)))
+        columns = ", ".join(f'"{column.name}"' for column in source.columns)
+        connection.execute(
+            f"INSERT INTO answer_image_blobs_v19 ({columns}) "
+            f"SELECT {columns} FROM answer_image_blobs"
+        )
+        connection.execute("DROP TABLE answer_image_blobs")
+        connection.execute(
+            "ALTER TABLE answer_image_blobs_v19 RENAME TO answer_image_blobs"
+        )
+    # Pre-lifecycle builds allowed multiple active rows. Keep one ready identity,
+    # retaining every other locator for GC rather than deleting physical ownership.
+    duplicates = connection.execute(
+        "SELECT id FROM (SELECT id, ROW_NUMBER() OVER ("
+        "PARTITION BY knowledge_base_id, sha256 "
+        "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, created_at, id"
+        ") AS n FROM answer_image_blobs WHERE status IN ('uploading','ready')) WHERE n > 1"
+    ).fetchall()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    for row in duplicates:
+        connection.execute(
+            "UPDATE image_access_grants SET revoked_at = ? "
+            "WHERE attachment_id IN (SELECT id FROM message_images WHERE blob_id = ?)",
+            (timestamp, row[0]),
+        )
+        connection.execute(
+            "UPDATE message_images SET status='unavailable', "
+            "unavailable_reason='blob_retired', blob_id=NULL WHERE blob_id=?",
+            (row[0],),
+        )
+        connection.execute(
+            "UPDATE answer_image_blobs SET status='retired', retired_at=?, "
+            "lease_token=NULL, lease_expires_at=NULL WHERE id=?",
+            (timestamp, row[0]),
+        )
+    # Early lifecycle migrations used SQLite CURRENT_TIMESTAMP (naive UTC).
+    # Repair those durable receipts as well as writing aware UTC for new rows.
+    for blob_id, retired_at in connection.execute(
+        "SELECT id, retired_at FROM answer_image_blobs WHERE retired_at IS NOT NULL"
+    ).fetchall():
+        parsed = datetime.fromisoformat(retired_at)
+        if parsed.tzinfo is None:
+            connection.execute(
+                "UPDATE answer_image_blobs SET retired_at=? WHERE id=?",
+                (parsed.replace(tzinfo=timezone.utc).isoformat(), blob_id),
+            )
+    for index in Base.metadata.tables["answer_image_blobs"].indexes:
+        connection.execute(
+            str(
+                CreateIndex(index, if_not_exists=True).compile(dialect=sqlite_dialect())
+            )
+        )
+
+
+def _migrate_answer_images(connection: sqlite3.Connection) -> None:
+    """v13 -> v14: durable image attachment and transport metadata."""
+    for table, additions in {
+        "messages": {
+            "answer_format_version": "INTEGER NOT NULL DEFAULT 1",
+            "answer_output_mode": "TEXT NOT NULL DEFAULT 'text'",
+            "image_previews_unavailable": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "application_runs": {
+            "result_expires_at": "TEXT NULL",
+            "image_transport": "TEXT NOT NULL DEFAULT 'url'",
+        },
+    }.items():
+        columns = {
+            str(row[1]) for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                connection.execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}'
+                )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS answer_image_blobs (
+            id VARCHAR NOT NULL PRIMARY KEY,
+            knowledge_base_id VARCHAR NOT NULL,
+            sha256 VARCHAR(64) NOT NULL,
+            media_type VARCHAR(64) NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL,
+            orientation INTEGER NOT NULL DEFAULT 1,
+            backend VARCHAR(32) NOT NULL,
+            storage_profile_id VARCHAR(128) NOT NULL,
+            object_key VARCHAR(1024) NOT NULL,
+            version_id VARCHAR(1024) NULL,
+            status VARCHAR(32) NOT NULL,
+            lease_token VARCHAR(128) NULL,
+            lease_expires_at VARCHAR(64) NULL,
+            created_at VARCHAR(64) NOT NULL,
+            updated_at VARCHAR(64) NOT NULL,
+            retired_at VARCHAR(64) NULL,
+            FOREIGN KEY(knowledge_base_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+            CONSTRAINT uq_answer_image_blob_key UNIQUE (knowledge_base_id, sha256, object_key),
+            CONSTRAINT ck_answer_image_blob_status CHECK (status IN ('uploading','ready','retired','deleting','deleted'))
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS message_images (
+            id VARCHAR NOT NULL PRIMARY KEY,
+            message_id VARCHAR NOT NULL,
+            blob_id VARCHAR NULL,
+            image_id VARCHAR(128) NOT NULL,
+            sequence INTEGER NOT NULL,
+            ref_ids_json TEXT NOT NULL DEFAULT '[]',
+            occurrences_json TEXT NOT NULL DEFAULT '[]',
+            source_bindings_json TEXT NOT NULL DEFAULT '[]',
+            caption TEXT NOT NULL DEFAULT '',
+            display_in_answer INTEGER NOT NULL DEFAULT 1,
+            status VARCHAR(32) NOT NULL,
+            unavailable_reason VARCHAR(128) NULL,
+            media_type VARCHAR(64) NULL,
+            size_bytes INTEGER NULL,
+            width INTEGER NULL,
+            height INTEGER NULL,
+            orientation INTEGER NOT NULL DEFAULT 1,
+            created_at VARCHAR(64) NOT NULL,
+            FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE,
+            FOREIGN KEY(blob_id) REFERENCES answer_image_blobs(id) ON DELETE SET NULL,
+            CONSTRAINT uq_message_image_sequence UNIQUE (message_id, sequence),
+            CONSTRAINT ck_message_image_status CHECK (status IN ('available','unavailable','deleted'))
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS image_access_grants (
+            id VARCHAR NOT NULL PRIMARY KEY,
+            attachment_id VARCHAR NOT NULL,
+            application_id VARCHAR NOT NULL,
+            client_id VARCHAR NOT NULL,
+            key_id VARCHAR NOT NULL,
+            token_sha256 VARCHAR(64) NOT NULL UNIQUE,
+            expires_at VARCHAR(64) NOT NULL,
+            revoked_at VARCHAR(64) NULL,
+            created_at VARCHAR(64) NOT NULL,
+            FOREIGN KEY(attachment_id) REFERENCES message_images(id) ON DELETE CASCADE
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_answer_image_blobs_identity "
+        "ON answer_image_blobs(knowledge_base_id, sha256, status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_message_images_message "
+        "ON message_images(message_id, sequence)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_image_access_grants_attachment "
+        "ON image_access_grants(attachment_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_image_access_grants_expiry "
+        "ON image_access_grants(expires_at)"
+    )
 
 
 def _migrate_knowledge_base_llm(connection: sqlite3.Connection) -> None:
@@ -481,7 +723,10 @@ def _rebuild_document_artifacts_for_v2_kinds(
         "SELECT sql FROM sqlite_master "
         "WHERE type = 'table' AND name = 'document_artifacts'"
     ).fetchone()
-    if table_sql_row is None or "enriched_markdown" in str(table_sql_row[0]):
+    if table_sql_row is None or all(
+        kind in str(table_sql_row[0])
+        for kind in ("enriched_markdown", "image_catalog", "image_asset")
+    ):
         return
     connection.execute("DROP INDEX IF EXISTS idx_document_artifacts_document_kind")
     connection.execute(
@@ -506,7 +751,7 @@ def _rebuild_document_artifacts_for_v2_kinds(
                     'original', 'result_zip', 'full_markdown', 'content_list',
                     'layout', 'model', 'asset', 'parse_chunk_source',
                     'parse_chunk_result', 'normalized_markdown', 'page_map',
-                    'enriched_markdown', 'tree', 'diagnostics'
+                    'enriched_markdown', 'tree', 'diagnostics', 'image_catalog', 'image_asset'
                 )
             ),
             CONSTRAINT ck_document_artifact_size CHECK (size_bytes >= 0),
@@ -691,12 +936,19 @@ def initialize_database(factory: SQLiteConnectionFactory) -> None:
         _migrate_document_tombstones(connection)
         _migrate_parse_chunk_plan(connection)
         _migrate_application_agent_version(connection)
+        _migrate_console_agent_contract(connection)
         _migrate_application_api(connection)
         _rebuild_conversations_wecom_constraints(connection)
         _rebuild_deployment_event_channel_unique(connection)
         _migrate_release_descriptions(connection)
         _migrate_knowledge_base_llm(connection)
         _migrate_llm_vision_capability(connection)
+        _migrate_answer_images(connection)
+        _migrate_image_blob_lifecycle(connection)
+        _migrate_image_storage_profiles(connection)
+        _migrate_document_parser_options(connection)
+        _migrate_reasoning_effort(connection)
+        _migrate_model_temperature(connection)
         _require_current_schema(connection)
         violations = connection.execute("PRAGMA foreign_key_check").fetchall()
         if violations:

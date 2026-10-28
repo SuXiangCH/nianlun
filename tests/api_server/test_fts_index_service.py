@@ -271,8 +271,11 @@ def test_empty_dirty_set_finishes_without_build(tmp_path: Path, monkeypatch) -> 
         settings,
     )
     try:
-        service.schedule("kb-1")
-        service._jobs["kb-1"].result(timeout=5)  # pyright: ignore[reportPrivateUsage]
+        # Capture the future before a fast no-op build removes its job.
+        with service._lock:  # pyright: ignore[reportPrivateUsage]
+            service.schedule("kb-1")
+            future = service._jobs["kb-1"]  # pyright: ignore[reportPrivateUsage]
+        future.result(timeout=5)
     finally:
         service.shutdown()
 

@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.api_server.apis.v1.schemas import ApiSchema
+from nianlun.models.reasoning import ReasoningEffort, ReasoningEffortOverride
 
 
 class PublishedLoopGuard(ApiSchema):
@@ -42,8 +43,10 @@ class PublishedConfig(ApiSchema):
     knowledge_base_id: str
     knowledge_update_policy: Literal["latest_committed"] = "latest_committed"
     clarification_enabled: bool = True
-    temperature: float = 0.0
+    temperature: float | None = Field(default=0.0, ge=0, le=2)
+    sampling_config_version: Literal[1, 2] = 1
     thinking: bool | None = None
+    reasoning_effort: ReasoningEffort | None = None
     loop_guard: PublishedLoopGuard
     prompt_version: int
     tool_schema_version: int
@@ -60,6 +63,7 @@ class ApplicationUpdateRequest(ApiSchema):
     provider: Literal["default"] | None = None
     agent_version: Literal["v0", "v1"] | None = None
     clarification_enabled: bool | None = None
+    reasoning_effort: ReasoningEffortOverride = "inherit"
 
     @field_validator("name")
     @classmethod

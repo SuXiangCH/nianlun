@@ -465,6 +465,40 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
             )
         return True
 
+    def _fit_trusted_image_history(
+        self, messages: list[AnyMessage], runtime: Any
+    ) -> tuple[bool, dict[str, Any] | None]:
+        from nianlun.agent.image_history import TrustedHistory
+
+        context = getattr(runtime, "context", None)
+        history = context.get("trusted_history") if isinstance(context, dict) else None
+        if not isinstance(history, TrustedHistory) or not history.uses_turn_names:
+            return False, None
+        names = {f"history_{turn.message_id}" for turn in history.turns}
+        remaining = list(messages)
+        while self._has_reached_hard_context_token_limit(self.token_counter(remaining)):
+            oldest = next(
+                (message.name for message in remaining if message.name in names), None
+            )
+            if oldest is None:
+                raise HistoryOverCapacityError(
+                    "Current request evidence exceeds model context capacity"
+                )
+            remaining = [message for message in remaining if message.name != oldest]
+        retained_names = {message.name for message in remaining}
+        # The answer stage must use the same surviving turns as retrieval.
+        context["trusted_history"] = TrustedHistory(
+            turns=tuple(
+                turn
+                for turn in history.turns
+                if f"history_{turn.message_id}" in retained_names
+            ),
+            preserve_turn_names=True,
+        )
+        if len(remaining) == len(messages):
+            return True, None
+        return True, {"messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *remaining]}
+
     def _build_summarization_state_update(
         self, state: Any, runtime: Any
     ) -> dict[str, Any] | None:
@@ -472,6 +506,9 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
         total_tokens = self.token_counter(messages)
         if self._preserve_external_history(runtime, total_tokens):
             return None
+        handled, update = self._fit_trusted_image_history(messages, runtime)
+        if handled:
+            return update
         self._ensure_message_ids(messages)
         if not self._should_summarize(messages, total_tokens):
             return None
@@ -547,6 +584,9 @@ class ContextSummarizationMiddleware(LangChainSummarizationMiddleware):
         total_tokens = self.token_counter(messages)
         if self._preserve_external_history(runtime, total_tokens):
             return None
+        handled, update = self._fit_trusted_image_history(messages, runtime)
+        if handled:
+            return update
         self._ensure_message_ids(messages)
         if not self._should_summarize(messages, total_tokens):
             return None

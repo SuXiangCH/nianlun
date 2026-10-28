@@ -63,6 +63,54 @@ def test_runtime_cache_is_invalidated_when_vector_capability_changes(tmp_path):
     assert len(created) == 2
 
 
+def test_runtime_cache_isolates_bundles_and_image_capability(tmp_path):
+    from nianlun.agent.prompt_registry import (
+        CURRENT_PROMPT_BUNDLE,
+        LEGACY_PROMPT_BUNDLE,
+    )
+
+    application = {
+        "id": "app-1",
+        "knowledge_base_id": "kb-1",
+        "provider": "default",
+        "model": "model",
+    }
+    service = ApplicationService(
+        _ApplicationRepository(application),
+        lambda _: {"workspace_dir": str(tmp_path)},
+        runtime_factory=lambda **kw: SimpleNamespace(**kw),
+    )
+    old = service.runtime("app-1", prompt_bundle=LEGACY_PROMPT_BUNDLE)
+    current_text = service.runtime("app-1", prompt_bundle=CURRENT_PROMPT_BUNDLE)
+    current_images = service.runtime(
+        "app-1", prompt_bundle=CURRENT_PROMPT_BUNDLE, image_capability=True
+    )
+    assert old is not current_text and current_text is not current_images
+    assert service.runtime("app-1", prompt_bundle=LEGACY_PROMPT_BUNDLE) is old
+    assert service.runtime("app-1", prompt_bundle=CURRENT_PROMPT_BUNDLE) is current_text
+    assert (
+        service.runtime(
+            "app-1", prompt_bundle=CURRENT_PROMPT_BUNDLE, image_capability=True
+        )
+        is current_images
+    )
+    from dataclasses import replace
+    from nianlun.agent.contracts import AnswerImagePolicy
+
+    smaller = replace(AnswerImagePolicy(), max_answer_images=1)
+    limited = service.runtime(
+        "app-1",
+        prompt_bundle=CURRENT_PROMPT_BUNDLE,
+        image_capability=True,
+        image_policy=smaller,
+    )
+    assert limited is not current_images
+    assert limited.image_policy is smaller
+    assert current_images.image_policy.max_answer_images == 32
+    service.invalidate_runtime("app-1")
+    assert service.runtime("app-1", prompt_bundle=LEGACY_PROMPT_BUNDLE) is not old
+
+
 def test_runtime_factory_receives_persisted_agent_version(tmp_path):
     application = {
         "id": "app-1",
@@ -139,3 +187,43 @@ def test_degraded_vector_runtime_is_retried_instead_of_cached(tmp_path):
     second = service.runtime("app-1")
     assert second is not first
     assert attempts == 2
+
+
+def test_shutdown_closes_every_cached_reader_even_when_one_close_fails(tmp_path):
+    import pytest
+    from nianlun.agent.prompt_registry import CURRENT_PROMPT_BUNDLE
+
+    closed = []
+
+    def factory(**kwargs):
+        index = len(readers)
+
+        def close():
+            closed.append(index)
+            if index == 0:
+                raise OSError("close failed")
+
+        runtime = SimpleNamespace(kb=SimpleNamespace(close=close), **kwargs)
+        readers.append(runtime)
+        return runtime
+
+    readers = []
+    service = ApplicationService(
+        _ApplicationRepository(
+            {
+                "id": "app-1",
+                "knowledge_base_id": "kb",
+                "provider": "default",
+                "model": "model",
+            }
+        ),
+        lambda _: {"workspace_dir": str(tmp_path)},
+        runtime_factory=factory,
+    )
+    service.runtime("app-1")
+    service.runtime("app-1", prompt_bundle=CURRENT_PROMPT_BUNDLE)
+    with pytest.raises(OSError, match="close failed"):
+        service.shutdown()
+    assert set(closed) == {0, 1}
+    service.shutdown()
+    assert len(closed) == 2

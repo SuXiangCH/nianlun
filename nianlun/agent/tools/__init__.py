@@ -253,17 +253,37 @@ def get_line_content_tool(
 
 
 def build_tools(
-    *, include_vector: bool = False, include_clarification: bool = False
+    *,
+    include_vector: bool = False,
+    include_clarification: bool = False,
+    tool_schema_version: int = 4,
+    image_capability: bool = False,
 ) -> list:
     """返回基于全文检索和可选向量检索的工具集合。"""
+    if tool_schema_version not in (4, 5):
+        raise ValueError("不支持的工具契约版本")
+    if image_capability and tool_schema_version != 5:
+        raise ValueError("v4 不支持图片输出")
+    content_tool = get_line_content_tool
+    if tool_schema_version == 5:
+        content_tool = get_line_content_tool.model_copy(
+            update={
+                "description": get_line_content_tool.description
+                + "\n字符位置基于源节点；继续读取必须使用 next_char_offset，不能按投影后文本长度推算。图片目录只含完整读取的图片引用，不包含图片像素。",
+            }
+        )
     tools = [
         search_document_nodes_tool,
         get_document_tool,
         get_structure_outline_tool,
-        get_line_content_tool,
+        content_tool,
     ]
     if include_vector:
         tools.insert(1, find_semantic_documents_tool)
     if include_clarification:
         tools.append(ask_clarification_tool)
+    if image_capability:
+        from nianlun.agent.tools.answer_images import select_answer_images_tool
+
+        tools.append(select_answer_images_tool)
     return tools

@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from app.api_server.apis.v1.publishing_schemas import PublishedConfig
 from app.api_server.common.errors import ApiError
+from nianlun.models.reasoning import (
+    ReasoningEffort,
+    ReasoningEffortOverride,
+    resolve_reasoning_effort,
+)
 from app.api_server.database.connection import SQLiteConnectionFactory
 from app.api_server.database.models import (
     Application,
@@ -185,6 +190,17 @@ class PublishingRepository:
             raise ApiError("发布版本与模型配置不匹配，请重新发布", 409)
         if draft and app.model is None and not profile.is_default:
             raise ApiError("默认模型已变化，请刷新后重试", 409)
+        if (
+            draft
+            and resolve_reasoning_effort(
+                cast(ReasoningEffortOverride, app.reasoning_effort),
+                cast(ReasoningEffort | None, llm.reasoning_effort),
+            )
+            != config.reasoning_effort
+        ):
+            raise ApiError("模型思考程度已变化，请刷新后重试", 409)
+        if draft and llm.temperature != config.temperature:
+            raise ApiError("模型温度已变化，请刷新后重试", 409)
         revision = session.scalar(
             select(KnowledgeBaseWorkspaceRevision.id).where(
                 KnowledgeBaseWorkspaceRevision.knowledge_base_id
@@ -525,6 +541,7 @@ class PublishingRepository:
                 "provider",
                 "agent_version",
                 "clarification_enabled",
+                "reasoning_effort",
             }
             changed = any(
                 getattr(app, key) != value

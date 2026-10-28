@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -12,6 +12,22 @@ from nianlun.agent.subagents.config import DeepSearchConfig
 from nianlun.models.llm import content_to_text
 
 DeepSearchStatus = Literal["completed", "failed"]
+
+
+class EvidenceImageRef(BaseModel):
+    """A child-local identity, never a parent authorization or storage locator."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+    ref_id: str = Field(pattern=r"^img_[0-9]{2,}$", max_length=32)
+    knowledge_base_id: str = Field(min_length=1, max_length=128)
+    generation: int = Field(ge=1)
+    content_version: int = Field(ge=0)
+    image_id: str = Field(pattern=r"^img_[0-9a-f]{16,64}$")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_start: int = Field(ge=0)
+    source_end: int = Field(gt=0)
+    text_start: int = Field(ge=0)
+    text_end: int = Field(gt=0)
 
 
 class EvidenceOutput(BaseModel):
@@ -71,6 +87,7 @@ class Evidence:
     total_chars: int | None = None
     text_truncated: bool | None = None
     text: str = ""
+    image_refs: tuple[EvidenceImageRef, ...] = ()
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "Evidence":
@@ -92,8 +109,11 @@ class Evidence:
             text=_clip(value.get("text"), 600),
         )
 
-    def to_dict(self, *, text_limit: int = 600) -> dict[str, Any]:
-        return {
+    def to_dict(
+        self, *, text_limit: int = 600, image_ref_limit: int = 2
+    ) -> dict[str, Any]:
+        text = _clip(self.text, text_limit)
+        payload: dict[str, Any] = {
             "doc_id": self.doc_id,
             "doc_name": self.doc_name,
             "node_id": self.node_id,
@@ -104,8 +124,22 @@ class Evidence:
             "char_limit": self.char_limit,
             "total_chars": self.total_chars,
             "text_truncated": self.text_truncated,
-            "text": _clip(self.text, text_limit),
+            "text": text,
         }
+        refs = [
+            ref.model_dump()
+            for ref in self.image_refs[:image_ref_limit]
+            if (
+                0 <= ref.text_start < ref.text_end <= len(text)
+                and text[ref.text_start : ref.text_end].startswith("![")
+                and text[ref.text_start : ref.text_end].endswith(
+                    f"](nianlun-image:{ref.ref_id})"
+                )
+            )
+        ]
+        if refs:
+            payload["image_refs"] = refs
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,12 +164,21 @@ class DeepSearchResult:
                     "code": _clip(self.error_code, 64),
                     "message": _clip(self.error_message, 1_000),
                 }
+                while len(_json(payload)) > limits.max_result_chars:
+                    error = payload["error"]
+                    field = "message" if error["message"] else "code"
+                    error[field] = error[field][: len(error[field]) // 2]
             return payload
 
-        evidence = [
-            item.to_dict(text_limit=limits.max_evidence_text_chars)
-            for item in self.evidence[: limits.max_evidence_items]
-        ]
+        evidence = []
+        remaining_refs = limits.max_image_refs
+        for item in self.evidence[: limits.max_evidence_items]:
+            serialized = item.to_dict(
+                text_limit=limits.max_evidence_text_chars,
+                image_ref_limit=min(limits.max_evidence_image_refs, remaining_refs),
+            )
+            remaining_refs -= len(serialized.get("image_refs", []))
+            evidence.append(serialized)
         open_questions = [
             _clip(item, limits.max_open_question_chars)
             for item in self.open_questions[: limits.max_open_questions]
@@ -293,7 +336,23 @@ def bound_result(
     result: DeepSearchResult, config: DeepSearchConfig
 ) -> DeepSearchResult:
     """Materialize the configured result limits before a result leaves the runner."""
-    return result_from_agent_output(result.to_dict(config), config)
+    payload = result.to_dict(config)
+    bounded = result_from_agent_output(payload, config)
+    # Only this internal round trip preserves trusted references. The public
+    # model-output parser deliberately ignores every supplied image identity.
+    return replace(
+        bounded,
+        evidence=tuple(
+            replace(
+                item,
+                image_refs=tuple(
+                    EvidenceImageRef.model_validate(ref)
+                    for ref in raw.get("image_refs", [])
+                ),
+            )
+            for item, raw in zip(bounded.evidence, payload.get("evidence", []))
+        ),
+    )
 
 
 def _parse_json_text(value: str) -> Mapping[str, Any] | None:
@@ -317,6 +376,7 @@ __all__ = [
     "DeepSearchOutput",
     "EvidenceOutput",
     "Evidence",
+    "EvidenceImageRef",
     "bound_result",
     "failed_result",
     "result_from_agent_output",

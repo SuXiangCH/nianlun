@@ -41,8 +41,37 @@ from nianlun.evaluation.stages.evidence.schema import (
     RetrievalNoiseAssessment,
     SupportAssessment,
 )
+from nianlun.models.llm import LLMClient, LLMMetadata
 
 T = TypeVar("T", bound=BaseModel)
+
+
+@pytest.mark.parametrize("temperature", [None, 0.0, 0.7])
+def test_evaluator_preserves_judge_temperature_in_serialized_logs(
+    temperature: float | None,
+) -> None:
+    async def fail_invoke(prompt: str) -> str:
+        pytest.fail(f"empty answer must not invoke judge: {prompt}")
+
+    judge = LLMClient(
+        fail_invoke,
+        metadata=LLMMetadata(
+            provider="test-provider",
+            model="test-model",
+            temperature=temperature,
+        ),
+    )
+    evaluator = RagEvaluator(judge=judge)
+    result = asyncio.run(evaluator.evaluate(_case(answer="")))
+    encoded = result.model_dump_json()
+    restored = EvaluationOutcome.model_validate_json(encoded)
+
+    assert restored.run_logs.judge.temperature == temperature
+    assert restored.run_logs.judge.model_dump(mode="json") == {
+        "provider": "test-provider",
+        "model": "test-model",
+        "temperature": temperature,
+    }
 
 
 class FakeJudge:

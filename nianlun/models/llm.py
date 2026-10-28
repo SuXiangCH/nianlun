@@ -16,6 +16,7 @@ import json
 from collections.abc import Awaitable, Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from typing import Any, Protocol, TypeVar, cast
 
 from json_repair import repair_json
@@ -29,15 +30,33 @@ from nianlun.config import (
 
 from langchain_openai import ChatOpenAI
 
+from nianlun.models.reasoning import ReasoningEffort, ReasoningEffortKwargs
+
 StructuredResultT = TypeVar("StructuredResultT", bound=BaseModel)
 STRUCTURED_OUTPUT_PROTOCOL_VERSION = "2026-08-20.v1"
+
+
+class _DefaultTemperature(Enum):
+    OMITTED = "omitted"
+
+
+def _resolve_temperature(
+    temperature: float | None | _DefaultTemperature,
+    reasoning_effort: ReasoningEffort | None,
+) -> float | None:
+    # Preserve historical defaults only for callers that omit the argument.
+    if isinstance(temperature, _DefaultTemperature):
+        return 0.0 if reasoning_effort is None else None
+    return temperature
 
 
 def build_chat_model(
     model: str | None = None,
     *,
-    temperature: float = 0.0,
+    temperature: float | None | _DefaultTemperature = _DefaultTemperature.OMITTED,
+    legacy_temperature: bool = False,
     enable_thinking: bool | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     allow_env_fallback: bool = True,
@@ -55,7 +74,17 @@ def build_chat_model(
     - 仅当 ``base_url`` 存在且 ``enable_thinking=False`` 时注入
       ``extra_body={"chat_template_kwargs": {"enable_thinking": False}}``：
       这是当前 OpenAI-compatible 后端使用的显式关闭方式。
+    - 显式 ``reasoning_effort`` 优先于旧的关闭思考设置，直接传给供应商。
+      temperature 独立解析：显式数值原样发送，None 省略；未传入时保留旧行为，
+      无 reasoning_effort 使用 0.0，有 reasoning_effort 则省略 temperature。
+    - ``legacy_temperature=True`` 保留 SDK 的温度校正，仅用于旧版本和旧任务。
     """
+    if reasoning_effort is not None and reasoning_effort not in (
+        "low",
+        "medium",
+        "high",
+    ):
+        raise ValueError("Invalid reasoning_effort")
     if allow_env_fallback:
         api_key = api_key or get_openai_api_key()
     if not api_key:
@@ -68,7 +97,7 @@ def build_chat_model(
     kwargs: dict = {
         "model": model,
         "api_key": api_key,
-        "temperature": temperature,
+        "temperature": _resolve_temperature(temperature, reasoning_effort),
         "timeout": request_timeout_seconds,
         "max_retries": max_retries,
         # 让流式响应也回带 usage（OpenAI 的 stream_options.include_usage）。非流式
@@ -77,16 +106,32 @@ def build_chat_model(
     }
     if base_url:
         kwargs["base_url"] = base_url
-        if enable_thinking is False:
+        if enable_thinking is False and reasoning_effort is None:
             kwargs["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
-    return ChatOpenAI(**kwargs)
+    if reasoning_effort is not None:
+        kwargs["reasoning_effort"] = reasoning_effort
+    chat_model = ChatOpenAI(**kwargs)
+    if (
+        not legacy_temperature
+        and not isinstance(temperature, _DefaultTemperature)
+        and temperature is not None
+    ):
+        # SDK model-name heuristics must not silently override explicit sampling.
+        # extra_body also preserves it when the Responses adapter filters parameters.
+        chat_model.temperature = temperature
+        chat_model.extra_body = {
+            **(chat_model.extra_body or {}),
+            "temperature": temperature,
+        }
+    return chat_model
 
 
 def build_llm(
     model: str | None = None,
     *,
-    temperature: float = 0.0,
+    temperature: float | None | _DefaultTemperature = _DefaultTemperature.OMITTED,
     enable_thinking: bool | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     allow_env_fallback: bool = True,
@@ -96,7 +141,13 @@ def build_llm(
     retry_base_delay_seconds: float = 0.25,
 ) -> LLMClient:
     """构建同时支持普通生成和结构化生成的统一 LLM 客户端。"""
-    thinking_override = False if enable_thinking is False else None
+    resolved_temperature = _resolve_temperature(temperature, reasoning_effort)
+    thinking_override = (
+        False if enable_thinking is False and reasoning_effort is None else None
+    )
+    reasoning_kwargs: ReasoningEffortKwargs = {}
+    if reasoning_effort is not None:
+        reasoning_kwargs["reasoning_effort"] = reasoning_effort
     chat_model = build_chat_model(
         model,
         temperature=temperature,
@@ -104,6 +155,7 @@ def build_llm(
         api_key=api_key,
         base_url=base_url,
         allow_env_fallback=allow_env_fallback,
+        **reasoning_kwargs,
     )
     resolved_model = str(chat_model.model_name)
     return LLMClient(
@@ -111,8 +163,9 @@ def build_llm(
         metadata=LLMMetadata(
             provider=provider,
             model=resolved_model,
-            temperature=temperature,
+            temperature=getattr(chat_model, "temperature", resolved_temperature),
             enable_thinking=thinking_override,
+            reasoning_effort=reasoning_effort,
             endpoint_identity=_endpoint_identity(chat_model.openai_api_base),
         ),
         max_schema_retries=max_schema_retries,
@@ -124,8 +177,9 @@ def build_llm(
 def build_structured_chat_model(
     model: str | None = None,
     *,
-    temperature: float = 0.0,
+    temperature: float | None | _DefaultTemperature = _DefaultTemperature.OMITTED,
     enable_thinking: bool | None = None,
+    reasoning_effort: ReasoningEffort | None = None,
     api_key: str | None = None,
     base_url: str | None = None,
     allow_env_fallback: bool = True,
@@ -135,6 +189,9 @@ def build_structured_chat_model(
     retry_base_delay_seconds: float = 0.25,
 ) -> LLMClient:
     """Compatibility alias for callers that only need structured generation."""
+    reasoning_kwargs: ReasoningEffortKwargs = {}
+    if reasoning_effort is not None:
+        reasoning_kwargs["reasoning_effort"] = reasoning_effort
     return build_llm(
         model,
         temperature=temperature,
@@ -146,6 +203,7 @@ def build_structured_chat_model(
         max_schema_retries=max_schema_retries,
         max_invoke_retries=max_invoke_retries,
         retry_base_delay_seconds=retry_base_delay_seconds,
+        **reasoning_kwargs,
     )
 
 
@@ -232,9 +290,10 @@ class LLM(StructuredLLM, Protocol):
 class LLMMetadata:
     provider: str
     model: str
-    temperature: float
+    temperature: float | None
     enable_thinking: bool | None = None
     endpoint_identity: str = "custom"
+    reasoning_effort: ReasoningEffort | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,6 +401,8 @@ class LLMClient:
             "endpoint_identity": metadata.endpoint_identity,
             "structured_output_protocol_version": STRUCTURED_OUTPUT_PROTOCOL_VERSION,
         }
+        if metadata.reasoning_effort is not None:
+            self.fingerprint_config["reasoning_effort"] = metadata.reasoning_effort
         self._last_call: ContextVar[LLMCallTelemetry] = ContextVar(
             f"llm_call_telemetry_{id(self)}", default=_EMPTY_CALL_TELEMETRY
         )

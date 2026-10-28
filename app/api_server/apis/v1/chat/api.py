@@ -3,7 +3,7 @@
 import logging
 from typing import Any, Literal
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.api_server.apis.v1.schemas import ChatRequest
@@ -43,7 +43,10 @@ async def chat(
 
     async def event_stream():
         try:
-            yield encode_sse("ready", {"conversation_id": conversation_id})
+            yield encode_sse(
+                "ready",
+                {"conversation_id": conversation_id, "answer_format_version": 2},
+            )
             async for event in service.iterate_stream_async(events):
                 event_type = event["type"]
                 payload = event["data"]
@@ -61,6 +64,14 @@ async def chat(
                         "usage": payload.get("usage"),
                         "ttft_ms": payload.get("ttft_ms"),
                         "clarification": payload.get("clarification"),
+                        "images": payload.get("images", []),
+                        "answer_format_version": payload.get(
+                            "answer_format_version", 1
+                        ),
+                        "answer_output_mode": payload.get("answer_output_mode", "text"),
+                        "image_previews_unavailable": payload.get(
+                            "image_previews_unavailable", 0
+                        ),
                     }
                 yield encode_sse(event_type, payload)
         except ApiError as exc:
@@ -139,6 +150,34 @@ def delete_conversation(
 ) -> dict[str, Any]:
     _services(request).chat.delete_conversation(application_id, conversation_id)
     return success(None)
+
+
+@router.get(
+    "/{application_id}/conversations/{conversation_id}/messages/"
+    "{message_id}/images/{attachment_id}/content"
+)
+def image_content(
+    application_id: str,
+    conversation_id: str,
+    message_id: str,
+    attachment_id: str,
+    request: Request,
+) -> Response:
+    service = _services(request).images
+    if service is None:
+        raise ApiError("图片不存在", 404)
+    data, media_type = service.read_content(
+        application_id, conversation_id, message_id, attachment_id
+    )
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+            "Referrer-Policy": "no-referrer",
+        },
+    )
 
 
 __all__ = ["router"]

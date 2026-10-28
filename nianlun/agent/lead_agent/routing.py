@@ -11,6 +11,7 @@ import re
 
 from nianlun.agent.language import prefers_english
 from nianlun.agent.lead_agent.prompt import DIRECT_HELP_TEXT
+from nianlun.agent.image_history import TrustedHistory
 
 
 def _normalize_chat_text(text: str) -> str:
@@ -41,7 +42,9 @@ DIRECT_CAPABILITY_QUERIES = {
 }
 
 
-def maybe_handle_non_retrieval_query(user_query: str) -> dict[str, str]:
+def maybe_handle_non_retrieval_query(
+    user_query: str, *, trusted_history: TrustedHistory | None = None
+) -> dict[str, str]:
     """对明显的非知识库对话直接回复，其他情况交给主 agent 自行判断。"""
     query = user_query.strip()
     english = prefers_english(query)

@@ -59,3 +59,7 @@ class ApplicationRun(Base):
     created_at: Mapped[str] = mapped_column(String, nullable=False)
     updated_at: Mapped[str] = mapped_column(String, nullable=False)
     finished_at: Mapped[str | None] = mapped_column(String)
+    result_expires_at: Mapped[str | None] = mapped_column(String, nullable=True)
+    image_transport: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="url", server_default="url"
+    )

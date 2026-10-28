@@ -32,14 +32,23 @@ from nianlun.agent.tool_call_batches import (
     annotate_tool_call_batches as _annotate_tool_call_batches,
 )
 from nianlun.agent.usage import message_usage as _message_usage
+from nianlun.agent.image_context import AnswerImagePolicy, RequestImageContext
+from nianlun.agent.image_history import TrustedHistory, fit_history, scrub_messages
+from nianlun.agent.token_estimation import estimate_tokens
 
 logger = logging.getLogger(__name__)
 
 
 def _route_with_checkpoint(
-    runner: AgentRunner, user_query: str, thread_id: str
+    runner: AgentRunner,
+    user_query: str,
+    thread_id: str,
+    *,
+    trusted_history: TrustedHistory | None = None,
 ) -> dict[str, Any]:
-    decision = maybe_handle_non_retrieval_query(user_query)
+    decision = maybe_handle_non_retrieval_query(
+        user_query, trusted_history=trusted_history
+    )
     if decision["route"] == "direct":
         update_state = getattr(runner.agent, "update_state", None)
         if (
@@ -72,12 +81,23 @@ class RetrievalCollector:
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     _citation_ids: dict[tuple[Any, ...], int] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    tool_schema_version: int = 4
+    image_capability: bool = False
+    image_policy: AnswerImagePolicy = field(default_factory=AnswerImagePolicy)
+    image_context: RequestImageContext = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.image_context = RequestImageContext(
+            enabled=self.tool_schema_version == 5 and self.image_capability,
+            policy=self.image_policy,
+        )
 
     def clear(self) -> None:
         with self._lock:
             self.snippets.clear()
             self.tool_calls.clear()
             self._citation_ids.clear()
+            self.image_context.clear()
 
     def record_tool_call(
         self,
@@ -115,12 +135,12 @@ class RetrievalCollector:
             return result
 
         with self._lock:
-            for item in content_items:
+            for index, item in enumerate(content_items):
                 if not isinstance(item, dict):
                     continue
 
-                text = sanitize_text(str(item.get("text", ""))).strip()
-                if not text:
+                text = sanitize_text(str(item.get("text", "")))
+                if not text.strip():
                     continue
 
                 key = (
@@ -131,7 +151,8 @@ class RetrievalCollector:
                     text,
                 )
                 citation_id = self._citation_ids.get(key)
-                if citation_id is None:
+                is_new = citation_id is None
+                if is_new:
                     citation_id = len(self.snippets) + 1
                     self._citation_ids[key] = citation_id
                     self.snippets.append(
@@ -148,9 +169,29 @@ class RetrievalCollector:
                             "char_limit": item.get("char_limit"),
                             "total_chars": item.get("total_chars"),
                             "text_truncated": bool(item.get("text_truncated", False)),
+                            "images": list(item.get("images", []))
+                            if isinstance(item.get("images", []), list)
+                            else [],
                         }
                     )
                 item["citation_id"] = citation_id
+                if self.tool_schema_version == 5:
+                    projected, registered = self.image_context.project_item(
+                        item, str(doc_id)
+                    )
+                    content_items[index] = projected
+                    if is_new:
+                        self.snippets[-1]["images"] = registered
+                        self.snippets[-1]["image_spans"] = list(
+                            item.get("image_spans") or []
+                        )
+                        self.snippets[-1]["model_text"] = projected["text"]
+                        self.snippets[-1]["model_images"] = projected.get("images", [])
+                else:
+                    item.pop("images", None)
+                    item.pop("image_spans", None)
+                    if is_new:
+                        self.snippets[-1].pop("images", None)
 
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -183,6 +224,9 @@ class AgentRequestContextFactory:
 
     knowledge_base: KnowledgeBasePort
     tool_logging: bool
+    tool_schema_version: int = 4
+    image_capability: bool = False
+    image_policy: AnswerImagePolicy = field(default_factory=AnswerImagePolicy)
 
     def create(
         self,
@@ -190,7 +234,11 @@ class AgentRequestContextFactory:
         *,
         clarification_enabled: bool = False,
     ) -> tuple[RetrievalCollector, AgentRequestContext]:
-        collector = RetrievalCollector()
+        collector = RetrievalCollector(
+            tool_schema_version=self.tool_schema_version,
+            image_capability=self.image_capability,
+            image_policy=self.image_policy,
+        )
         context: AgentRequestContext = {
             "knowledge_base": self.knowledge_base,
             "retrieval_collector": collector,
@@ -212,6 +260,8 @@ class AgentRunner:
     context_factory: AgentRequestContextFactory
     recursion_limit: int = 192
     agent_version: AgentVersion = "v0"
+    context_window_tokens: int | None = None
+    context_overhead_tokens: int = 0
 
     def new_request_context(
         self,
@@ -230,7 +280,18 @@ class AgentRunner:
         thread_id: str = "default",
         *,
         clarification_enabled: bool = False,
+        trusted_history: TrustedHistory | None = None,
     ) -> dict[str, Any]:
+        if trusted_history is not None:
+            for event in self.iter_events(
+                user_query,
+                thread_id=thread_id,
+                clarification_enabled=clarification_enabled,
+                trusted_history=trusted_history,
+            ):
+                if event["type"] == "done":
+                    return event["data"]
+            raise RuntimeError("Agent did not return a completed result")
         if self.agent_version == "v1":
             return _run_retrieval_answer_impl(
                 self,
@@ -270,6 +331,7 @@ class AgentRunner:
         *,
         clarification_enabled: bool = False,
         cancellation_event: threading.Event | None = None,
+        trusted_history: TrustedHistory | None = None,
     ) -> Iterator[dict[str, Any]]:
         if self.agent_version == "v1":
             return _iter_retrieval_answer_events_impl(
@@ -278,6 +340,7 @@ class AgentRunner:
                 thread_id=thread_id,
                 clarification_enabled=clarification_enabled,
                 cancellation_event=cancellation_event,
+                trusted_history=trusted_history,
             )
         return _iter_agent_stream_events_impl(
             self,
@@ -285,6 +348,7 @@ class AgentRunner:
             thread_id=thread_id,
             clarification_enabled=clarification_enabled,
             cancellation_event=cancellation_event,
+            trusted_history=trusted_history,
         )
 
     def iter_public_events(
@@ -296,6 +360,7 @@ class AgentRunner:
         cancellation_event: threading.Event | None = None,
     ) -> Iterator[dict[str, Any]]:
         """Append-only output: v0 retries are dropped; only the final answer is emitted."""
+        messages = scrub_messages(messages)
         query = messages[-1]["content"]
         events = (
             _iter_retrieval_answer_events_impl(
@@ -597,7 +662,7 @@ def _run_agent_impl(
         ),
         None,
     )
-    return {
+    result = {
         "answer": (
             str(clarification.get("question", "请补充必要信息。"))
             if clarification is not None
@@ -624,6 +689,7 @@ def _run_agent_impl(
         "clarification": clarification,
         "guard": _guard_summary(context, thread_id),
     }
+    return _apply_image_selection(result, retrieval_collector)
 
 
 def _run_agent_streaming_impl(
@@ -684,7 +750,7 @@ def _run_agent_streaming_impl(
                 continue
 
             text = _stream_message_text(message)
-            if text:
+            if text and not retrieval_collector.image_context.enabled:
                 print(text, end="", flush=True)
                 streamed_any_text = True
         elif chunk_type == "values":
@@ -698,6 +764,8 @@ def _run_agent_streaming_impl(
 
     result_payload = final_state if final_state is not None else ""
     answer = _extract_final_answer(result_payload)
+    if retrieval_collector.image_context.selected_images:
+        answer = ""
     if (guard_final_model_started or not streamed_any_text) and answer:
         print(answer)
     used_retrieval = (
@@ -709,7 +777,7 @@ def _run_agent_streaming_impl(
             final_state.get("messages") if isinstance(final_state, dict) else None,
         )
 
-    return {
+    result = {
         "answer": answer,
         "retrieved_texts": []
         if retrieval_collector is None
@@ -731,6 +799,7 @@ def _run_agent_streaming_impl(
         ),
         "guard": _guard_summary(context, thread_id),
     }
+    return _apply_image_selection(result, retrieval_collector)
 
 
 def _elapsed_ms(start: float, end: float | None) -> int | None:
@@ -805,6 +874,7 @@ def _iter_agent_stream_events_impl(
     clarification_enabled: bool = False,
     cancellation_event: threading.Event | None = None,
     input_messages: list[dict[str, str]] | None = None,
+    trusted_history: TrustedHistory | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield transport-neutral events for HTTP or other streaming frontends.
 
@@ -821,6 +891,15 @@ def _iter_agent_stream_events_impl(
     )
     if input_messages is not None:
         context["input_messages"] = input_messages
+    if trusted_history is not None:
+        trusted_history = fit_history(
+            trusted_history,
+            token_budget=(runner.context_window_tokens or 32768)
+            - runner.context_overhead_tokens
+            - 4096
+            - estimate_tokens([{"role": "user", "content": user_query}]),
+        )
+        context["trusted_history"] = trusted_history
     if cancellation_event is not None:
         context["cancellation_event"] = cancellation_event
     # 首 token 时延（TTFT）：从本函数入口计到「最终答案」的首个文本 token 产出。
@@ -832,7 +911,16 @@ def _iter_agent_stream_events_impl(
     route_decision = (
         {"route": "agent"}
         if input_messages is not None
-        else _route_with_checkpoint(runner, user_query, thread_id)
+        else _route_with_checkpoint(
+            runner,
+            user_query,
+            thread_id,
+            **(
+                {"trusted_history": trusted_history}
+                if trusted_history is not None
+                else {}
+            ),
+        )
     )
     if route_decision["route"] == "direct":
         first_token_at = time.monotonic()
@@ -912,8 +1000,22 @@ def _iter_agent_stream_events_impl(
         if input_messages is not None
         else [{"role": "user", "content": user_query}]
     )
+    graph_input: dict[str, Any] = {"messages": messages}
+    if trusted_history is not None:
+        messages = [
+            *trusted_history.messages(),
+            {"role": "user", "content": user_query},
+        ]
+        graph_input["messages"] = messages
+        # Replace checkpoint messages with the committed projection. Old tool
+        # selections and failed turns must never become historical evidence.
+        if getattr(agent, "checkpointer", None) is not None:
+            from langchain_core.messages import RemoveMessage
+            from langgraph.graph.message import REMOVE_ALL_MESSAGES
+
+            graph_input["messages"] = [RemoveMessage(id=REMOVE_ALL_MESSAGES), *messages]
     for chunk in agent.stream(
-        {"messages": messages},
+        graph_input,
         config={
             "configurable": {"thread_id": thread_id},
             "recursion_limit": runner.recursion_limit,
@@ -958,14 +1060,17 @@ def _iter_agent_stream_events_impl(
                 current_model_text.append(text)
                 if first_token_at is None:
                     first_token_at = time.monotonic()
-                yield {
-                    "type": "message",
-                    "data": {
-                        "delta": text,
-                        "phase": "candidate",
-                        "round": round_id,
-                    },
-                }
+                # Image capability must not buffer ordinary answers. Only a
+                # committed pure-image selection suppresses draft model text.
+                if not retrieval_collector.image_context.selected_images:
+                    yield {
+                        "type": "message",
+                        "data": {
+                            "delta": text,
+                            "phase": "candidate",
+                            "round": round_id,
+                        },
+                    }
             has_tool_call = _stream_message_has_tool_call(message)
             if has_tool_call:
                 tool_names = _stream_message_tool_names(message)
@@ -1040,8 +1145,16 @@ def _iter_agent_stream_events_impl(
         result["clarification"] = clarification
         result["answer"] = str(clarification.get("question", "请补充必要信息。"))
         yield {"type": "clarification", "data": clarification}
-    elif result["answer"] and (
-        guard_final_model_started or "".join(current_model_text) != result["answer"]
+    else:
+        _apply_image_selection(result, retrieval_collector)
+    if (
+        clarification is None
+        and result["answer"]
+        and (
+            retrieval_collector.image_context.enabled
+            or guard_final_model_started
+            or "".join(current_model_text) != result["answer"]
+        )
     ):
         yield {
             "type": "message",
@@ -1109,6 +1222,9 @@ def _retrieval_answer_result(
         },
         "guard": _guard_summary(context, thread_id),
         "agent_version": "v1",
+        "answer_output_mode": state.get("answer_output_mode", "text"),
+        "selected_answer_images": list(state.get("selected_answer_images", [])),
+        "display_image_citation_ids": list(state.get("display_image_citation_ids", [])),
     }
     if trace is not None:
         result["trace"] = trace
@@ -1116,6 +1232,29 @@ def _retrieval_answer_result(
         result["ttft_ms"] = ttft_ms
     if isinstance(clarification, dict):
         result["clarification"] = clarification
+    return result
+
+
+def _apply_image_selection(
+    result: dict[str, Any], collector: RetrievalCollector
+) -> dict[str, Any]:
+    selected = collector.image_context.selected_images
+    if selected and result.get("clarification") is None:
+        result.update(
+            {
+                "answer": "",
+                "answer_output_mode": "images",
+                "selected_answer_images": selected,
+                "answer_input_citation_ids": [],
+                "display_image_citation_ids": list(
+                    dict.fromkeys(
+                        binding["citation_id"]
+                        for image in selected
+                        for binding in image["source_bindings"]
+                    )
+                ),
+            }
+        )
     return result
 
 
@@ -1175,6 +1314,7 @@ def _iter_retrieval_answer_events_impl(
     clarification_enabled: bool = False,
     cancellation_event: threading.Event | None = None,
     input_messages: list[dict[str, str]] | None = None,
+    trusted_history: TrustedHistory | None = None,
 ) -> Iterator[dict[str, Any]]:
     start = time.monotonic()
     status_sink = AgentStatusSink()
@@ -1183,10 +1323,21 @@ def _iter_retrieval_answer_events_impl(
     )
     if input_messages is not None:
         context["input_messages"] = input_messages
+    if trusted_history is not None:
+        context["trusted_history"] = fit_history(trusted_history)
     route_decision = (
         {"route": "agent"}
         if input_messages is not None
-        else _route_with_checkpoint(runner, user_query, thread_id)
+        else _route_with_checkpoint(
+            runner,
+            user_query,
+            thread_id,
+            **(
+                {"trusted_history": trusted_history}
+                if trusted_history is not None
+                else {}
+            ),
+        )
     )
     if route_decision["route"] == "direct":
         result: dict[str, Any] = {

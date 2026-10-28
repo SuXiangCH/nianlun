@@ -122,8 +122,10 @@ def test_guarded_retrieval_uses_snapshot_fallback_during_mutation():
     assert retriever.search("term")[0]["doc_id"] == "snapshot"
 
 
+@pytest.mark.parametrize("effort", [None, "high"])
+@pytest.mark.parametrize("sampling_version", [1, 2])
 def test_release_runtime_uses_frozen_model_settings_and_current_snapshot(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, effort, sampling_version
 ):
     from app.api_server.services.application_service import ApplicationService
     from nianlun.knowledgebase.factory import KnowledgeBaseFactory
@@ -148,7 +150,10 @@ def test_release_runtime_uses_frozen_model_settings_and_current_snapshot(
         lambda _id: knowledge,
         runtime_factory=runtime_factory,
         model_config_service=SimpleNamespace(
-            require_llm_profile=lambda _id: {"api_key": "internal"}
+            require_llm_profile=lambda _id: {
+                "api_key": "internal",
+                "reasoning_effort": "low",
+            }
         ),
     )
     config = SimpleNamespace(
@@ -159,17 +164,31 @@ def test_release_runtime_uses_frozen_model_settings_and_current_snapshot(
         context_window_tokens=2048,
         agent_version="v1",
         temperature=0.0,
+        sampling_config_version=sampling_version,
         thinking=None,
+        reasoning_effort=effort,
         loop_guard=SimpleNamespace(model_dump=lambda: {}),
     )
+    from nianlun.agent.prompt_registry import CURRENT_PROMPT_BUNDLE
+
+    config.tool_schema_version = CURRENT_PROMPT_BUNDLE.tool_schema_version
+    config.prompt_version = CURRENT_PROMPT_BUNDLE.prompt_version
+    config.v1_prompt_hash = CURRENT_PROMPT_BUNDLE.v1_prompt_hash
+    config.checkpoint_schema_version = CURRENT_PROMPT_BUNDLE.checkpoint_schema_version
     record = dict(knowledge, content_version=1)
     checkpointer = object()
-    service.release_runtime(config, checkpointer, record)
+    service.release_runtime(config, checkpointer, record, image_capability=True)
     assert record["content_version"] == 2
     assert captured["checkpointer"] is checkpointer
-    assert captured["temperature"] == 0.0
+    assert captured["temperature"] == (
+        None if sampling_version == 1 and effort else 0.0
+    )
+    assert captured["legacy_temperature"] is (sampling_version == 1)
     assert captured["model"] == "frozen"
+    assert captured["reasoning_effort"] == effort
     assert captured["allow_env_fallback"] is False
+    assert captured["prompt_bundle"] is CURRENT_PROMPT_BUNDLE
+    assert captured["image_capability"] is True
 
 
 def test_console_runtime_uses_env_sampling_defaults(tmp_path, monkeypatch):

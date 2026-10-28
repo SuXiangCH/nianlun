@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import os
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
+from typing import Literal
+
+from pydantic import SecretStr
 
 from nianlun.config import PROJECT_ROOT
+from nianlun.agent.contracts import AnswerImagePolicy
 
 
 def _csv(value: str) -> tuple[str, ...]:
@@ -74,6 +79,40 @@ class ApiServerSettings:
     application_api_requests_per_minute: int = 60
     application_api_timeout_seconds: float = 300.0
     application_api_retention_days: int = 30
+    application_api_result_retention_days: int = 30
+    application_api_public_base_url: str | None = None
+    answer_images_enabled: bool = True
+    answer_image_storage_backend: Literal["filesystem", "s3"] = "filesystem"
+    answer_image_storage_profiles: Mapping = field(default_factory=dict, repr=False)
+    answer_image_storage_profile_id: str | None = None
+    answer_image_s3_endpoint_url: str | None = None
+    answer_image_s3_bucket: str = ""
+    answer_image_s3_region: str = ""
+    answer_image_s3_addressing_style: Literal["auto", "path", "virtual"] = "auto"
+    answer_image_s3_access_key_id: SecretStr | None = field(default=None, repr=False)
+    answer_image_s3_secret_access_key: SecretStr | None = field(
+        default=None, repr=False
+    )
+    answer_image_s3_session_token: SecretStr | None = field(default=None, repr=False)
+    answer_image_s3_ca_bundle: str | None = None
+    answer_image_s3_connect_timeout_seconds: float = 5.0
+    answer_image_s3_read_timeout_seconds: float = 30.0
+    answer_image_s3_total_max_attempts: int = 3
+    answer_image_orphan_grace_hours: int = 24
+    answer_image_grant_hours: int = 24
+    answer_image_max_image_bytes: int = 8 * 1024 * 1024
+    answer_image_max_image_pixels: int = 40_000_000
+    answer_image_max_candidates: int = 64
+    answer_image_max_answer_images: int = 32
+    answer_image_max_answer_bytes: int = 128 * 1024 * 1024
+    answer_image_max_preview_images: int = 8
+    answer_image_max_preview_bytes: int = 32 * 1024 * 1024
+    answer_image_max_occurrences: int = 128
+    answer_image_max_candidate_line_bytes: int = 4 * 1024
+    answer_image_max_canonical_bytes: int = 1024 * 1024
+    answer_image_inline_max_bytes: int = 1024 * 1024
+    answer_image_inline_total_bytes: int = 2 * 1024 * 1024
+    answer_image_inline_response_max_bytes: int = 8 * 1024 * 1024
     internal_token: str | None = None
     gateway_control_urls: tuple[str, ...] = ()
     gateway_control_token: str | None = None
@@ -83,6 +122,12 @@ class ApiServerSettings:
     wecom_conversation_retention_days: int = 30
 
     def __post_init__(self) -> None:
+        from app.api_server.storage.image_storage_profiles import normalize_profiles
+
+        selected, profiles = normalize_profiles(self)
+        object.__setattr__(self, "answer_image_storage_profile_id", selected)
+        object.__setattr__(self, "answer_image_storage_profiles", profiles)
+        self.freeze_image_policy()
         api_limits = (
             self.application_api_max_concurrent,
             self.application_api_app_concurrent,
@@ -93,6 +138,33 @@ class ApiServerSettings:
         )
         if any(value <= 0 for value in api_limits):
             raise ValueError("应用 API 限额、保留期与超时时间必须大于 0")
+        if any(
+            value <= 0
+            for value in (
+                self.application_api_result_retention_days,
+                self.answer_image_grant_hours,
+                self.answer_image_orphan_grace_hours,
+                self.answer_image_inline_max_bytes,
+                self.answer_image_inline_total_bytes,
+                self.answer_image_inline_response_max_bytes,
+            )
+        ):
+            raise ValueError("图片限额、授权和结果保留期必须大于 0")
+        if self.application_api_public_base_url is not None:
+            parsed = urlsplit(self.application_api_public_base_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+                or self.application_api_public_base_url
+                != self.application_api_public_base_url.strip()
+            ):
+                raise ValueError(
+                    "应用 API 公开地址必须是无凭据、查询参数和片段的 HTTP(S) URL"
+                )
         if self.port < 1 or self.port > 65_535:
             raise ValueError("API port 必须在 1 到 65535 之间")
         if self.database_timeout_seconds <= 0:
@@ -169,6 +241,18 @@ class ApiServerSettings:
         ):
             raise ValueError("企业微信并发、超时和保留期必须大于 0")
 
+    def freeze_image_policy(
+        self, *, transport: Literal["url", "data_url"] = "url"
+    ) -> AnswerImagePolicy:
+        return AnswerImagePolicy(
+            **{
+                name: getattr(self, "answer_image_" + name)
+                for name in AnswerImagePolicy.__dataclass_fields__
+                if name != "inline_budget_enabled"
+            },
+            inline_budget_enabled=transport == "data_url",
+        )
+
     def resolve_provider(self, provider: str) -> ProviderConfig:
         if provider == "default":
             return ProviderConfig()
@@ -179,6 +263,41 @@ class ApiServerSettings:
 
     @classmethod
     def from_env(cls) -> ApiServerSettings:
+        def image_storage_env() -> dict:
+            prefix = "NIANLUN_API_ANSWER_IMAGE_"
+            values = {}
+            for name in (
+                "storage_backend",
+                "storage_profile_id",
+                "s3_endpoint_url",
+                "s3_bucket",
+                "s3_region",
+                "s3_addressing_style",
+                "s3_ca_bundle",
+            ):
+                value = os.environ.get(prefix + name.upper())
+                if value:
+                    values["answer_image_" + name] = value
+            try:
+                raw = os.environ.get(prefix + "STORAGE_PROFILES")
+                if raw:
+                    values["answer_image_storage_profiles"] = json.loads(raw)
+                for name in ("access_key_id", "secret_access_key", "session_token"):
+                    value = os.environ.get(prefix + "S3_" + name.upper())
+                    if value:
+                        values["answer_image_s3_" + name] = SecretStr(value)
+                for name, convert in (
+                    ("connect_timeout_seconds", float),
+                    ("read_timeout_seconds", float),
+                    ("total_max_attempts", int),
+                ):
+                    value = os.environ.get(prefix + "S3_" + name.upper())
+                    if value is not None:
+                        values["answer_image_s3_" + name] = convert(value)
+            except (ValueError, TypeError):
+                raise ValueError("Invalid answer image storage environment") from None
+            return values
+
         def parse_bool(name: str, default: bool) -> bool:
             value = os.environ.get(name)
             if value is None:
@@ -203,6 +322,67 @@ class ApiServerSettings:
                 api_key=os.environ.get(f"NIANLUN_API_PROVIDER_{env_name}_API_KEY"),
             )
         return cls(
+            **image_storage_env(),
+            answer_image_max_image_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_IMAGE_BYTES",
+                    str(cls.answer_image_max_image_bytes),
+                )
+            ),
+            answer_image_max_image_pixels=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_IMAGE_PIXELS",
+                    str(cls.answer_image_max_image_pixels),
+                )
+            ),
+            answer_image_max_candidates=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_CANDIDATES",
+                    str(cls.answer_image_max_candidates),
+                )
+            ),
+            answer_image_max_answer_images=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_ANSWER_IMAGES",
+                    str(cls.answer_image_max_answer_images),
+                )
+            ),
+            answer_image_max_answer_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_ANSWER_BYTES",
+                    str(cls.answer_image_max_answer_bytes),
+                )
+            ),
+            answer_image_max_preview_images=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_PREVIEW_IMAGES",
+                    str(cls.answer_image_max_preview_images),
+                )
+            ),
+            answer_image_max_preview_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_PREVIEW_BYTES",
+                    str(cls.answer_image_max_preview_bytes),
+                )
+            ),
+            answer_image_max_occurrences=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_OCCURRENCES",
+                    str(cls.answer_image_max_occurrences),
+                )
+            ),
+            answer_image_max_candidate_line_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_CANDIDATE_LINE_BYTES",
+                    str(cls.answer_image_max_candidate_line_bytes),
+                )
+            ),
+            answer_image_max_canonical_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_MAX_CANONICAL_BYTES",
+                    str(cls.answer_image_max_canonical_bytes),
+                )
+            ),
             application_api_enabled=os.environ.get(
                 "NIANLUN_API_APPLICATION_ENABLED", "false"
             ).lower()
@@ -224,6 +404,38 @@ class ApiServerSettings:
             ),
             application_api_retention_days=int(
                 os.environ.get("NIANLUN_API_APPLICATION_RETENTION_DAYS", "30")
+            ),
+            application_api_result_retention_days=int(
+                os.environ.get("NIANLUN_API_APPLICATION_RESULT_RETENTION_DAYS", "30")
+            ),
+            application_api_public_base_url=os.environ.get(
+                "NIANLUN_API_APPLICATION_PUBLIC_BASE_URL"
+            )
+            or None,
+            answer_images_enabled=parse_bool("NIANLUN_API_ANSWER_IMAGES_ENABLED", True),
+            answer_image_orphan_grace_hours=int(
+                os.environ.get("NIANLUN_API_ANSWER_IMAGE_ORPHAN_GRACE_HOURS", "24")
+            ),
+            answer_image_grant_hours=int(
+                os.environ.get("NIANLUN_API_ANSWER_IMAGE_GRANT_HOURS", "24")
+            ),
+            answer_image_inline_max_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_INLINE_MAX_BYTES",
+                    str(cls.answer_image_inline_max_bytes),
+                )
+            ),
+            answer_image_inline_total_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_INLINE_TOTAL_BYTES",
+                    str(cls.answer_image_inline_total_bytes),
+                )
+            ),
+            answer_image_inline_response_max_bytes=int(
+                os.environ.get(
+                    "NIANLUN_API_ANSWER_IMAGE_INLINE_RESPONSE_MAX_BYTES",
+                    str(cls.answer_image_inline_response_max_bytes),
+                )
             ),
             internal_token=os.environ.get("NIANLUN_INTERNAL_TOKEN") or None,
             gateway_control_urls=_csv(

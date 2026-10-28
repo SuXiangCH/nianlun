@@ -64,6 +64,12 @@ class KnowledgeBase(Base):
     heading_recovery_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=text("1")
     )
+    parser_options_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default="{}"
+    )
+    reasoning_effort: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="inherit", server_default="inherit"
+    )
     llm_model_id: Mapped[str | None] = mapped_column(
         ForeignKey("model_profiles.id", ondelete="RESTRICT"), nullable=True
     )
@@ -136,6 +142,9 @@ class Application(Base):
     agent_version: Mapped[str] = mapped_column(String(8), nullable=False, default="v0")
     clarification_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
+    )
+    reasoning_effort: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="inherit", server_default="inherit"
     )
     created_at: Mapped[str] = mapped_column(String(64), nullable=False)
     updated_at: Mapped[str] = mapped_column(String(64), nullable=False)

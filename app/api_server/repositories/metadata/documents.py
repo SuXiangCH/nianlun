@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from app.api_server.repositories.answer_images import invalidate_source_images
+
+
 from typing import Any
 
 from sqlalchemy import delete, func, select
@@ -31,6 +34,7 @@ def _document_dict(item: Document) -> dict[str, Any]:
             "status",
             "pipeline_generation",
             "parse_plan_json",
+            "parser_config_json",
             "current_stage",
             "stage_state",
             "failed_stage",
@@ -79,11 +83,15 @@ class DocumentRepositoryMixin:
     def list_unqueued_markdown_normalization_documents(self) -> list[dict[str, Any]]:
         """Return Markdown documents left without their first normalize task."""
         with self.factory.session_scope() as session:
-            task_exists = select(DocumentNormalizationTask.id).where(
-                DocumentNormalizationTask.document_id == Document.id,
-                DocumentNormalizationTask.pipeline_generation
-                == Document.pipeline_generation,
-            ).exists()
+            task_exists = (
+                select(DocumentNormalizationTask.id)
+                .where(
+                    DocumentNormalizationTask.document_id == Document.id,
+                    DocumentNormalizationTask.pipeline_generation
+                    == Document.pipeline_generation,
+                )
+                .exists()
+            )
             items = session.scalars(
                 select(Document).where(
                     Document.parser == "native_markdown",
@@ -161,6 +169,7 @@ class DocumentRepositoryMixin:
                 status=str(values.get("status", "uploaded")),
                 pipeline_generation=int(values.get("pipeline_generation", 1)),
                 parse_plan_json=values.get("parse_plan_json"),
+                parser_config_json=values.get("parser_config_json"),
                 current_stage=str(values.get("current_stage", "complete")),
                 stage_state=str(values.get("stage_state", "succeeded")),
                 failed_stage=values.get("failed_stage"),
@@ -183,15 +192,34 @@ class DocumentRepositoryMixin:
             session.flush()
             return _document_dict(item)
 
-    def update_document(self, document_id: str, values: dict[str, Any]) -> None:
+    def update_document(
+        self,
+        document_id: str,
+        values: dict[str, Any],
+        *,
+        pipeline_generation: int | None = None,
+        expected_state: tuple[str, str] | None = None,
+    ) -> None:
         with self.factory.session_scope(write=True) as session:
             item = session.get(Document, document_id)
             if item is None:
                 raise KeyError(document_id)
+            if pipeline_generation is not None and (
+                item.pipeline_generation != pipeline_generation
+                or item.status == "deleted"
+            ):
+                raise ValueError("文档解析 generation 已失效")
+            # Preparation must not overwrite progress once another stage has started.
+            if (
+                expected_state is not None
+                and (item.status, item.current_stage) != expected_state
+            ):
+                return
             for field in (
                 "status",
                 "pipeline_generation",
                 "parse_plan_json",
+                "parser_config_json",
                 "current_stage",
                 "stage_state",
                 "failed_stage",
@@ -209,6 +237,22 @@ class DocumentRepositoryMixin:
             ):
                 if field in values:
                     setattr(item, field, values[field])
+
+    def freeze_document_parser_config(
+        self, document_id: str, generation: int, parser_config_json: str
+    ) -> str:
+        """Capture legacy pending documents once without crossing generations."""
+        with self.factory.session_scope(write=True) as session:
+            item = session.get(Document, document_id)
+            if (
+                item is None
+                or item.pipeline_generation != generation
+                or item.status == "deleted"
+            ):
+                raise ValueError("文档解析 generation 已失效")
+            if item.parser_config_json is None:
+                item.parser_config_json = parser_config_json
+            return item.parser_config_json
 
     def delete_document(
         self, knowledge_base_id: str, document_id: str, now: str
@@ -229,6 +273,7 @@ class DocumentRepositoryMixin:
                 )
             )
             session.delete(item)
+            invalidate_source_images(session)
             session.flush()
             knowledge_base = session.get(KnowledgeBase, knowledge_base_id)
             if knowledge_base is not None:

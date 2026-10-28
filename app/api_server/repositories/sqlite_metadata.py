@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from app.api_server.repositories.answer_images import invalidate_source_images
+
+
+import json
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -48,7 +52,9 @@ def _knowledge_base_dict(item: KnowledgeBase) -> dict[str, Any]:
         "document_count": item.document_count,
         "summary_enabled": bool(item.summary_enabled),
         "heading_recovery_enabled": bool(item.heading_recovery_enabled),
+        "parser_options": json.loads(item.parser_options_json),
         "llm_model_id": item.llm_model_id,
+        "reasoning_effort": item.reasoning_effort,
         "content_version": item.content_version,
         "fts_status": item.fts_status,
         "fts_revision": item.fts_revision,
@@ -85,6 +91,7 @@ def _application_dict(item: Application) -> dict[str, Any]:
         "config_version": item.config_version,
         "agent_version": item.agent_version,
         "clarification_enabled": item.clarification_enabled,
+        "reasoning_effort": item.reasoning_effort,
         "created_at": item.created_at,
         "updated_at": item.updated_at,
     }
@@ -175,7 +182,9 @@ class SQLiteMetadataRepository(
             "name",
             "summary_enabled",
             "heading_recovery_enabled",
+            "parser_options_json",
             "llm_model_id",
+            "reasoning_effort",
             "vector_model_id",
             "vector_status",
             "vector_revision",
@@ -230,6 +239,7 @@ class SQLiteMetadataRepository(
                 )
             yield _knowledge_base_dict(item)
             session.delete(item)
+            invalidate_source_images(session)
             session.flush()
 
     def delete_application(self, application_id: str) -> bool:
@@ -245,6 +255,7 @@ class SQLiteMetadataRepository(
                 )
             )
             session.delete(item)
+            invalidate_source_images(session)
             session.flush()
             return True
 
@@ -265,7 +276,9 @@ class SQLiteMetadataRepository(
                 heading_recovery_enabled=bool(
                     item.get("heading_recovery_enabled", True)
                 ),
+                parser_options_json=json.dumps(item.get("parser_options", {})),
                 llm_model_id=item.get("llm_model_id"),
+                reasoning_effort=item.get("reasoning_effort", "inherit"),
                 content_version=int(item.get("content_version", 0)),
                 fts_status=item.get("fts_status", "disabled"),
                 fts_revision=item.get("fts_revision"),
@@ -300,7 +313,9 @@ class SQLiteMetadataRepository(
             entity.heading_recovery_enabled = bool(
                 item.get("heading_recovery_enabled", True)
             )
+            entity.parser_options_json = json.dumps(item.get("parser_options", {}))
             entity.llm_model_id = item.get("llm_model_id")
+            entity.reasoning_effort = item.get("reasoning_effort", "inherit")
             entity.content_version = int(item.get("content_version", 0))
             entity.fts_status = item.get("fts_status", "disabled")
             entity.fts_revision = item.get("fts_revision")
@@ -339,6 +354,7 @@ class SQLiteMetadataRepository(
                     config_version=int(item.get("config_version", 1)),
                     agent_version=item.get("agent_version", "v0"),
                     clarification_enabled=bool(item.get("clarification_enabled", True)),
+                    reasoning_effort=item.get("reasoning_effort", "inherit"),
                     created_at=item["created_at"],
                     updated_at=item["updated_at"],
                 )
@@ -353,6 +369,7 @@ class SQLiteMetadataRepository(
         entity.config_version = int(item.get("config_version", 1))
         entity.agent_version = item.get("agent_version", "v0")
         entity.clarification_enabled = bool(item.get("clarification_enabled", True))
+        entity.reasoning_effort = item.get("reasoning_effort", "inherit")
         entity.updated_at = item["updated_at"]
 
 

@@ -2,11 +2,12 @@
 
 from typing import Any
 
-from fastapi import APIRouter, File, Header, Request, UploadFile
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, File, Header, Query, Request, UploadFile
+from fastapi.responses import PlainTextResponse, Response
 from starlette.concurrency import run_in_threadpool
 
 from app.api_server.apis.v1.schemas import (
+    DocumentReparseRequest,
     KnowledgeBaseCreateRequest,
     KnowledgeBaseUpdateRequest,
 )
@@ -241,6 +242,19 @@ def get_document_pipeline(
     return success(item)
 
 
+@router.post("/{knowledge_base_id}/documents/{document_id}/reparse")
+def reparse_document(
+    knowledge_base_id: str,
+    document_id: str,
+    body: DocumentReparseRequest,
+    request: Request,
+) -> dict[str, Any]:
+    item = _services(request).documents.reparse_document(
+        knowledge_base_id, document_id, is_ocr=body.is_ocr
+    )
+    return success(item)
+
+
 @router.post("/{knowledge_base_id}/documents/{document_id}/retry")
 def retry_document(
     knowledge_base_id: str, document_id: str, request: Request
@@ -263,6 +277,37 @@ def get_document_content(
 ) -> PlainTextResponse:
     content = _services(request).documents.read_content(knowledge_base_id, document_id)
     return PlainTextResponse(content, media_type="text/markdown")
+
+
+@router.get("/{knowledge_base_id}/documents/{document_id}/preview")
+def get_document_preview(
+    knowledge_base_id: str, document_id: str, request: Request
+) -> dict[str, Any]:
+    result = _services(request).document_previews.preview(
+        knowledge_base_id, document_id
+    )
+    return success(result.model_dump(mode="json"))
+
+
+@router.get("/{knowledge_base_id}/documents/{document_id}/images/{image_id}/content")
+def get_document_image(
+    knowledge_base_id: str,
+    document_id: str,
+    image_id: str,
+    request: Request,
+    content_version: int = Query(ge=0),
+) -> Response:
+    content, media_type = _services(request).document_previews.read_image(
+        knowledge_base_id, document_id, image_id, content_version
+    )
+    return Response(
+        content,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.get("/{knowledge_base_id}/documents/{document_id}/tree")

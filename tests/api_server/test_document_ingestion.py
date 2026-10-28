@@ -6,14 +6,15 @@ import json
 import threading
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pypdf import PdfReader, PdfWriter
 
@@ -34,6 +35,19 @@ from app.api_server.services.documents.mineru_artifacts import (
 from app.api_server.services.documents.mineru_tasks import build_parser_options
 from app.api_server.services.documents.pdf_chunks import PdfChunkError
 from app.api_server.main import create_app
+
+
+@pytest.fixture
+def client_factory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[FastAPI], TestClient]]:
+    # Drain workers before monkeypatch restores their integration dependencies.
+    with ExitStack() as clients:
+
+        def create_client(app: FastAPI) -> TestClient:
+            return clients.enter_context(TestClient(app))
+
+        yield create_client
 
 
 def _settings(tmp_path: Path) -> ApiServerSettings:
@@ -204,6 +218,569 @@ def test_parser_options_limit_page_ranges_to_pdf() -> None:
 
     assert build_parser_options(config, ".pdf")["page_ranges"] == "2-4"
     assert "page_ranges" not in build_parser_options(config, ".docx")
+
+
+def test_knowledge_base_parser_options_validate_and_reset(tmp_path: Path) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={"name": "独立解析", "parser_options": {"is_ocr": True}},
+        )
+        assert kb.status_code == 200
+        kb_id = kb.json()["data"]["id"]
+        assert kb.json()["data"]["parser_options"]["is_ocr"] is True
+        url = f"/api/v1/knowledge-bases/{kb_id}"
+        for invalid in [
+            {"api_key": "forbidden"},
+            {"is_ocr": "false"},
+            {"language": " "},
+        ]:
+            assert (
+                client.patch(url, json={"parser_options": invalid}).status_code == 422
+            )
+        reset = client.patch(url, json={"parser_options": {}})
+        assert reset.status_code == 200
+        assert reset.json()["data"]["parser_options"] == {
+            "is_ocr": None,
+            "enable_table": None,
+            "enable_formula": None,
+            "language": None,
+        }
+
+
+@pytest.mark.parametrize("extension", [".pdf", ".doc", ".docx"])
+def test_upload_freezes_parser_options_before_background_preparation(
+    tmp_path: Path, monkeypatch, extension: str
+) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        monkeypatch.setattr(service, "_schedule_preparation", lambda *_args: None)
+        monkeypatch.setattr(service, "_schedule_task_submission", lambda *_args: None)
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={
+                "name": "参数快照",
+                "parser_options": {
+                    "is_ocr": True,
+                    "enable_formula": False,
+                    "language": "en",
+                },
+            },
+        ).json()["data"]
+        url = f"/api/v1/knowledge-bases/{kb['id']}"
+        first = client.post(
+            f"{url}/documents", files={"file": (f"first{extension}", _pdf_bytes())}
+        )
+        assert first.status_code == 200
+        first_id = first.json()["data"]["document_id"]
+        assert (
+            client.patch(url, json={"parser_options": {"is_ocr": False}}).status_code
+            == 200
+        )
+        changed_global = {
+            **service.models.parser_runtime_config(),
+            "enable_table": False,
+        }
+        monkeypatch.setattr(
+            service.models, "parser_runtime_config", lambda: changed_global
+        )
+        second = client.post(
+            f"{url}/documents", files={"file": (f"second{extension}", _pdf_bytes(2))}
+        )
+        second_id = second.json()["data"]["document_id"]
+        replay = client.post(
+            f"{url}/documents", files={"file": (f"first{extension}", _pdf_bytes())}
+        ).json()["data"]
+        assert replay["idempotent_replay"] is True
+        assert replay["document_id"] == first_id
+        # Simulate worker recovery after settings have changed and no tasks exist yet.
+        for doc_id in [first_id, second_id]:
+            service._prepare_parse_tasks(doc_id, service.models.parser_runtime_config())
+        first_task = service.repository.list_parse_tasks(first_id)[0]
+        second_task = service.repository.list_parse_tasks(second_id)[0]
+        first_options = json.loads(first_task["request_json"])
+        second_options = json.loads(second_task["request_json"])
+        assert first_options["is_ocr"] is True
+        assert first_options["enable_formula"] is False
+        assert first_options["language"] == "en"
+        assert first_options["enable_table"] is True
+        assert second_options["is_ocr"] is False
+        assert second_options["enable_table"] is False
+        first_record = service.repository.get_document(kb["id"], first_id)
+        assert first_record is not None
+        snapshot = json.loads(first_record["parser_config_json"])
+        assert "api_key" not in snapshot and "base_url" not in snapshot
+        assert (
+            "parser_config_json"
+            not in client.get(f"{url}/documents/{first_id}").json()["data"]
+        )
+        # Legacy partial preparation recovers submitted options, not new defaults.
+        service.repository.update_document(first_id, {"parser_config_json": None})
+        service._prepare_parse_tasks(first_id, service.models.parser_runtime_config())
+        legacy = service.repository.get_document(kb["id"], first_id)
+        assert legacy is not None
+        assert json.loads(legacy["parser_config_json"])["is_ocr"] is True
+
+
+@pytest.mark.parametrize("is_ocr", [True, False, None])
+def test_reparse_ocr_is_document_scoped_and_publishes_new_generation(
+    tmp_path: Path, monkeypatch, is_ocr: bool | None
+) -> None:
+    monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={
+                "name": "单文档 OCR",
+                "summary_enabled": False,
+                "parser_options": {"is_ocr": False},
+            },
+        ).json()["data"]
+        url = f"/api/v1/knowledge-bases/{kb['id']}"
+        doc_id = client.post(
+            f"{url}/documents", files={"file": ("report.doc", b"word source")}
+        ).json()["data"]["document_id"]
+        for _ in range(200):
+            before = client.get(f"{url}/documents/{doc_id}").json()["data"]
+            if before["status"] == "ready":
+                break
+            time.sleep(0.01)
+        assert before["status"] == "ready"
+        service = client.app.state.services.documents
+        schedule = service._schedule_preparation
+        monkeypatch.setattr(service, "_schedule_preparation", lambda *_args: None)
+        response = client.post(
+            f"{url}/documents/{doc_id}/reparse", json={"is_ocr": is_ocr}
+        )
+        assert response.status_code == 200
+        assert response.json()["data"]["pipeline_generation"] == 2
+        assert (
+            response.json()["data"]["published_content_version"]
+            == before["published_content_version"]
+        )
+        assert (
+            client.post(f"{url}/documents/{doc_id}/reparse", json={}).status_code == 409
+        )
+        assert client.get(url).json()["data"]["parser_options"]["is_ocr"] is False
+        record = service.repository.get_document(kb["id"], doc_id)
+        assert record is not None
+        assert json.loads(record["parser_config_json"])["is_ocr"] is bool(is_ocr)
+        monkeypatch.setattr(service, "_schedule_preparation", schedule)
+        schedule(doc_id)
+        for _ in range(200):
+            after = client.get(f"{url}/documents/{doc_id}").json()["data"]
+            if after["status"] == "ready":
+                break
+            time.sleep(0.01)
+        assert after["status"] == "ready"
+        assert after["published_content_version"] > before["published_content_version"]
+        assert client.get(url).json()["data"]["document_count"] == 1
+        tasks = service.repository.list_parse_tasks(doc_id)
+        assert {task["pipeline_generation"] for task in tasks} == {1, 2}
+        new_task = next(task for task in tasks if task["pipeline_generation"] == 2)
+        assert json.loads(new_task["request_json"])["is_ocr"] is bool(is_ocr)
+
+
+def test_reparse_rejects_invalid_requests_without_changing_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        monkeypatch.setattr(service, "_schedule_preparation", lambda *_args: None)
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={"name": "重解析校验", "summary_enabled": False},
+        ).json()["data"]
+        url = f"/api/v1/knowledge-bases/{kb['id']}"
+        doc_id = client.post(
+            f"{url}/documents", files={"file": ("source.doc", b"word")}
+        ).json()["data"]["document_id"]
+        endpoint = f"{url}/documents/{doc_id}/reparse"
+        service.repository.update_document(
+            doc_id, {"status": "failed", "failed_stage": "parse"}
+        )
+        assert client.post(endpoint, json={"is_ocr": "false"}).status_code == 422
+        assert client.post(endpoint, json={"api_key": "forbidden"}).status_code == 422
+        other = client.post(
+            "/api/v1/knowledge-bases", json={"name": "其他知识库"}
+        ).json()["data"]["id"]
+        assert (
+            client.post(
+                f"/api/v1/knowledge-bases/{other}/documents/{doc_id}/reparse", json={}
+            ).status_code
+            == 404
+        )
+        record = service.repository.get_document(kb["id"], doc_id)
+        assert record is not None
+        (Path(kb["workspace_dir"]) / record["source_relpath"]).unlink()
+        assert client.post(endpoint, json={}).status_code == 409
+        current = service.repository.get_document(kb["id"], doc_id)
+        assert current is not None
+        assert current["pipeline_generation"] == 1
+        native_id = client.post(
+            f"{url}/documents", files={"file": ("notes.md", b"# Notes\nText")}
+        ).json()["data"]["document_id"]
+        assert (
+            client.post(f"{url}/documents/{native_id}/reparse", json={}).status_code
+            == 415
+        )
+
+
+@pytest.mark.parametrize("action", ["reparse", "retry", "recover"])
+@pytest.mark.parametrize("preparation_fails", [False, True])
+def test_preparation_restart_isolated_from_finishing_prior_generation(
+    tmp_path: Path, monkeypatch, action: str, preparation_fails: bool
+) -> None:
+    old_failure = threading.Event()
+    release_old = threading.Event()
+    new_preparation = threading.Event()
+    release_new = threading.Event()
+    original_split = ingestion_module.split_pdf
+
+    def split_for_generation(content: bytes, **kwargs):
+        if kwargs["generation"] == 1:
+            raise PdfChunkError("first generation rejected")
+        new_preparation.set()
+        assert release_new.wait(5)
+        if preparation_fails:
+            raise PdfChunkError("second generation rejected")
+        return original_split(content, **kwargs)
+
+    monkeypatch.setattr(ingestion_module, "split_pdf", split_for_generation)
+    monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
+    settings = replace(_settings(tmp_path), mineru_submit_workers=2)
+    with TestClient(create_app(settings)) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        fail_preflight = service.repository.fail_document_parse_preflight
+
+        def pause_old_failure(*args, **kwargs):
+            result = fail_preflight(*args, **kwargs)
+            if kwargs.get("error_message") == "first generation rejected":
+                old_failure.set()
+                assert release_old.wait(5)
+            return result
+
+        monkeypatch.setattr(
+            service.repository, "fail_document_parse_preflight", pause_old_failure
+        )
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={"name": "preparation generation fence", "summary_enabled": False},
+        ).json()["data"]
+        url = f"/api/v1/knowledge-bases/{kb['id']}/documents"
+        try:
+            doc_id = client.post(
+                url, files={"file": ("source.pdf", _pdf_bytes())}
+            ).json()["data"]["document_id"]
+            assert old_failure.wait(5)
+            with service._jobs_lock:
+                old_future = next(iter(service._jobs.values()))
+            if action == "recover":
+                service.repository.restart_parse_preparation(
+                    doc_id, 1, ingestion_module._now()
+                )
+                service.recover()
+            else:
+                response = client.post(
+                    f"{url}/{doc_id}/{action}",
+                    **({"json": {}} if action == "reparse" else {}),
+                )
+                assert response.status_code == 200
+                assert response.json()["data"]["pipeline_generation"] == 2
+            assert new_preparation.wait(2), (
+                "new generation preparation was not scheduled"
+            )
+            with service._jobs_lock:
+                new_future = next(
+                    future
+                    for future in service._jobs.values()
+                    if future is not old_future
+                )
+            release_old.set()
+            old_future.result(timeout=5)
+            with service._jobs_lock:
+                assert new_future in service._jobs.values()
+            operation = service.repository.get_upload_by_document(kb["id"], doc_id)
+            assert operation is not None
+            assert operation["status"] == "files_committed"
+            assert operation["error_message"] is None
+            # Recovery while the current generation is active must not submit it twice.
+            service.recover()
+            with service._jobs_lock:
+                assert list(service._jobs.values()) == [new_future]
+            release_new.set()
+            new_future.result(timeout=5)
+            for _ in range(200):
+                document = client.get(f"{url}/{doc_id}").json()["data"]
+                if document["status"] in {"ready", "failed"}:
+                    break
+                time.sleep(0.01)
+            assert document["pipeline_generation"] == 2
+            assert document["status"] == ("failed" if preparation_fails else "ready")
+            operation = service.repository.get_upload_by_document(kb["id"], doc_id)
+            assert operation is not None
+            assert operation["status"] == (
+                "failed" if preparation_fails else "committed"
+            )
+            assert operation["error_message"] == (
+                "second generation rejected" if preparation_fails else None
+            )
+            tasks = service.repository.list_parse_tasks(doc_id)
+            assert {task["pipeline_generation"] for task in tasks} == (
+                set() if preparation_fails else {2}
+            )
+        finally:
+            release_old.set()
+            release_new.set()
+
+
+def test_queued_preparation_does_not_adopt_restarted_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    release_executor = threading.Event()
+    monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
+    settings = replace(_settings(tmp_path), mineru_submit_workers=1)
+    with TestClient(create_app(settings)) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        blocker = service._submission_executor.submit(release_executor.wait, 5)
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={"name": "queued preparation", "summary_enabled": False},
+        ).json()["data"]
+        try:
+            doc_id = client.post(
+                f"/api/v1/knowledge-bases/{kb['id']}/documents",
+                files={"file": ("source.doc", b"word")},
+            ).json()["data"]["document_id"]
+            with service._jobs_lock:
+                old_future = next(iter(service._jobs.values()))
+            assert service.repository.fail_document_parse_preflight(
+                doc_id,
+                1,
+                error_code="TEST_FAILURE",
+                error_message="restart while queued",
+                now=ingestion_module._now(),
+            )
+            service.repository.restart_parse_preparation(
+                doc_id, 1, ingestion_module._now()
+            )
+            release_executor.set()
+            blocker.result(timeout=5)
+            old_future.result(timeout=5)
+            assert service.repository.list_parse_tasks(doc_id) == []
+            document = service.repository.get_document(kb["id"], doc_id)
+            assert document is not None
+            assert document["pipeline_generation"] == 2
+            assert document["stage_state"] == "queued"
+        finally:
+            release_executor.set()
+
+
+@pytest.mark.parametrize(
+    "paused_field", ["parse_plan_json", "progress_completed", "create_parse_task"]
+)
+def test_stale_preparation_cannot_write_new_generation_or_create_tasks(
+    tmp_path: Path, monkeypatch, paused_field: str
+) -> None:
+    old_write = threading.Event()
+    release_old = threading.Event()
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        update_document = service.repository.update_document
+        create_parse_task = service.repository.create_parse_task
+
+        def pause_old_write(document_id, values, **kwargs):
+            if paused_field in values:
+                old_write.set()
+                assert release_old.wait(5)
+            return update_document(document_id, values, **kwargs)
+
+        def pause_old_task_creation(values):
+            if paused_field == "create_parse_task":
+                old_write.set()
+                assert release_old.wait(5)
+            return create_parse_task(values)
+
+        monkeypatch.setattr(service.repository, "update_document", pause_old_write)
+        monkeypatch.setattr(
+            service.repository, "create_parse_task", pause_old_task_creation
+        )
+        monkeypatch.setattr(service, "_schedule_task_submission", lambda *_args: None)
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={"name": "stale preparation write", "summary_enabled": False},
+        ).json()["data"]
+        try:
+            doc_id = client.post(
+                f"/api/v1/knowledge-bases/{kb['id']}/documents",
+                files={"file": ("source.pdf", _pdf_bytes())},
+            ).json()["data"]["document_id"]
+            assert old_write.wait(5)
+            with service._jobs_lock:
+                old_future = next(iter(service._jobs.values()))
+            assert service.repository.fail_document_parse_preflight(
+                doc_id,
+                1,
+                error_code="TEST_FAILURE",
+                error_message="restart before old write",
+                now=ingestion_module._now(),
+            )
+            service.repository.restart_parse_preparation(
+                doc_id, 1, ingestion_module._now()
+            )
+            release_old.set()
+            old_future.result(timeout=5)
+            document = service.repository.get_document(kb["id"], doc_id)
+            assert document is not None
+            assert document["pipeline_generation"] == 2
+            assert document["parse_plan_json"] is None
+            assert document["status"] == "parsing"
+            assert document["stage_state"] == "queued"
+            assert document["progress_total"] is None
+            assert service.repository.list_parse_tasks(doc_id, 2) == []
+            assert all(
+                task["state"] == "canceled"
+                for task in service.repository.list_parse_tasks(doc_id, 1)
+            )
+            upload = service.repository.get_upload_by_document(kb["id"], doc_id)
+            assert upload is not None
+            assert upload["status"] == "files_committed"
+            assert upload["error_message"] is None
+        finally:
+            release_old.set()
+
+
+def test_preparation_cannot_reset_stage_after_background_parse_finishes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        schedule = service._schedule_task_submission
+
+        def finish_before_preparer_resumes(task_id):
+            schedule(task_id)
+            task = service.repository.get_parse_task(task_id)
+            for _ in range(300):
+                document = service.repository.get_document(
+                    kb["id"], task["document_id"]
+                )
+                if document["status"] == "ready":
+                    break
+                time.sleep(0.01)
+            assert document["status"] == "ready"
+
+        monkeypatch.setattr(
+            service, "_schedule_task_submission", finish_before_preparer_resumes
+        )
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={
+                "name": "stage ordering",
+                "summary_enabled": False,
+                "heading_recovery_enabled": False,
+            },
+        ).json()["data"]
+        doc_id = client.post(
+            f"/api/v1/knowledge-bases/{kb['id']}/documents",
+            files={"file": ("source.pdf", _pdf_bytes())},
+        ).json()["data"]["document_id"]
+        for _ in range(300):
+            with service._jobs_lock:
+                pending = service._jobs.get(f"prepare:{doc_id}:g1")
+            if pending is None:
+                break
+            pending.result(timeout=5)
+        document = service.repository.get_document(kb["id"], doc_id)
+        assert document["status"] == "ready"
+        assert document["current_stage"] == "complete"
+        assert document["stage_state"] == "succeeded"
+        # A queued recovery worker may start after the current generation finishes.
+        service._prepare_parse_tasks(doc_id, service.models.parser_runtime_config(), 1)
+        document = service.repository.get_document(kb["id"], doc_id)
+        assert document["current_stage"] == "complete"
+        assert document["stage_state"] == "succeeded"
+
+
+def test_late_failed_attempt_cannot_break_retry_in_same_generation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    old_failure = threading.Event()
+    release_old = threading.Event()
+    retry_poll = threading.Event()
+    release_retry = threading.Event()
+
+    class ControlledClient(RetryMineruClient):
+        submissions_by_data_id = {}
+
+        def get_batch_result(self, batch_id):
+            if batch_id.endswith(":s2"):
+                retry_poll.set()
+                assert release_retry.wait(5)
+            return super().get_batch_result(batch_id)
+
+    monkeypatch.setattr(ingestion_module, "MineruClient", ControlledClient)
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        service = client.app.state.services.documents
+        fail_task = service.repository.fail_claimed_parse_task
+
+        def pause_after_failure(*args, **kwargs):
+            result = fail_task(*args, **kwargs)
+            old_failure.set()
+            assert release_old.wait(5)
+            return result
+
+        monkeypatch.setattr(
+            service.repository, "fail_claimed_parse_task", pause_after_failure
+        )
+        kb = client.post(
+            "/api/v1/knowledge-bases",
+            json={
+                "name": "same generation retry",
+                "summary_enabled": False,
+                "heading_recovery_enabled": False,
+            },
+        ).json()["data"]
+        url = f"/api/v1/knowledge-bases/{kb['id']}/documents"
+        try:
+            doc_id = client.post(
+                url, files={"file": ("source.pdf", _pdf_bytes())}
+            ).json()["data"]["document_id"]
+            assert old_failure.wait(5)
+            with service._jobs_lock:
+                old_worker = next(
+                    future
+                    for key, future in service._jobs.items()
+                    if not key.startswith("prepare:")
+                )
+            response = client.post(f"{url}/{doc_id}/retry")
+            assert response.status_code == 200
+            assert response.json()["data"]["pipeline_generation"] == 1
+            assert retry_poll.wait(5)
+            release_old.set()
+            old_worker.result(timeout=5)
+            upload = service.repository.get_upload_by_document(kb["id"], doc_id)
+            assert upload["status"] == "files_committed"
+            release_retry.set()
+            for _ in range(300):
+                document = service.repository.get_document(kb["id"], doc_id)
+                if document["status"] in {"ready", "failed"}:
+                    break
+                time.sleep(0.01)
+            assert document["status"] == "ready"
+            upload = service.repository.get_upload_by_document(kb["id"], doc_id)
+            assert upload["status"] == "committed"
+        finally:
+            release_old.set()
+            release_retry.set()
 
 
 class FakeMineruClient:
@@ -406,7 +983,7 @@ def test_self_hosted_mineru_rejects_non_contiguous_page_ranges() -> None:
 
 
 def test_pdf_uses_self_hosted_mineru_task_and_zip_pipeline(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(
         ingestion_module, "SelfHostedMineruClient", FakeSelfHostedMineruClient
@@ -414,9 +991,9 @@ def test_pdf_uses_self_hosted_mineru_task_and_zip_pipeline(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: FakeSummaryLLM(),
+        lambda _self, _profile_id=None, **_kwargs: FakeSummaryLLM(),
     )
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client, api_mode="self_hosted")
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases", json={"name": "私有解析"}
@@ -441,7 +1018,7 @@ def test_pdf_uses_self_hosted_mineru_task_and_zip_pipeline(
 
 
 def test_self_hosted_task_is_resubmitted_after_upstream_restart(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     RestartingSelfHostedMineruClient.submit_count = 0
     RestartingSelfHostedMineruClient.query_count = 0
@@ -451,9 +1028,9 @@ def test_self_hosted_task_is_resubmitted_after_upstream_restart(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: FakeSummaryLLM(),
+        lambda _self, _profile_id=None, **_kwargs: FakeSummaryLLM(),
     )
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client, api_mode="self_hosted")
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases", json={"name": "私有重试"}
@@ -476,15 +1053,15 @@ def test_self_hosted_task_is_resubmitted_after_upstream_restart(
 
 
 def test_markdown_documents_are_visible_and_pdf_uses_mineru_pipeline(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: FakeSummaryLLM(),
+        lambda _self, _profile_id=None, **_kwargs: FakeSummaryLLM(),
     )
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases", json={"name": "文档测试"}
@@ -509,11 +1086,10 @@ def test_markdown_documents_are_visible_and_pdf_uses_mineru_pipeline(
             break
         time.sleep(0.01)
     assert markdown_document["status"] == "ready"
-    markdown_artifact = json.loads(
-        (
-            Path(markdown.json()["data"]["workspace_dir"]) / f"{markdown_id}.json"
-        ).read_text(encoding="utf-8")
-    )
+    service = client.app.state.services.documents
+    markdown_artifact = service._committed_workspace_view(
+        knowledge_base_id
+    ).load_document(markdown_id)
     assert markdown_artifact["doc_description"] == "文档描述"
     assert markdown_artifact["structure"][0]["summary"] == "节点摘要"
 
@@ -523,7 +1099,6 @@ def test_markdown_documents_are_visible_and_pdf_uses_mineru_pipeline(
     )
     assert pdf.status_code == 200
     pdf_id = pdf.json()["data"]["document_id"]
-    workspace_dir = Path(pdf.json()["data"]["workspace_dir"])
 
     documents: list[dict[str, object]] = []
     for _ in range(50):
@@ -546,9 +1121,9 @@ def test_markdown_documents_are_visible_and_pdf_uses_mineru_pipeline(
         isinstance(item, dict) and item.get("kind") == "full_markdown"
         for item in artifacts
     )
-    workspace_document = json.loads(
-        (workspace_dir / f"{pdf_id}.json").read_text(encoding="utf-8")
-    )
+    workspace_document = service._committed_workspace_view(
+        knowledge_base_id
+    ).load_document(pdf_id)
     assert workspace_document["heading_recovery"]["mode"] == "rules_then_llm"
 
     content = client.get(
@@ -559,7 +1134,7 @@ def test_markdown_documents_are_visible_and_pdf_uses_mineru_pipeline(
 
 
 def test_pdf_marks_task_done_only_after_locked_persistence(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
     app = create_app(_settings(tmp_path))
@@ -600,7 +1175,7 @@ def test_pdf_marks_task_done_only_after_locked_persistence(
     monkeypatch.setattr(service.artifacts, "write_document", tracked_write_document)
     monkeypatch.setattr(service, "_persist_result", tracked_persist_result)
 
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases",
@@ -627,8 +1202,9 @@ def test_pdf_marks_task_done_only_after_locked_persistence(
 
 def test_batch_upload_keeps_successful_files_when_one_file_is_invalid(
     tmp_path: Path,
+    client_factory,
 ) -> None:
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     knowledge_base = client.post(
         "/api/v1/knowledge-bases",
         json={"name": "批量文档", "summary_enabled": False},
@@ -670,9 +1246,11 @@ def test_batch_upload_keeps_successful_files_when_one_file_is_invalid(
     )
 
 
-def test_pdf_without_summary_does_not_require_llm(tmp_path: Path, monkeypatch) -> None:
+def test_pdf_without_summary_does_not_require_llm(
+    tmp_path: Path, monkeypatch, client_factory
+) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases",
@@ -708,14 +1286,17 @@ def test_pdf_without_summary_does_not_require_llm(tmp_path: Path, monkeypatch) -
     assert artifact["doc_description"] == ""
     assert "summary" not in artifact["structure"][0]
     assert artifact["heading_recovery"]["mode"] == "fallback"
-    assert artifact["structure"][0]["nodes"][0]["nodes"][0]["title"] == "1.1 盈利预测"
+    assert len(artifact["structure"]) == 1
+    assert not artifact["structure"][0].get("nodes")
+    assert "## 1.1 盈利预测" in artifact["structure"][0]["text"]
+    assert "这是 MinerU 解析后的完整内容。" in artifact["structure"][0]["text"]
 
 
 def test_missing_mineru_markdown_cleans_claim_directory(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", MissingMarkdownMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases",
@@ -744,10 +1325,10 @@ def test_missing_mineru_markdown_cleans_claim_directory(
 
 
 def test_mineru_resource_is_copied_and_rewritten_during_normalize(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", ResourceMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases",
@@ -791,10 +1372,10 @@ def test_mineru_resource_is_copied_and_rewritten_during_normalize(
 
 
 def test_pdf_heading_recovery_can_be_disabled_for_experiments(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases",
@@ -828,7 +1409,99 @@ def test_pdf_heading_recovery_can_be_disabled_for_experiments(
     assert "heading_recovery" not in artifact
 
 
-def test_pdf_heading_recovery_reuses_summary_llm(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("build_path", ["pipeline", "workspace"])
+@pytest.mark.parametrize("heading_recovery", [False, True])
+@pytest.mark.parametrize("folding", [False, True])
+@pytest.mark.parametrize("extension", [".pdf", ".doc", ".docx", ".md"])
+def test_document_heading_recovery_and_folding_are_independent(
+    tmp_path: Path,
+    monkeypatch,
+    build_path: str,
+    heading_recovery: bool,
+    folding: bool,
+    extension: str,
+) -> None:
+    from app.api_server.services.workspace_store import (
+        TreeBuildOptions,
+        WorkspaceArtifactStore,
+    )
+    from nianlun.indexing.tree.pipeline import structure_to_list
+
+    monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
+    with TestClient(create_app(_settings(tmp_path))) as client:
+        _configure_parser(client)
+        knowledge_base = client.post(
+            "/api/v1/knowledge-bases",
+            json={
+                "name": "标题修复与子树合并",
+                "summary_enabled": False,
+                "heading_recovery_enabled": heading_recovery,
+            },
+        ).json()["data"]
+        workspace = Path(knowledge_base["workspace_dir"])
+        WorkspaceArtifactStore.write_tree_build_options(
+            workspace,
+            TreeBuildOptions(
+                subtree_folding_enabled=folding,
+                min_subtree_tokens=1200 if folding else None,
+            ),
+        )
+        with zipfile.ZipFile(io.BytesIO(_result_zip())) as archive:
+            source = archive.read("result/full.md")
+        if build_path == "pipeline":
+            response = client.post(
+                f"/api/v1/knowledge-bases/{knowledge_base['id']}/documents",
+                files={
+                    "file": (
+                        f"report{extension}",
+                        source if extension == ".md" else _pdf_bytes(),
+                    )
+                },
+            )
+            assert response.status_code == 200
+            document_id = response.json()["data"]["document_id"]
+            for _ in range(200):
+                document = client.get(
+                    f"/api/v1/knowledge-bases/{knowledge_base['id']}"
+                    f"/documents/{document_id}"
+                ).json()["data"]
+                if document["status"] == "ready":
+                    break
+                time.sleep(0.01)
+            assert document["status"] == "ready"
+            artifact = client.app.state.services.documents._committed_workspace_view(
+                knowledge_base["id"]
+            ).load_document(document_id)
+        else:
+            markdown = tmp_path / "report.md"
+            markdown.write_bytes(source)
+            artifact = client.app.state.services.documents._build_workspace_document(
+                markdown,
+                {
+                    "knowledge_base_id": knowledge_base["id"],
+                    "parser": "markdown" if extension == ".md" else "mineru",
+                    "file_extension": extension,
+                    "original_filename": f"report{extension}",
+                },
+            )
+            assert markdown.read_bytes() == source
+
+        nodes = structure_to_list(artifact["structure"])
+        assert len(nodes) == (1 if folding else 4)
+        should_recover = heading_recovery and extension != ".md"
+        assert ("heading_recovery" in artifact) is should_recover
+        if should_recover and not folding:
+            chapter = artifact["structure"][0]["nodes"][0]
+            assert chapter["title"] == "1. 投资要点"
+            assert chapter["nodes"][0]["title"] == "1.1 盈利预测"
+        text = "\n".join(node["text"] for node in nodes)
+        for fragment in ["1. 投资要点", "1.1 盈利预测", "完整内容", "2. 风险提示"]:
+            assert fragment in text
+
+
+def test_pdf_heading_recovery_reuses_summary_llm(
+    tmp_path: Path, monkeypatch, client_factory
+) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
 
     class TrackingSummaryLLM(FakeSummaryLLM):
@@ -843,9 +1516,9 @@ def test_pdf_heading_recovery_reuses_summary_llm(tmp_path: Path, monkeypatch) ->
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: llm,
+        lambda _self, _profile_id=None, **_kwargs: llm,
     )
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases",
@@ -873,10 +1546,10 @@ def test_pdf_heading_recovery_reuses_summary_llm(tmp_path: Path, monkeypatch) ->
 
 
 def test_pdf_upload_returns_before_mineru_submission_finishes(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", SlowSubmissionMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases", json={"name": "异步提交"}
@@ -901,11 +1574,11 @@ def test_pdf_upload_returns_before_mineru_submission_finishes(
 
 
 def test_401_page_pdf_is_chunked_and_published_as_one_document(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     ChunkTrackingMineruClient.data_ids = []
     monkeypatch.setattr(ingestion_module, "MineruClient", ChunkTrackingMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases",
@@ -948,12 +1621,12 @@ def test_401_page_pdf_is_chunked_and_published_as_one_document(
 
 
 def test_legacy_unpartitioned_pdf_retry_starts_new_chunked_generation(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     ChunkTrackingMineruClient.data_ids = []
     monkeypatch.setattr(ingestion_module, "MineruClient", ChunkTrackingMineruClient)
     app = create_app(_settings(tmp_path))
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases",
@@ -1082,7 +1755,7 @@ def test_legacy_unpartitioned_pdf_retry_starts_new_chunked_generation(
 
 
 def test_empty_password_encrypted_pdf_succeeds_when_preflight_is_retried(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     monkeypatch.setattr(ingestion_module, "MineruClient", FakeMineruClient)
     actual_split_pdf = ingestion_module.split_pdf
@@ -1097,7 +1770,7 @@ def test_empty_password_encrypted_pdf_succeeds_when_preflight_is_retried(
 
     monkeypatch.setattr(ingestion_module, "split_pdf", reject_like_previous_version)
     app = create_app(_settings(tmp_path))
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases",
@@ -1150,9 +1823,10 @@ def test_empty_password_encrypted_pdf_succeeds_when_preflight_is_retried(
 
 
 def test_mineru_job_scheduling_is_atomic_and_submission_pool_stays_available(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     app = create_app(_settings(tmp_path))
+    client_factory(app)
     service = app.state.services.documents
     poll_started = threading.Event()
     release_poll = threading.Event()
@@ -1179,14 +1853,13 @@ def test_mineru_job_scheduling_is_atomic_and_submission_pool_stays_available(
     assert poll_calls == 1
 
     release_poll.set()
-    service.shutdown()
 
 
 def test_recover_repairs_missing_and_prematurely_completed_parse_tasks(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     app = create_app(_settings(tmp_path))
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "恢复测试"}
@@ -1247,7 +1920,7 @@ def test_recover_repairs_missing_and_prematurely_completed_parse_tasks(
 
 
 def test_recover_rebuilds_missing_pdf_chunks_in_current_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_factory
 ) -> None:
     settings = ApiServerSettings(
         data_dir=tmp_path / "api",
@@ -1257,7 +1930,7 @@ def test_recover_rebuilds_missing_pdf_chunks_in_current_generation(
         mineru_poll_interval_seconds=60,
     )
     app = create_app(settings)
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "缺失分段恢复"}
@@ -1322,11 +1995,10 @@ def test_recover_rebuilds_missing_pdf_chunks_in_current_generation(
     assert [task["chunk_index"] for task in tasks] == [0, 1]
     assert tasks[1]["chunk_count"] == 2
     assert scheduled == [tasks[1]["id"]]
-    service.shutdown()
 
 
 def test_recover_uses_persisted_pdf_plan_after_chunk_setting_changes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_factory
 ) -> None:
     settings = ApiServerSettings(
         data_dir=tmp_path / "api",
@@ -1336,7 +2008,7 @@ def test_recover_uses_persisted_pdf_plan_after_chunk_setting_changes(
         mineru_poll_interval_seconds=60,
     )
     app = create_app(settings)
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "固定分段计划"}
@@ -1379,22 +2051,29 @@ def test_recover_uses_persisted_pdf_plan_after_chunk_setting_changes(
         return task
 
     monkeypatch.setattr(service, "_schedule_task_submission", lambda _task_id: None)
-    monkeypatch.setattr(service.repository, "create_parse_task", interrupt_after_first_task)
+    monkeypatch.setattr(
+        service.repository, "create_parse_task", interrupt_after_first_task
+    )
 
     with pytest.raises(SystemExit, match="simulated process exit"):
-        service._prepare_parse_tasks(document_id, service.models.parser_runtime_config())
+        service._prepare_parse_tasks(
+            document_id, service.models.parser_runtime_config()
+        )
 
     partial = service.repository.list_parse_tasks(document_id, 1)
     assert [task["chunk_index"] for task in partial] == [0]
     stored = service.repository.get_document(knowledge_base["id"], document_id)
     assert stored is not None
     assert len(json.loads(str(stored["parse_plan_json"]))["chunks"]) == 2
-    assert len(
-        service._load_pdf_chunk_plan(
-            stored, Path(knowledge_base["workspace_dir"]), 1
+    assert (
+        len(
+            service._load_pdf_chunk_plan(
+                stored, Path(knowledge_base["workspace_dir"]), 1
+            )
+            or []
         )
-        or []
-    ) == 2
+        == 2
+    )
 
     monkeypatch.setattr(service.repository, "create_parse_task", create_task)
     service.settings = replace(settings, pdf_chunk_max_pages=2)
@@ -1413,11 +2092,10 @@ def test_recover_uses_persisted_pdf_plan_after_chunk_setting_changes(
     assert [
         (task["source_page_start"], task["source_page_end"]) for task in recovered
     ] == [(1, 1), (2, 2)]
-    service.shutdown()
 
 
 def test_recovery_requires_new_generation_for_legacy_partial_plan_config_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_factory
 ) -> None:
     settings = ApiServerSettings(
         data_dir=tmp_path / "api",
@@ -1427,7 +2105,7 @@ def test_recovery_requires_new_generation_for_legacy_partial_plan_config_mismatc
         mineru_poll_interval_seconds=60,
     )
     app = create_app(settings)
-    client = TestClient(app)
+    client = client_factory(app)
     _configure_parser(client)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "旧计划配置冲突"}
@@ -1508,11 +2186,10 @@ def test_recovery_requires_new_generation_for_legacy_partial_plan_config_mismatc
     regenerated = service.repository.list_parse_tasks(document_id, 2)
     assert [task["chunk_index"] for task in regenerated] == [0]
     assert regenerated[0]["chunk_count"] == 1
-    service.shutdown()
 
 
 def test_result_download_lease_heartbeat_keeps_claim_alive(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_factory
 ) -> None:
     settings = ApiServerSettings(
         data_dir=tmp_path / "api",
@@ -1522,7 +2199,7 @@ def test_result_download_lease_heartbeat_keeps_claim_alive(
         pipeline_lease_seconds=1,
     )
     app = create_app(settings)
-    client = TestClient(app)
+    client = client_factory(app)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "下载租约续期"}
     ).json()["data"]
@@ -1535,7 +2212,9 @@ def test_result_download_lease_heartbeat_keeps_claim_alive(
         return clock["value"].isoformat()
 
     def fake_after(seconds: float) -> str:
-        return (clock["value"] + ingestion_module.timedelta(seconds=seconds)).isoformat()
+        return (
+            clock["value"] + ingestion_module.timedelta(seconds=seconds)
+        ).isoformat()
 
     monkeypatch.setattr(ingestion_module, "_now", fake_now)
     monkeypatch.setattr(ingestion_module, "_after", fake_after)
@@ -1617,7 +2296,9 @@ def test_result_download_lease_heartbeat_keeps_claim_alive(
     )
     monkeypatch.setattr(service, "_parse_lease_maintenance_interval", lambda: 0.01)
 
-    persisted = service._persist_result(task, "https://result.invalid/file.zip", SlowClient())
+    persisted = service._persist_result(
+        task, "https://result.invalid/file.zip", SlowClient()
+    )
 
     assert SlowClient.downloads == 1
     assert len(renewals) > 1
@@ -1633,7 +2314,6 @@ def test_result_download_lease_heartbeat_keeps_claim_alive(
         },
         release=True,
     )
-    service.shutdown()
 
 
 def test_recover_requeues_normalization_after_completed_parse_handoff_gap(
@@ -1736,9 +2416,10 @@ def test_markdown_requeue_skips_already_published_document() -> None:
 
 def test_workspace_recovery_materializes_markdown_before_index_recovery(
     tmp_path: Path,
+    client_factory,
 ) -> None:
     app = create_app(_settings(tmp_path))
-    client = TestClient(app)
+    client = client_factory(app)
     knowledge_base = client.post(
         "/api/v1/knowledge-bases", json={"name": "Markdown 恢复"}
     ).json()["data"]
@@ -1790,9 +2471,11 @@ def test_workspace_recovery_materializes_markdown_before_index_recovery(
     assert document["fts_indexed_version"] is None
 
 
-def test_concurrent_same_markdown_upload_creates_one_document(tmp_path: Path) -> None:
+def test_concurrent_same_markdown_upload_creates_one_document(
+    tmp_path: Path, client_factory
+) -> None:
     app = create_app(_settings(tmp_path))
-    client = TestClient(app)
+    client = client_factory(app)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases",
         json={"name": "并发去重", "summary_enabled": False},
@@ -1815,13 +2498,13 @@ def test_concurrent_same_markdown_upload_creates_one_document(tmp_path: Path) ->
 
 
 def test_failed_pdf_can_be_retried_without_uploading_again(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, client_factory
 ) -> None:
     RetryMineruClient.submit_count = 0
     RetryMineruClient.poll_count = 0
     RetryMineruClient.submissions_by_data_id = {}
     monkeypatch.setattr(ingestion_module, "MineruClient", RetryMineruClient)
-    client = TestClient(create_app(_settings(tmp_path)))
+    client = client_factory(create_app(_settings(tmp_path)))
     _configure_parser(client)
     knowledge_base_id = client.post(
         "/api/v1/knowledge-bases", json={"name": "解析重试", "summary_enabled": False}

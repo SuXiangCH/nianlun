@@ -2,8 +2,12 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import type { ChangeEvent, DragEvent, FormEvent, KeyboardEvent } from "react";
 import { ArrowLeft, BookOpen, Eye, MoreHorizontal, Plus, RefreshCw, Search, Settings2, Upload, X } from "lucide-react";
 import { Modal } from "../../components/Modal";
-import type { DocumentIndexTree, KnowledgeBase, KnowledgeBaseDocument, ModelProfile } from "../../types";
+import { ReasoningEffortSelect } from "../../components/ReasoningEffortSelect";
+import type { DocumentIndexTree, DocumentPreview, KnowledgeBase, KnowledgeBaseDocument, KnowledgeBaseParserOptions, KnowledgeBaseTreeBuildOptions, ModelProfile, ReasoningEffortOverride } from "../../types";
 import { DocumentReader } from "./DocumentReader";
+import { TreeBuildSettings } from "./TreeBuildSettings";
+import { ParserSettings } from "./ParserSettings";
+import { ReparseDocumentDialog } from "./ReparseDocumentDialog";
 
 interface Props {
   items: KnowledgeBase[];
@@ -22,14 +26,18 @@ interface Props {
   onRebuildVector: (knowledgeBaseId: string) => Promise<void>;
   onUpdateSummary: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
   onUpdateHeadingRecovery: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
+  onUpdateTreeBuildOptions: (knowledgeBaseId: string, options: KnowledgeBaseTreeBuildOptions) => Promise<void>;
+  onUpdateParserOptions: (knowledgeBaseId: string, options: KnowledgeBaseParserOptions) => Promise<void>;
   onUpdateLlmModel: (knowledgeBaseId: string, modelId: string | null) => Promise<void>;
+  onUpdateReasoningEffort: (knowledgeBaseId: string, effort: ReasoningEffortOverride) => Promise<void>;
   onUpdateName: (knowledgeBaseId: string, name: string) => Promise<void>;
   onUpdateEmbeddingModel: (knowledgeBaseId: string, modelId: string) => Promise<void>;
   onUpdateVectorEnabled: (knowledgeBaseId: string, enabled: boolean) => Promise<void>;
   onDeleteDocument: (knowledgeBaseId: string, documentId: string) => Promise<void>;
   onRetryDocument: (knowledgeBaseId: string, documentId: string) => Promise<void>;
+  onReparseDocument: (knowledgeBaseId: string, documentId: string, isOcr: boolean | null) => Promise<void>;
   onDeleteKnowledgeBase: (knowledgeBaseId: string) => Promise<void>;
-  onReadContent: (knowledgeBaseId: string, documentId: string) => Promise<string>;
+  onReadContent: (knowledgeBaseId: string, documentId: string) => Promise<DocumentPreview>;
   onReadTree: (knowledgeBaseId: string, documentId: string) => Promise<DocumentIndexTree>;
 }
 
@@ -93,18 +101,22 @@ export function KnowledgeBaseView({
   onRebuildVector,
   onUpdateSummary,
   onUpdateHeadingRecovery,
+  onUpdateTreeBuildOptions,
+  onUpdateParserOptions,
   onUpdateLlmModel,
+  onUpdateReasoningEffort,
   onUpdateName,
   onUpdateEmbeddingModel,
   onUpdateVectorEnabled,
   onDeleteDocument,
   onRetryDocument,
+  onReparseDocument,
   onDeleteKnowledgeBase,
   onReadContent,
   onReadTree,
 }: Props) {
   const [contentDocumentId, setContentDocumentId] = useState<string | null>(null);
-  const [content, setContent] = useState<string | null>(null);
+  const [preview, setPreview] = useState<DocumentPreview | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
   const [contentError, setContentError] = useState<string | null>(null);
   const [tree, setTree] = useState<DocumentIndexTree | null>(null);
@@ -114,6 +126,8 @@ export function KnowledgeBaseView({
   const [headingRecoverySaving, setHeadingRecoverySaving] = useState(false);
   const [llmSaving, setLlmSaving] = useState(false);
   const [llmError, setLlmError] = useState<string | null>(null);
+  const [reasoningSaving, setReasoningSaving] = useState(false);
+  const [reasoningError, setReasoningError] = useState<string | null>(null);
   const [editingItem, setEditingItem] = useState<KnowledgeBase | null>(null);
   const [nameSaving, setNameSaving] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
@@ -121,20 +135,40 @@ export function KnowledgeBaseView({
   const [query, setQuery] = useState("");
   const [documentQuery, setDocumentQuery] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [parserSaving, setParserSaving] = useState(false);
   const [retryingDocumentId, setRetryingDocumentId] = useState<string | null>(null);
+  const [reparseDocument, setReparseDocument] = useState<KnowledgeBaseDocument | null>(null);
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null);
   const [queuedFiles, setQueuedFiles] = useState<File[]>([]);
   const [uploadProgress, setUploadProgress] = useState<{ loaded: number; total: number } | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const uploadAbort = useRef<AbortController | null>(null);
   const contentRequestVersion = useRef(0);
+  const parserSavePending = useRef(false);
   const selected = items.find((item) => item.id === selectedId);
   useEffect(() => {
     setDocumentQuery("");
     setSettingsOpen(false);
     setOpenMenuId(null);
     setLlmError(null);
+    setReasoningError(null);
+    setReparseDocument(null);
   }, [selectedId]);
+  const closeSettings = () => {
+    if (!parserSavePending.current) setSettingsOpen(false);
+  };
+  const saveParserOptions = async (options: KnowledgeBaseParserOptions) => {
+    if (!selected) return;
+    // Language blur can start a save before the closing click in the same event batch.
+    parserSavePending.current = true;
+    setParserSaving(true);
+    try {
+      await onUpdateParserOptions(selected.id, options);
+    } finally {
+      parserSavePending.current = false;
+      setParserSaving(false);
+    }
+  };
   const openUpload = (id: string) => {
     setUploadTargetId(id);
     setQueuedFiles([]);
@@ -204,7 +238,7 @@ export function KnowledgeBaseView({
     if (!selected) return;
     const requestVersion = ++contentRequestVersion.current;
     setContentDocumentId(documentId);
-    setContent(null);
+    setPreview(null);
     setContentError(null);
     setContentLoading(true);
     setTree(null);
@@ -220,7 +254,7 @@ export function KnowledgeBaseView({
     });
     try {
       const nextContent = await onReadContent(selected.id, documentId);
-      if (requestVersion === contentRequestVersion.current) setContent(nextContent);
+      if (requestVersion === contentRequestVersion.current) setPreview(nextContent);
     } catch (error) {
       if (requestVersion === contentRequestVersion.current) setContentError(error instanceof Error ? error.message : "无法读取解析内容");
     } finally {
@@ -230,7 +264,7 @@ export function KnowledgeBaseView({
   const closeContent = () => {
     ++contentRequestVersion.current;
     setContentDocumentId(null);
-    setContent(null);
+    setPreview(null);
     setContentError(null);
     setTree(null);
     setTreeError(null);
@@ -273,6 +307,18 @@ export function KnowledgeBaseView({
       setLlmError(error instanceof Error ? error.message : "LLM 模型切换失败");
     } finally {
       setLlmSaving(false);
+    }
+  };
+  const changeReasoningEffort = async (value: ReasoningEffortOverride) => {
+    if (!selected || reasoningSaving || value === (selected.reasoning_effort ?? "inherit")) return;
+    setReasoningSaving(true);
+    setReasoningError(null);
+    try {
+      await onUpdateReasoningEffort(selected.id, value);
+    } catch (error) {
+      setReasoningError(error instanceof Error ? error.message : "思考程度保存失败");
+    } finally {
+      setReasoningSaving(false);
     }
   };
   const toggleSummary = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -348,17 +394,22 @@ export function KnowledgeBaseView({
           <label className="knowledge-search"><Search size={16} aria-hidden="true" /><input aria-label="搜索文档" placeholder="搜索文档" value={documentQuery} onChange={(event) => setDocumentQuery(event.target.value)} /></label>
           <button className="icon-button" onClick={() => onLoadDocuments(selected.id)} type="button" title="刷新文档" aria-label="刷新文档" disabled={documentsLoading}><RefreshCw size={16} className={documentsLoading ? "knowledge-spinning" : undefined} /></button>
         </div>
-        {settingsOpen && <Modal title="知识库设置" description="" onClose={() => setSettingsOpen(false)}><div className="knowledge-settings">
+        {settingsOpen && <Modal title="知识库设置" description="" onClose={closeSettings}><div className="knowledge-settings">
           <section><h3>检索索引</h3><div className="knowledge-setting-row"><span>全文索引</span><button className="outline-button" onClick={() => confirmRebuild(selected)} type="button" disabled={selected.fts_status === "pending" || selected.fts_status === "building"}>{ftsReady(selected) ? "重建全文索引" : "构建全文索引"}</button></div>
             <label className="field detail-vector-model"><span>Embedding 模型</span><select value={selected.embedding_model_id || ""} onChange={(event) => changeEmbeddingModel(event.target.value)}><option value="" disabled>请选择 Embedding 模型</option>{embeddingModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
             <div className="knowledge-setting-row"><label className="switch-control detail-vector-switch"><input type="checkbox" checked={selected.vector_enabled} disabled={!selected.embedding_model_id} onChange={(event) => void onUpdateVectorEnabled(selected.id, event.target.checked)} /><span>向量检索</span></label><button className="outline-button" onClick={() => confirmVectorRebuild(selected)} type="button" disabled={!selected.vector_enabled || !selected.embedding_model_id || selected.vector_status === "pending" || selected.vector_status === "building"}>{hasVectorIndex(selected) ? "重建向量索引" : "构建向量索引"}</button></div>
           </section>
+          <ParserSettings key={selected.id} options={selected.parser_options} onSave={saveParserOptions} />
           <section><h3>文档处理</h3>
+            <label className="field detail-vector-model"><span>思考程度</span><ReasoningEffortSelect override aria-label="思考程度" value={selected.reasoning_effort ?? "inherit"} disabled={reasoningSaving} aria-busy={reasoningSaving} onChange={(event) => void changeReasoningEffort(event.target.value as ReasoningEffortOverride)} /></label>
+            {reasoningError && <p className="error-text" role="alert">{reasoningError}</p>}
             <label className="field detail-vector-model"><span>LLM 模型</span><select aria-label="LLM 模型" value={selected.llm_model_id || ""} disabled={llmSaving} aria-busy={llmSaving} onChange={(event) => void changeLlmModel(event.target.value)}><option value="">跟随系统默认 · {defaultLlm ? modelLabel(defaultLlm) : "未配置"}</option>{selected.llm_model_id && !llmModels.some((profile) => profile.id === selected.llm_model_id) && <option value={selected.llm_model_id} disabled>模型不可用</option>}{llmModels.map((profile) => <option key={profile.id} value={profile.id}>{modelLabel(profile)}</option>)}</select></label>
             {llmError && <div className="document-content-state is-error" role="alert">{llmError}</div>}
-            <label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>生成摘要</span></label><label className="switch-control detail-heading-recovery-switch" title="仅影响之后上传的 MinerU PDF"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>修复 PDF 标题</span></label></section>
-          <div className="modal-actions"><button className="primary-button" type="button" onClick={() => setSettingsOpen(false)}>完成</button></div>
+            <label className="switch-control detail-summary-switch"><input type="checkbox" checked={selected.summary_enabled} disabled={summarySaving} onChange={(event) => void toggleSummary(event)} /><span>生成摘要</span></label><label className="switch-control detail-heading-recovery-switch" title="适用于 MinerU 解析的 PDF、Word，已有文档需重新处理后生效"><input type="checkbox" checked={selected.heading_recovery_enabled} disabled={headingRecoverySaving} onChange={(event) => void toggleHeadingRecovery(event)} /><span>修复标题层级</span></label>
+            <TreeBuildSettings key={selected.id} knowledgeBase={selected} onSave={(options) => onUpdateTreeBuildOptions(selected.id, options)} /></section>
+          <div className="modal-actions"><button className="primary-button" type="button" disabled={parserSaving} onClick={closeSettings}>完成</button></div>
         </div></Modal>}
+        {reparseDocument && <ReparseDocumentDialog key={reparseDocument.id} document={reparseDocument} onClose={() => setReparseDocument(null)} onReparse={(isOcr) => onReparseDocument(selected.id, reparseDocument.id, isOcr)} />}
         {(selected.vector_status === "pending" || selected.vector_status === "building") && <div className="document-content-state">向量索引进度：{vectorProgressLabel(selected)}</div>}
         {selected.vector_error && <div className="document-content-state is-error" role="alert">向量索引：{selected.vector_error}</div>}
         {selected.fts_error && <div className="document-content-state is-error" role="alert">全文索引：{selected.fts_error}</div>}
@@ -369,12 +420,16 @@ export function KnowledgeBaseView({
               <Fragment key={document.id}>
                 <article className="document-row">
                   <div className="document-row-main"><div className="document-file-icon" aria-hidden="true">{document.file_extension === ".pdf" ? "PDF" : document.file_extension === ".doc" || document.file_extension === ".docx" ? "DOC" : "MD"}</div><div className="document-row-copy"><strong title={document.original_filename}>{document.original_filename}</strong><span>{formatBytes(document.size_bytes)}</span>{document.error_message && <small>{document.error_message}</small>}</div></div>
-                  <div className="document-row-meta"><span className={`knowledge-status ${document.status === "ready" ? "ready" : document.status === "failed" ? "error" : "indexing"}`}>{document.status === "ready" ? "可用" : documentStageLabel(document)}</span>{document.status !== "ready" && documentProgressLabel(document) && <span>{documentProgressLabel(document)}</span>}{document.warnings.length > 0 && <span>{document.warnings.length} 条警告</span>}{Boolean(document.published_content_version) && document.status !== "failed" && <button className="icon-button" type="button" title="查看解析内容" aria-label={`查看 ${document.original_filename}`} onClick={() => void openContent(document.id)}><Eye size={17} /><span className="knowledge-sr-only">查看解析内容</span></button>}{document.status === "failed" && <button className="outline-button" type="button" disabled={retryingDocumentId !== null} onClick={async () => { setRetryingDocumentId(document.id); try { await onRetryDocument(selected.id, document.id); } finally { setRetryingDocumentId(null); } }}>{retryingDocumentId === document.id ? "重试中..." : `重试${document.failed_stage ? ({ parse: "解析", normalize: "规范化", enrich: "增强", index: "索引" }[document.failed_stage]) : "处理"}`}</button>}<div className="kb-card-menu"><button className="icon-button" type="button" title="更多操作" aria-label={`${document.original_filename}的更多操作`} aria-haspopup="menu" aria-expanded={openMenuId === `document:${document.id}`} onClick={() => setOpenMenuId(openMenuId === `document:${document.id}` ? null : `document:${document.id}`)}><MoreHorizontal size={18} /></button>{openMenuId === `document:${document.id}` && <div className="kb-card-menu-popover" role="menu"><button className="kb-card-menu-item is-danger" role="menuitem" type="button" onClick={() => { setOpenMenuId(null); void onDeleteDocument(selected.id, document.id); }}>删除文档</button></div>}</div></div>
+                  <div className="document-row-meta"><span className={`knowledge-status ${document.status === "ready" ? "ready" : document.status === "failed" ? "error" : "indexing"}`}>{document.status === "ready" ? "可用" : documentStageLabel(document)}</span>{document.status !== "ready" && documentProgressLabel(document) && <span>{documentProgressLabel(document)}</span>}{document.warnings.length > 0 && <span>{document.warnings.length} 条警告</span>}{Boolean(document.published_content_version) && document.status !== "failed" && <button className="icon-button" type="button" title="查看解析内容" aria-label={`查看 ${document.original_filename}`} onClick={() => void openContent(document.id)}><Eye size={17} /><span className="knowledge-sr-only">查看解析内容</span></button>}{document.status === "failed" && <button className="outline-button" type="button" disabled={retryingDocumentId !== null} onClick={async () => { setRetryingDocumentId(document.id); try { await onRetryDocument(selected.id, document.id); } finally { setRetryingDocumentId(null); } }}>{retryingDocumentId === document.id ? "重试中..." : `重试${document.failed_stage ? ({ parse: "解析", normalize: "规范化", enrich: "增强", index: "索引" }[document.failed_stage]) : "处理"}`}</button>}<div className="kb-card-menu"><button className="icon-button" type="button" title="更多操作" aria-label={`${document.original_filename}的更多操作`} aria-haspopup="menu" aria-expanded={openMenuId === `document:${document.id}`} onClick={() => setOpenMenuId(openMenuId === `document:${document.id}` ? null : `document:${document.id}`)}><MoreHorizontal size={18} /></button>{openMenuId === `document:${document.id}` && <div className="kb-card-menu-popover" role="menu">
+                    {document.parser === "mineru" && (document.status === "ready" || document.status === "failed") && <button className="kb-card-menu-item" role="menuitem" type="button" onClick={() => { setOpenMenuId(null); setReparseDocument(document); }}>重新解析</button>}
+                    <button className="kb-card-menu-item is-danger" role="menuitem" type="button" onClick={() => { setOpenMenuId(null); void onDeleteDocument(selected.id, document.id); }}>删除文档</button></div>}</div></div>
                 </article>
                 {contentDocumentId === document.id && (
                   <DocumentReader
                     title={document.original_filename}
-                    content={content}
+                    content={preview?.content ?? null}
+                    renderedContent={preview?.rendered_content}
+                    images={preview?.images}
                     contentLoading={contentLoading}
                     contentError={contentError}
                     tree={tree}

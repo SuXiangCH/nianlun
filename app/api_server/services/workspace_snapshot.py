@@ -21,15 +21,22 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from nianlun.agent.contracts import AnswerImagePolicy
 
 from app.api_server.services.workspace_store import WorkspaceArtifactStore
+from app.api_server.services.documents.image_catalog import (
+    ImageCatalog,
+    catalog_bundle_digest,
+    build_image_catalog,
+    stage_image_catalog,
+)
 from nianlun.knowledgebase.workspace_view import workspace_snapshot_registry
 
 if TYPE_CHECKING:
     from app.api_server.repositories import SQLiteMetadataRepository
 
 
-SNAPSHOT_SCHEMA_VERSION = 2
+SNAPSHOT_SCHEMA_VERSION = 3
 SNAPSHOT_DIRNAME = "snapshots"
 MANIFEST_FILENAME = "manifest.json"
 
@@ -76,6 +83,7 @@ class SnapshotDocumentEntry(BaseModel):
     content_relpath: str | None = None
     page_map_relpath: str | None = None
     source_relpath: str | None = None
+    image_catalog_relpath: str | None = None
     generation: int = Field(ge=1)
     # Reader-summary fields so KnowledgeBase meta can be built without touching
     # every artifact (§7.7 mandates the first five; these are additive).
@@ -90,7 +98,7 @@ class WorkspaceSnapshotManifest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = Field(ge=2, le=2)
+    schema_version: int = Field(ge=2, le=3)
     knowledge_base_id: str = Field(min_length=1)
     content_version: int = Field(ge=0)
     documents: list[SnapshotDocumentEntry]
@@ -139,14 +147,23 @@ def build_manifest(
     content_version: int,
     documents: Sequence[SnapshotDocumentEntry],
     artifact_files: Iterable[SnapshotArtifactFile],
+    *,
+    workspace: Path | None = None,
+    current_manifest: WorkspaceSnapshotManifest | None = None,
 ) -> WorkspaceSnapshotManifest:
     if len(documents) > MAX_MANIFEST_DOCUMENTS:
-        raise SnapshotError(f"manifest 文档数超限: {len(documents)}")
+        raise SnapshotError(
+            f"manifest documents budget current={len(current_manifest.documents) if current_manifest else 0} candidate={len(documents)} limit={MAX_MANIFEST_DOCUMENTS}"
+        )
     files: dict[str, SnapshotArtifactFile] = {}
     for item in artifact_files:
-        files.setdefault(item.relpath, item)
+        if item.relpath in files and files[item.relpath] != item:
+            raise SnapshotError(f"manifest artifact 记录冲突: {item.relpath}")
+        files[item.relpath] = item
     if len(files) > MAX_MANIFEST_FILES:
-        raise SnapshotError(f"manifest 文件数超限: {len(files)}")
+        raise SnapshotError(
+            f"manifest files budget current={len(current_manifest.artifact_files) if current_manifest else 0} candidate={len(files)} limit={MAX_MANIFEST_FILES}"
+        )
     manifest = WorkspaceSnapshotManifest(
         schema_version=SNAPSHOT_SCHEMA_VERSION,
         knowledge_base_id=knowledge_base_id,
@@ -164,6 +181,7 @@ def build_manifest(
             entry.content_relpath,
             entry.page_map_relpath,
             entry.source_relpath,
+            entry.image_catalog_relpath,
         ):
             if optional is not None:
                 _require_confined_relpath(optional)
@@ -179,15 +197,91 @@ def build_manifest(
             entry.content_relpath,
             entry.page_map_relpath,
             entry.source_relpath,
+            entry.image_catalog_relpath,
         )
         if relpath is not None and relpath not in files
     }
     if missing:
         raise SnapshotError(f"manifest 缺少 artifact file 记录: {sorted(missing)!r}")
+    if workspace is None and any(entry.image_catalog_relpath for entry in documents):
+        raise SnapshotError("图片目录资源闭包校验需要 workspace")
+    if workspace is not None:
+        for entry in documents:
+            document_resource_closure(workspace, entry, files)
     payload = manifest_json_bytes(manifest)
     if len(payload) > MAX_MANIFEST_BYTES:
-        raise SnapshotError(f"manifest 序列化过大: {len(payload)} 字节")
+        raise SnapshotError(
+            f"manifest bytes budget current={len(manifest_json_bytes(current_manifest)) if current_manifest else 0} candidate={len(payload)} limit={MAX_MANIFEST_BYTES}"
+        )
     return manifest
+
+
+def document_resource_closure(
+    workspace: Path,
+    entry: SnapshotDocumentEntry,
+    records: Mapping[str, SnapshotArtifactFile],
+) -> dict[str, SnapshotArtifactFile]:
+    """Validate and enumerate direct artifacts and catalog-owned image assets."""
+    closure: dict[str, SnapshotArtifactFile] = {}
+
+    def include(relpath: str) -> bytes:
+        _require_confined_relpath(relpath)
+        expected = records.get(relpath)
+        if expected is None:
+            raise SnapshotError(f"manifest 缺少 artifact file 记录: {relpath}")
+        actual = file_record(workspace, relpath)
+        if actual != expected:
+            raise SnapshotError(f"snapshot artifact hash/size 不匹配: {relpath}")
+        closure[relpath] = expected
+        return resolve_confined(workspace, relpath).read_bytes()
+
+    for relpath in (
+        entry.index_relpath,
+        entry.content_relpath,
+        entry.page_map_relpath,
+        entry.source_relpath,
+    ):
+        if relpath is not None:
+            include(relpath)
+    if entry.image_catalog_relpath is not None:
+        raw = include(entry.image_catalog_relpath)
+        try:
+            catalog = ImageCatalog.model_validate_json(raw)
+        except ValidationError as exc:
+            raise SnapshotError(
+                f"图片目录格式无效: {entry.image_catalog_relpath}"
+            ) from exc
+        if (
+            catalog.document_id != entry.document_id
+            or catalog.generation != entry.generation
+        ):
+            raise SnapshotError("图片目录 document/generation 不匹配")
+        digest = catalog_bundle_digest(
+            [item.model_dump() for item in catalog.entries], catalog.unavailable
+        )
+        if digest != catalog.bundle_digest:
+            raise SnapshotError("图片目录 bundle digest 不匹配")
+        bundle_root = Path(entry.image_catalog_relpath).parent
+        expected_root = (
+            Path("artifacts")
+            / entry.document_id
+            / f"g{entry.generation}"
+            / "image_catalogs"
+            / "v1"
+            / catalog.bundle_digest
+        )
+        if bundle_root != expected_root:
+            raise SnapshotError("图片目录 bundle 路径不匹配")
+        for image in catalog.entries:
+            if Path(image.asset_relpath).parent != bundle_root / "assets":
+                raise SnapshotError("图片资源不属于目录 bundle")
+            raw = include(image.asset_relpath)
+            if (
+                len(raw) != image.size_bytes
+                or hashlib.sha256(raw).hexdigest() != image.sha256
+            ):
+                raise SnapshotError(f"图片资源 hash/size 不匹配: {image.asset_relpath}")
+    return closure
 
 
 def _require_confined_relpath(relpath: str) -> None:
@@ -252,15 +346,15 @@ def quarantine_uncommitted_snapshot(
 ) -> None:
     """Free a version slot when SQLite did not commit its promoted snapshot."""
     try:
-        committed = repository.get_committed_revision(knowledge_base_id, content_version)
+        committed = repository.get_committed_revision(
+            knowledge_base_id, content_version
+        )
         if committed is not None:
             return
         final = workspace / SNAPSHOT_DIRNAME / f"r{content_version}"
         if not final.is_dir():
             return
-        orphan = final.with_name(
-            f".orphan-r{content_version}-{uuid.uuid4().hex[:8]}"
-        )
+        orphan = final.with_name(f".orphan-r{content_version}-{uuid.uuid4().hex[:8]}")
         final.replace(orphan)
         logger.warning(
             "snapshot.uncommitted_quarantined knowledge_base_id=%s content_version=%s",
@@ -290,9 +384,7 @@ def quarantine_untracked_snapshots(
         match = _REVISION_DIR.fullmatch(child.name)
         if match is None or int(match.group(1)) in valid or not child.is_dir():
             continue
-        orphan = child.with_name(
-            f".orphan-{child.name}-{uuid.uuid4().hex[:8]}"
-        )
+        orphan = child.with_name(f".orphan-{child.name}-{uuid.uuid4().hex[:8]}")
         try:
             child.replace(orphan)
         except OSError:
@@ -308,7 +400,7 @@ def _parse_manifest_bytes(payload: bytes) -> WorkspaceSnapshotManifest:
         manifest = WorkspaceSnapshotManifest.model_validate_json(payload)
     except ValidationError as exc:
         raise SnapshotError(f"manifest 格式无效: {exc}") from exc
-    if manifest.schema_version != SNAPSHOT_SCHEMA_VERSION:
+    if manifest.schema_version not in {2, SNAPSHOT_SCHEMA_VERSION}:
         raise SnapshotError(f"manifest schema 版本不支持: {manifest.schema_version}")
     return manifest
 
@@ -512,6 +604,7 @@ def publish_document_snapshot(
     document_values: dict[str, Any] | None = None,
     tree_content: bytes | None = None,
     enrichment_completion: dict[str, Any] | None = None,
+    image_policy: AnswerImagePolicy = AnswerImagePolicy(),
 ) -> int:
     """Publish one document artifact bundle and atomically advance SQLite."""
     knowledge_base = repository.get("knowledge_bases", knowledge_base_id)
@@ -548,12 +641,31 @@ def publish_document_snapshot(
     )
     tree_relpath = immutable["tree.json"]
     content_relpath = immutable["full.md"]
+    image_catalog_build = build_image_catalog(
+        workspace,
+        document_id,
+        generation,
+        content,
+        tree_payload,
+        max_bytes=image_policy.max_image_bytes,
+        max_pixels=image_policy.max_image_pixels,
+    )
+    if image_catalog_build.catalog is not None:
+        stage_image_catalog(workspace, image_catalog_build.files)
+    image_catalog_relpath = (
+        next(
+            path for path in image_catalog_build.files if path.endswith("/images.json")
+        )
+        if image_catalog_build.catalog is not None
+        else None
+    )
     entry = SnapshotDocumentEntry(
         document_id=document_id,
         index_relpath=tree_relpath,
         content_relpath=content_relpath,
         page_map_relpath=page_map_relpath,
         source_relpath=source_relpath,
+        image_catalog_relpath=image_catalog_relpath,
         generation=generation,
         doc_name=str(tree_payload.get("doc_name") or "unknown"),
         doc_description=str(tree_payload.get("doc_description") or ""),
@@ -567,33 +679,29 @@ def publish_document_snapshot(
         if item.document_id != document_id
     }
     entries[document_id] = entry
-    referenced = {
-        relpath
-        for item in entries.values()
-        for relpath in (
-            item.index_relpath,
-            item.content_relpath,
-            item.page_map_relpath,
-            item.source_relpath,
-        )
-        if relpath is not None
-    }
-    old_files = {
-        item.relpath: item
-        for item in current_manifest.artifact_files
-        if item.relpath in referenced
-    }
+    current_files = {item.relpath: item for item in current_manifest.artifact_files}
+    old_files: dict[str, SnapshotArtifactFile] = {}
+    for retained in entries.values():
+        if retained.document_id != document_id:
+            old_files.update(
+                document_resource_closure(workspace, retained, current_files)
+            )
     old_files[tree_relpath] = file_record(workspace, tree_relpath)
     old_files[content_relpath] = file_record(workspace, content_relpath)
     old_files[source_relpath] = file_record(workspace, source_relpath)
     if page_map_relpath is not None:
         old_files[page_map_relpath] = file_record(workspace, page_map_relpath)
+    if image_catalog_relpath is not None:
+        for relpath in image_catalog_build.files:
+            old_files[relpath] = file_record(workspace, relpath)
     next_version = current_version + 1
     manifest = build_manifest(
         knowledge_base_id,
         next_version,
         list(entries.values()),
         old_files.values(),
+        workspace=workspace,
+        current_manifest=current_manifest,
     )
     staging, manifest_sha256 = stage_manifest(workspace, manifest)
     try:
@@ -626,6 +734,25 @@ def publish_document_snapshot(
             "sha256": hashlib.sha256(content).hexdigest(),
         },
     ]
+    if image_catalog_relpath is not None:
+        published_closure = document_resource_closure(workspace, entry, old_files)
+        for relpath in published_closure:
+            if relpath not in image_catalog_build.files:
+                continue
+            record = published_closure[relpath]
+            artifact_rows.append(
+                {
+                    "kind": "image_catalog"
+                    if relpath.endswith("/images.json")
+                    else "image_asset",
+                    "relpath": relpath,
+                    "mime_type": "application/json"
+                    if relpath.endswith("/images.json")
+                    else "application/octet-stream",
+                    "size_bytes": record.size_bytes,
+                    "sha256": record.sha256,
+                }
+            )
     try:
         revision = repository.publish_document_revision(
             knowledge_base_id=knowledge_base_id,
@@ -687,22 +814,19 @@ def publish_document_deletion_snapshot(
     entries = [
         item for item in current_manifest.documents if item.document_id != document_id
     ]
-    referenced = {
-        relpath
-        for item in entries
-        for relpath in (
-            item.index_relpath,
-            item.content_relpath,
-            item.page_map_relpath,
-            item.source_relpath,
-        )
-        if relpath is not None
-    }
-    files = [
-        item for item in current_manifest.artifact_files if item.relpath in referenced
-    ]
+    current_files = {item.relpath: item for item in current_manifest.artifact_files}
+    files: dict[str, SnapshotArtifactFile] = {}
+    for retained in entries:
+        files.update(document_resource_closure(workspace, retained, current_files))
     next_version = current_version + 1
-    manifest = build_manifest(knowledge_base_id, next_version, entries, files)
+    manifest = build_manifest(
+        knowledge_base_id,
+        next_version,
+        entries,
+        files.values(),
+        workspace=workspace,
+        current_manifest=current_manifest,
+    )
     staging, manifest_sha256 = stage_manifest(workspace, manifest)
     try:
         promote_staged_snapshot(workspace, staging, manifest)

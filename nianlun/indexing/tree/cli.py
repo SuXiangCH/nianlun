@@ -24,6 +24,7 @@ from pathlib import Path
 
 from nianlun.indexing.tree.pipeline import build_md_index_sync
 from nianlun.indexing.tree.workspace import build_workspace_doc, write_workspace_doc
+from nianlun.knowledgebase.workspace_ownership import require_legacy_workspace
 
 
 def cmd_single(
@@ -33,6 +34,9 @@ def cmd_single(
     no_summary: bool,
     full_commonmark: bool = False,
 ) -> None:
+    require_legacy_workspace(md)
+    if out is not None:
+        require_legacy_workspace(out)
     result = build_md_index_sync(
         md,
         model=model,
@@ -61,6 +65,9 @@ def cmd_reindex(
     clean: bool = False,
     full_commonmark: bool = False,
 ) -> None:
+    require_legacy_workspace(workspace)
+    for path in paths:
+        require_legacy_workspace(path)
     ws = Path(workspace).expanduser()
     ws.mkdir(parents=True, exist_ok=True)
     if clean:

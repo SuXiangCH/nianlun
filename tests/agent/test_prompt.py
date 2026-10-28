@@ -152,7 +152,7 @@ def test_prompt_requires_answer_coverage_check_before_stopping():
 
 
 def test_prompt_revision_is_v21():
-    assert PROMPT_VERSION == 21
+    assert PROMPT_VERSION == 22
 
 
 @pytest.mark.parametrize("kb", [_NoCatalogKnowledgeBase(), _VectorKnowledgeBase()])

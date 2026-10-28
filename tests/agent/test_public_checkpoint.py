@@ -119,7 +119,6 @@ def test_v0_attaches_request_cancellation_middleware(monkeypatch):
     kb = SimpleNamespace(has_fts=True, has_vector=False)
     monkeypatch.setattr(factory, "build_chat_model", lambda **kw: object())
     monkeypatch.setattr(factory, "build_tools", lambda **kw: [])
-    monkeypatch.setattr(factory, "build_system_prompt", lambda kb: "prompt")
     monkeypatch.setattr(factory, "estimate_agent_context_overhead", lambda *a: 0)
     monkeypatch.setattr(
         factory,
@@ -203,8 +202,6 @@ def test_release_parameters_and_checkpoint_are_injected(monkeypatch, version):
         lambda **kw: calls.setdefault("model", kw) or object(),
     )
     monkeypatch.setattr(factory, "build_tools", lambda **kw: [])
-    monkeypatch.setattr(factory, "build_system_prompt", lambda kb: "prompt")
-    monkeypatch.setattr(factory, "build_retrieval_system_prompt", lambda kb: "prompt")
     monkeypatch.setattr(factory, "estimate_agent_context_overhead", lambda *a: 0)
     monkeypatch.setattr(
         factory, "build_agent", lambda *a, **kw: calls.setdefault("inner", kw)

@@ -267,7 +267,7 @@ class _FakeApplications:
         assert application_id == "app-1"
         return {"id": application_id}
 
-    def runtime(self, application_id):
+    def runtime(self, application_id, **kwargs):
         return object()
 
 

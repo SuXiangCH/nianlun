@@ -24,6 +24,8 @@ class DeepSearchConfig:
     max_open_questions: int = 8
     max_open_question_chars: int = 400
     max_search_summary_chars: int = 1_000
+    max_image_refs: int = 8
+    max_evidence_image_refs: int = 2
 
     def __post_init__(self) -> None:
         positive_fields = (
@@ -36,11 +38,17 @@ class DeepSearchConfig:
             "max_open_questions",
             "max_open_question_chars",
             "max_search_summary_chars",
+            "max_image_refs",
+            "max_evidence_image_refs",
         )
         for name in positive_fields:
             value = getattr(self, name)
             if not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_result_chars < 88:
+            raise ValueError(
+                "max_result_chars must fit the 88-character result envelope"
+            )
 
         if (
             not isinstance(self.timeout_seconds, (int, float))

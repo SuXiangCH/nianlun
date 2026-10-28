@@ -38,6 +38,120 @@ describe("Model management", () => {
     expect(button, label).toBeTruthy();
     await act(async () => button!.click());
   };
+  const changeInput = async (selector: string, value: string) => {
+    const input = container.querySelector<HTMLInputElement>(selector);
+    expect(input, selector).not.toBeNull();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, value);
+      input!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  };
+
+  it.each([["", null], ["0", 0], ["0.65", 0.65], ["2", 2]] as const)("creates a model with temperature %s independently of reasoning", async (value, expected) => {
+    const props = await renderView({ onCreateModel: vi.fn().mockResolvedValue(profile()) });
+    await click("新建模型");
+    const temperature = container.querySelector<HTMLInputElement>("#model-profile-temperature");
+    expect(temperature?.value).toBe("");
+    expect(temperature?.closest("details")).toBeTruthy();
+    expect(temperature?.placeholder).toBe("不配置");
+    await changeInput("#model-profile-model", "new-model");
+    await changeInput("#model-profile-url", "https://model.test/v1");
+    await changeInput("#model-profile-temperature", value);
+    await act(async () => container.querySelector("form")!.requestSubmit());
+    expect(props.onCreateModel).toHaveBeenCalledWith(expect.objectContaining({ temperature: expected, reasoning_effort: null }));
+  });
+
+  it("preserves saved zero temperature and clears it explicitly for updates and probes", async () => {
+    const props = await renderView({
+      onListModels: vi.fn().mockResolvedValue([profile({ temperature: 0, reasoning_effort: "high" })]),
+      onUpdateModel: vi.fn().mockResolvedValue(profile()),
+    });
+    await click("编辑 chat-model");
+    expect(container.querySelector<HTMLInputElement>("#model-profile-temperature")?.value).toBe("0");
+    await click("测试连接");
+    expect(props.onTestModel).toHaveBeenLastCalledWith("llm-1", expect.objectContaining({ temperature: 0, reasoning_effort: "high" }));
+    await changeInput("#model-profile-temperature", "");
+    await click("测试连接");
+    expect(props.onTestModel).toHaveBeenLastCalledWith("llm-1", expect.objectContaining({ temperature: null, reasoning_effort: "high" }));
+    await act(async () => container.querySelector("form")!.requestSubmit());
+    expect(props.onUpdateModel).toHaveBeenCalledWith("llm-1", expect.objectContaining({ temperature: null, reasoning_effort: "high" }));
+  });
+
+  it("tests unsaved temperature and enforces its numeric range without showing it for other model kinds", async () => {
+    const props = await renderView({ onTestConfig: vi.fn().mockRejectedValue(new Error("温度不受支持")) });
+    await click("新建模型");
+    await changeInput("#model-profile-model", "new-model");
+    await changeInput("#model-profile-url", "https://model.test/v1");
+    await changeInput("#model-profile-temperature", "0.7");
+    await click("测试连接");
+    expect(props.onTestConfig).toHaveBeenLastCalledWith(expect.objectContaining({ temperature: 0.7 }));
+    expect(container.querySelector("[role=alert]")?.textContent).toContain("温度不受支持");
+    expect(container.querySelector<HTMLInputElement>("#model-profile-temperature")?.value).toBe("0.7");
+    for (const value of ["-0.1", "2.1"]) {
+      await changeInput("#model-profile-temperature", value);
+      expect(container.querySelector<HTMLInputElement>("#model-profile-temperature")?.checkValidity()).toBe(false);
+    }
+    expect(container.querySelector<HTMLInputElement>("#model-profile-temperature")?.step).toBe("any");
+    await click("取消"); await click("Embedding1"); await click("编辑 embed-model");
+    expect(container.querySelector("#model-profile-temperature")).toBeNull();
+    await click("取消"); await click("文档解析0"); await click("新建模型");
+    expect(container.querySelector("#model-profile-temperature")).toBeNull();
+  });
+
+  it("saves all reasoning levels and explicit no configuration for LLM models", async () => {
+    const props = await renderView({ onUpdateModel: vi.fn().mockResolvedValue(profile()) });
+    for (const value of ["low", "medium", "high", ""]) {
+      await click("编辑 chat-model");
+      const select = container.querySelector<HTMLSelectElement>("#model-profile-reasoning");
+      expect(select).not.toBeNull();
+      await act(async () => { select!.value = value; select!.dispatchEvent(new Event("change", { bubbles: true })); });
+      await act(async () => container.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+      expect(props.onUpdateModel).toHaveBeenLastCalledWith("llm-1", expect.objectContaining({ reasoning_effort: value || null }));
+    }
+    await click("Embedding1"); await click("编辑 embed-model");
+    expect(container.querySelector("#model-profile-reasoning")).toBeNull();
+  });
+
+  it("defaults new reasoning effort to unconfigured and tests unsaved draft and saved changes", async () => {
+    const props = await renderView({ onTestConfig: vi.fn().mockResolvedValue({ target: "llm", ok: true, message: "连接成功" }) });
+    await click("新建模型");
+    const select = container.querySelector<HTMLSelectElement>("#model-profile-reasoning");
+    expect(select?.value).toBe("");
+    const model = container.querySelector<HTMLInputElement>("#model-profile-model")!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(model, "new-model");
+      model.dispatchEvent(new Event("input", { bubbles: true }));
+      const url = container.querySelector<HTMLInputElement>("#model-profile-url")!;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(url, "https://model.test/v1");
+      url.dispatchEvent(new Event("input", { bubbles: true }));
+      select!.value = "high"; select!.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await click("测试连接");
+    expect(props.onTestConfig).toHaveBeenCalledWith(expect.objectContaining({ reasoning_effort: "high" }));
+    await click("取消"); await click("编辑 chat-model");
+    await act(async () => {
+      const savedSelect = container.querySelector<HTMLSelectElement>("#model-profile-reasoning")!;
+      savedSelect.value = "low"; savedSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await click("测试连接");
+    expect(props.onTestModel).toHaveBeenCalledWith("llm-1", expect.objectContaining({ reasoning_effort: "low" }));
+  });
+
+  it("preserves saved reasoning and reports incompatible connection tests without clearing it", async () => {
+    const props = await renderView({
+      onListModels: vi.fn().mockResolvedValue([profile({ reasoning_effort: "high" })]),
+      onTestModel: vi.fn().mockRejectedValue(new Error("不支持 reasoning_effort")),
+    });
+    await click("编辑 chat-model");
+    const select = container.querySelector<HTMLSelectElement>("#model-profile-reasoning")!;
+    expect(select.value).toBe("high");
+    await click("测试连接");
+    expect(container.querySelector("[role=alert]")?.textContent).toContain("不支持 reasoning_effort");
+    expect(select.value).toBe("high");
+    await act(async () => { select.value = ""; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    await click("测试连接");
+    expect(props.onTestModel).toHaveBeenLastCalledWith("llm-1", expect.objectContaining({ reasoning_effort: null }));
+  });
 
   it("edits and saves all three vision states without exposing the field for embedding models", async () => {
     const props = await renderView({ onUpdateModel: vi.fn().mockResolvedValue(profile()) });

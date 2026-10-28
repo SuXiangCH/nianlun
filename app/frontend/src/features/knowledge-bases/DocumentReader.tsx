@@ -1,15 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import "katex/dist/katex.min.css";
 import { normalizeHtmlTablesWithSourceLines } from "../chat/markdown";
-import type { DocumentIndexNode, DocumentIndexTree } from "../../types";
+import type { DocumentIndexNode, DocumentIndexTree, DocumentPreviewImage } from "../../types";
+import { documentImageUrl } from "../../api/client";
+import { ImageViewer } from "../../components/ImageViewer";
+import { DocumentImage } from "./DocumentImage";
 
 interface Props {
   title: string;
   content: string | null;
+  renderedContent?: string;
+  images?: DocumentPreviewImage[];
   contentLoading: boolean;
   contentError: string | null;
   tree: DocumentIndexTree | null;
@@ -103,6 +108,8 @@ const TreeNode = ({ node, depth, collapsed, activeNodeId, onToggle, onJump }: Tr
 export function DocumentReader({
   title,
   content,
+  renderedContent,
+  images = [],
   contentLoading,
   contentError,
   tree,
@@ -113,6 +120,7 @@ export function DocumentReader({
   const [mode, setMode] = useState<"rendered" | "source">("rendered");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [activeNodeId, setActiveNodeId] = useState<string | null>(null);
+  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const flashTimer = useRef<number | null>(null);
@@ -171,9 +179,22 @@ export function DocumentReader({
 
   const sourceLines = useMemo(() => (content === null ? [] : content.split("\n")), [content]);
   const normalizedContent = useMemo(
-    () => (content === null ? null : normalizeHtmlTablesWithSourceLines(content)),
-    [content],
+    () => (content === null ? null : normalizeHtmlTablesWithSourceLines(renderedContent ?? content)),
+    [content, renderedContent],
   );
+  const viewerImages = useMemo(() => images.flatMap((image) => {
+    const url = image.status === "available" ? documentImageUrl(image.url) : null;
+    return url ? [{ id: image.id, caption: image.caption, url }] : [];
+  }), [images]);
+  const markdownComponents = useMemo<Components>(() => {
+    const byId = new Map(images.map((image) => [image.id, image]));
+    return {
+      img: ({ src, alt }) => {
+        const id = src?.startsWith("nianlun-document-image:") ? src.slice("nianlun-document-image:".length) : "";
+        return <DocumentImage image={byId.get(id)} caption={alt || ""} onOpen={() => setSelectedImageId(id)} />;
+      },
+    };
+  }, [images]);
   const nodeCount = tree ? countNodes(tree.structure) : 0;
 
   const expandAll = () => setCollapsed(new Set());
@@ -227,7 +248,7 @@ export function DocumentReader({
           {contentError && <div className="reader-content-state is-error" role="alert">{contentError}</div>}
           {content !== null && (mode === "rendered" ? (
             <div className="message-markdown reader-markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex, rehypeHeadingLines(normalizedContent?.sourceLineByRenderedLine || [])]}>{normalizedContent?.content || ""}</ReactMarkdown>
+              <ReactMarkdown components={markdownComponents} urlTransform={(url, key) => key === "src" && url.startsWith("nianlun-document-image:") ? url : defaultUrlTransform(url)} remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex, rehypeHeadingLines(normalizedContent?.sourceLineByRenderedLine || [])]}>{normalizedContent?.content || ""}</ReactMarkdown>
             </div>
           ) : (
             <pre className="reader-source">{sourceLines.map((line, index) => (
@@ -236,6 +257,7 @@ export function DocumentReader({
           ))}
         </div>
       </div>
+      {selectedImageId && <ImageViewer key={selectedImageId} images={viewerImages} selectedId={selectedImageId} onClose={() => setSelectedImageId(null)} />}
     </div>
   );
 }

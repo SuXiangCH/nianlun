@@ -222,8 +222,8 @@ class FTSIndexService:
 
     def shutdown(self) -> None:
         self._shutdown_event.set()
-        self._schema_executor.shutdown(wait=False, cancel_futures=True)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._schema_executor.shutdown(wait=True, cancel_futures=True)
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     def delete_collection(
         self, collection_name: str | None, knowledge_base_id: str

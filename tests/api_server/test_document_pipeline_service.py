@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+from threading import Event, get_ident
 import time
 from typing import Any
 
@@ -11,14 +14,219 @@ from fastapi.testclient import TestClient
 
 import app.api_server.services.document_pipeline_service as pipeline_module
 import app.api_server.services.model_config_service as model_config_service
+import app.api_server.services.workspace_store as workspace_store
+from app.api_server.apis.v1.schemas import (
+    KnowledgeBaseCreateRequest,
+    KnowledgeBaseUpdateRequest,
+    ModelProfileRequest,
+)
 from app.api_server.config import ApiServerSettings
+from app.api_server.database import SQLiteConnectionFactory, initialize_database
 from app.api_server.main import create_app
+from app.api_server.repositories import SQLiteMetadataRepository
 from app.api_server.services.document_pipeline_service import (
     DocumentPipelineService,
     _LimitedCachedLLM,
     _load_enriched_generation_artifacts,
     _parse_enrichment_diagnostics,
 )
+from app.api_server.services.knowledge_base_service import KnowledgeBaseService
+from app.api_server.services.model_config_service import ModelConfigService
+
+
+@pytest.fixture
+def enrichment_services(
+    tmp_path: Path,
+) -> Iterator[tuple[DocumentPipelineService, str]]:
+    factory = SQLiteConnectionFactory(tmp_path / "metadata.sqlite3")
+    initialize_database(factory)
+    repository = SQLiteMetadataRepository(factory)
+    knowledge_bases = KnowledgeBaseService(
+        repository, tmp_path / "workspaces", ModelConfigService(repository)
+    )
+    kb = knowledge_bases.create(
+        KnowledgeBaseCreateRequest(
+            name="consistent enrichment settings",
+            summary_enabled=False,
+            heading_recovery_enabled=False,
+            min_subtree_tokens=1,
+        )
+    )
+    repository.create_document(
+        {
+            "id": "doc-1",
+            "knowledge_base_id": kb.id,
+            "original_filename": "source.md",
+            "file_extension": ".md",
+            "size_bytes": 8,
+            "source_relpath": "sources/source.md",
+            "source_sha256": "source-hash",
+            "parser": "native_markdown",
+            "status": "parsed",
+            "created_at": "2026-10-26T00:00:00+00:00",
+            "updated_at": "2026-10-26T00:00:00+00:00",
+        }
+    )
+    pipeline = object.__new__(DocumentPipelineService)
+    pipeline.repository = repository
+    pipeline.knowledge_bases = knowledge_bases
+    pipeline._loop = None
+    pipeline._wake_event = None
+    try:
+        yield pipeline, kb.id
+    finally:
+        factory.dispose()
+
+
+@pytest.mark.parametrize("metadata_fails", [False, True], ids=["commit", "rollback"])
+def test_enrichment_snapshot_waits_for_complete_settings_update(
+    enrichment_services: tuple[DocumentPipelineService, str],
+    monkeypatch: pytest.MonkeyPatch,
+    metadata_fails: bool,
+) -> None:
+    pipeline, kb_id = enrichment_services
+    repository = pipeline.repository
+    knowledge_bases = pipeline.knowledge_bases
+    metadata_pending = Event()
+    resume_update = Event()
+    queue_thread = get_ident()
+    original_update = repository.update_knowledge_base_settings
+    original_create = repository.create_enrichment_task
+    original_lock_for = workspace_store._lock_for
+
+    def pause_metadata_update(
+        knowledge_base_id: str, updates: dict[str, Any]
+    ) -> dict[str, Any]:
+        metadata_pending.set()
+        assert resume_update.wait(5), "enrichment reader did not resume update"
+        if metadata_fails:
+            raise RuntimeError("metadata unavailable")
+        return original_update(knowledge_base_id, updates)
+
+    def resume_on_queue_lock(path: Path):
+        if get_ident() == queue_thread and metadata_pending.is_set():
+            resume_update.set()
+        return original_lock_for(path)
+
+    def record_task_before_resuming_update(**kwargs: Any) -> dict[str, Any]:
+        try:
+            return original_create(**kwargs)
+        finally:
+            # Also let the unprotected implementation finish, so RED reports
+            # the mixed durable snapshot rather than a synchronization timeout.
+            resume_update.set()
+
+    monkeypatch.setattr(
+        repository, "update_knowledge_base_settings", pause_metadata_update
+    )
+    monkeypatch.setattr(
+        repository, "create_enrichment_task", record_task_before_resuming_update
+    )
+    monkeypatch.setattr(workspace_store, "_lock_for", resume_on_queue_lock)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        update = executor.submit(
+            knowledge_bases.update,
+            kb_id,
+            KnowledgeBaseUpdateRequest(
+                summary_enabled=True,
+                heading_recovery_enabled=True,
+                min_subtree_tokens=1200,
+            ),
+        )
+        try:
+            assert metadata_pending.wait(5), "settings update did not reach metadata"
+            pipeline._queue_enrichment("doc-1", 1, "normalized-hash")
+        finally:
+            resume_update.set()
+        if metadata_fails:
+            with pytest.raises(RuntimeError, match="metadata unavailable"):
+                update.result(timeout=5)
+        else:
+            assert update.result(timeout=5).min_subtree_tokens == 1200
+
+    task = repository.get_latest_enrichment_task("doc-1", 1)
+    assert task is not None
+    assert json.loads(task["options_json"]) == {
+        "summary_enabled": not metadata_fails,
+        "heading_recovery_enabled": not metadata_fails,
+        "subtree_folding_enabled": True,
+        "min_subtree_tokens": 1 if metadata_fails else 1200,
+        "reasoning_effort": None,
+        "temperature": None,
+    }
+
+
+def test_enrichment_options_and_model_snapshot_are_fenced_through_enqueue(
+    enrichment_services: tuple[DocumentPipelineService, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipeline, kb_id = enrichment_services
+    repository = pipeline.repository
+    knowledge_bases = pipeline.knowledge_bases
+    models = knowledge_bases.models
+    profiles = [
+        models.create_profile(
+            ModelProfileRequest(
+                kind="llm", name=name, model=name, base_url="https://llm.test/v1"
+            )
+        )
+        for name in ("old-model", "new-model")
+    ]
+    knowledge_bases.update(
+        kb_id, KnowledgeBaseUpdateRequest(llm_model_id=profiles[0].id)
+    )
+    enqueue_pending = Event()
+    resume_enqueue = Event()
+    original_create = repository.create_enrichment_task
+    original_lock_for = workspace_store._lock_for
+
+    def pause_enqueue(**kwargs: Any) -> dict[str, Any]:
+        enqueue_pending.set()
+        assert resume_enqueue.wait(5), "settings writer did not resume enqueue"
+        return original_create(**kwargs)
+
+    def resume_on_settings_lock(path: Path):
+        if get_ident() == settings_thread and enqueue_pending.is_set():
+            resume_enqueue.set()
+        return original_lock_for(path)
+
+    monkeypatch.setattr(repository, "create_enrichment_task", pause_enqueue)
+    monkeypatch.setattr(workspace_store, "_lock_for", resume_on_settings_lock)
+    settings_thread = get_ident()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        enqueue = executor.submit(
+            pipeline._queue_enrichment, "doc-1", 1, "normalized-hash"
+        )
+        try:
+            assert enqueue_pending.wait(5), "enrichment did not reach enqueue"
+            updated = knowledge_bases.update(
+                kb_id,
+                KnowledgeBaseUpdateRequest(
+                    summary_enabled=True,
+                    heading_recovery_enabled=True,
+                    llm_model_id=profiles[1].id,
+                ),
+            )
+            assert updated.summary_enabled is True
+        finally:
+            # Also release implementations that update SQLite without the lock.
+            resume_enqueue.set()
+        enqueue.result(timeout=5)
+
+    task = repository.get_latest_enrichment_task("doc-1", 1)
+    assert task is not None
+    assert task["llm_profile_id"] == profiles[0].id
+    profile = repository.get_model_profile(profiles[0].id)
+    assert profile is not None
+    assert task["llm_profile_updated_at"] == profile["updated_at"]
+    assert json.loads(task["options_json"]) == {
+        "summary_enabled": False,
+        "heading_recovery_enabled": False,
+        "subtree_folding_enabled": True,
+        "min_subtree_tokens": 1,
+        "reasoning_effort": None,
+        "temperature": None,
+    }
 
 
 class _CallResultRepository:
@@ -266,7 +474,7 @@ def test_hanging_llm_does_not_leave_document_running(
     monkeypatch.setattr(
         model_config_service.ModelConfigService,
         "build_llm",
-        lambda _self, _profile_id=None: delegate,
+        lambda _self, _profile_id=None, **_kwargs: delegate,
     )
     client = TestClient(
         create_app(

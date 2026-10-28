@@ -10,7 +10,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 from app.api_server.config import ApiServerSettings
 from app.api_server.repositories import SQLiteMetadataRepository
@@ -37,6 +37,12 @@ from app.api_server.services.workspace_store import (
 )
 from nianlun.indexing.tree.pipeline import build_md_index
 from nianlun.models.llm import content_to_text
+from nianlun.models.reasoning import ReasoningEffortOverride
+
+
+class _ReasoningOverrideKwargs(TypedDict, total=False):
+    reasoning_effort: ReasoningEffortOverride
+    temperature: float | None
 
 
 logger = logging.getLogger(__name__)
@@ -588,27 +594,31 @@ class DocumentPipelineService:
         self, document_id: str, generation: int, input_sha256: str
     ) -> None:
         document = self._document(document_id)
-        kb = self.knowledge_bases.require_record(str(document["knowledge_base_id"]))
-        options = WorkspaceArtifactStore.read_tree_build_options(
-            Path(str(kb["workspace_dir"]))
-        )
-        payload = EnrichmentOptions(
-            summary_enabled=bool(kb["summary_enabled"]),
-            heading_recovery_enabled=bool(kb.get("heading_recovery_enabled", True)),
-            subtree_folding_enabled=options.subtree_folding_enabled,
-            min_subtree_tokens=options.min_subtree_tokens or 1,
-        )
-        self.repository.create_enrichment_task(
-            document_id=document_id,
-            pipeline_generation=generation,
-            input_sha256=input_sha256,
-            llm_profile_id=None,
-            llm_profile_updated_at=None,
-            use_knowledge_base_model=True,
-            prompt_schema_version=PROMPT_SCHEMA_VERSION,
-            options_json=payload.model_dump_json(),
-            now=_now(),
-        )
+        knowledge_base_id = str(document["knowledge_base_id"])
+        kb = self.knowledge_bases.require_record(knowledge_base_id)
+        workspace = Path(str(kb["workspace_dir"]))
+        with workspace_lock(workspace):
+            # Settings span SQLite and a workspace file; reread after any update
+            # or rollback finishes, and fence model selection through enqueue.
+            kb = self.knowledge_bases.require_record(knowledge_base_id)
+            options = WorkspaceArtifactStore.read_tree_build_options(workspace)
+            payload = EnrichmentOptions(
+                summary_enabled=bool(kb["summary_enabled"]),
+                heading_recovery_enabled=bool(kb.get("heading_recovery_enabled", True)),
+                subtree_folding_enabled=options.subtree_folding_enabled,
+                min_subtree_tokens=options.min_subtree_tokens or 1,
+            )
+            self.repository.create_enrichment_task(
+                document_id=document_id,
+                pipeline_generation=generation,
+                input_sha256=input_sha256,
+                llm_profile_id=None,
+                llm_profile_updated_at=None,
+                use_knowledge_base_model=True,
+                prompt_schema_version=PROMPT_SCHEMA_VERSION,
+                options_json=payload.model_dump_json(),
+                now=_now(),
+            )
         self.wake()
 
     async def _enrich(self, task: dict[str, Any]) -> None:
@@ -679,15 +689,31 @@ class DocumentPipelineService:
                 limited_llm: _LimitedCachedLLM | None = None
                 llm = None
                 if options.summary_enabled:
+                    reasoning: _ReasoningOverrideKwargs = {}
+                    if "reasoning_effort" in options.model_fields_set:
+                        reasoning["reasoning_effort"] = (
+                            options.reasoning_effort or "default"
+                        )
+                    # Tasks predating independent temperature used 0 unless reasoning
+                    # was enabled. Retrying them must keep that sampling behavior.
+                    if "temperature" in options.model_fields_set:
+                        reasoning["temperature"] = options.temperature
                     delegate = await asyncio.to_thread(
-                        self.models.build_llm, task.get("llm_profile_id")
+                        self.models.build_llm,
+                        task.get("llm_profile_id"),
+                        legacy_temperature="temperature"
+                        not in options.model_fields_set,
+                        **reasoning,
                     )
-                    fingerprint = _sha256(
-                        (
-                            f"{task.get('llm_profile_id') or ''}:"
-                            f"{task.get('llm_profile_updated_at') or ''}"
-                        ).encode("utf-8")
+                    model_identity = (
+                        f"{task.get('llm_profile_id') or ''}:"
+                        f"{task.get('llm_profile_updated_at') or ''}"
                     )
+                    if "reasoning_effort" in options.model_fields_set:
+                        model_identity += f":{options.reasoning_effort or ''}"
+                    if "temperature" in options.model_fields_set:
+                        model_identity += f":temperature={options.temperature}"
+                    fingerprint = _sha256(model_identity.encode("utf-8"))
                     limited_llm = _LimitedCachedLLM(
                         delegate,
                         self.repository,
@@ -704,7 +730,6 @@ class DocumentPipelineService:
                 heading_mode = (
                     "rules_then_llm"
                     if document["parser"] == "mineru"
-                    and document["file_extension"] == ".pdf"
                     and options.heading_recovery_enabled
                     else "off"
                 )
@@ -715,7 +740,7 @@ class DocumentPipelineService:
                     add_doc_description=options.summary_enabled,
                     add_node_text=True,
                     add_node_id=True,
-                    thin=options.subtree_folding_enabled and heading_mode == "off",
+                    thin=options.subtree_folding_enabled,
                     min_node_token=options.min_subtree_tokens,
                     heading_recovery_mode=heading_mode,
                     heading_recovery_llm=llm,
@@ -795,6 +820,7 @@ class DocumentPipelineService:
                     source_mime_type=str(document["mime_type"]),
                     idempotency_key=self._upload_key(document),
                     fts_enabled=self.settings.fts_enabled,
+                    image_policy=self.settings.freeze_image_policy(),
                     now=_now(),
                     page_map_relpath=(
                         f"artifacts/{document['id']}/g{generation}/normalized/"
@@ -890,7 +916,7 @@ class DocumentPipelineService:
     def shutdown(self) -> None:
         if self._loop is not None:
             self._loop.call_soon_threadsafe(self._stop_event.set)
-        self._thread.join(timeout=5)
+        self._thread.join()
 
 
 __all__ = ["DocumentPipelineService", "PROMPT_SCHEMA_VERSION"]
